@@ -44,6 +44,8 @@ SCROLL_MINUTES = 5             # default minutes per keyword
 PAGE_LOAD_WAIT = 6             # seconds to wait after driver.get()
 BTN_FIND_TRIES = 12            # retries to find SortPin button via JS
 BTN_RETRY_WAIT = 2             # seconds between retries
+STALL_SECS     = 40            # if page height stops growing this long → no more pins → next keyword
+STALL_SAMPLE   = 6             # seconds between page-height samples
 # ═══════════════════════════════════════════════════════════════════
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -271,25 +273,58 @@ def on_key(event):
 
 keyboard.on_press(on_key)
 
+# JS: total scrollable page height — grows as Pinterest loads more pins,
+# plateaus when pagination is exhausted (no more pins to load).
+_PAGE_HEIGHT_JS = ("return document.documentElement.scrollHeight"
+                   " || document.body.scrollHeight || 0;")
+
+def _page_height(driver):
+    try:
+        h = driver.execute_script(_PAGE_HEIGHT_JS)
+        return int(h) if h else 0
+    except Exception:
+        return 0
+
 # ── Countdown ─────────────────────────────────────────────────────────────────
-def countdown(kw, pos, total, duration_secs):
+def countdown(driver, kw, pos, total, duration_secs):
     state["action"] = None
     end_at = time.time() + duration_secs
+
+    # pagination-exhaustion tracking
+    last_h      = 0
+    last_grow   = time.time()
+    next_sample = time.time() + STALL_SAMPLE   # first sample after a short delay
+
     while time.time() < end_at:
         if not state["running"]:    return "quit"
         if state["action"] == "next_done": return "next"
         if state["action"] == "next_skip": return "skip"
+
+        # ── Detect "no more pins" (page height stopped growing) ───────────────
+        now = time.time()
+        if now >= next_sample:
+            next_sample = now + STALL_SAMPLE
+            h = _page_height(driver)
+            if h > last_h + 50:            # grew meaningfully → still loading pins
+                last_h = h
+                last_grow = now
+            elif last_h > 0 and (now - last_grow) >= STALL_SECS:
+                print()                    # finish the progress line
+                return "exhausted"
+
         remaining = int(end_at - time.time())
         elapsed   = duration_secs - remaining
         pct       = elapsed / duration_secs
         bar       = "█" * int(pct * 30) + "░" * (30 - int(pct * 30))
         em, es    = divmod(elapsed, 60)
         rm, rs    = divmod(remaining, 60)
+        idle      = int(time.time() - last_grow)
         print(
             f"\r  [{bar}]  {em:02d}:{es:02d} elapsed  |  "
             f"{rm:02d}:{rs:02d} left  |  "
-            f"[{pos}/{total}] {kw[:30]:<30}  "
-            f"[N=done+next  S=skip  ESC=quit]",
+            f"[{pos}/{total}] {kw[:26]:<26}  "
+            f"newpins:{max(0, STALL_SECS - idle):>2}s  "
+            f"[N=next S=skip ESC=quit]",
             end="", flush=True
         )
         time.sleep(1)
@@ -405,7 +440,7 @@ def main():
             # ── Countdown ─────────────────────────────────────────────────
             print(f"\n  ⏱  Scrolling {s['duration']//60}m {s['duration']%60:02d}s"
                   f"  —  SortPin saving pins (you can use your PC now)")
-            result = countdown(kw, pos + 1, len(remaining), s["duration"])
+            result = countdown(driver, kw, pos + 1, len(remaining), s["duration"])
 
             # ── Close this keyword's tab before moving on ─────────────────
             try:
@@ -414,10 +449,12 @@ def main():
                 pass
 
             # ── Result ────────────────────────────────────────────────────
-            if result in ("done", "next"):
+            if result in ("done", "next", "exhausted"):
                 mark_done(progress, kw)
                 done_count += 1
-                label = "⏰ Time up" if result == "done" else "⏭  Early done"
+                label = {"done":      "⏰ Time up",
+                         "next":      "⏭  Early done",
+                         "exhausted": "📄 Page end — no more pins"}[result]
                 print(f"\n  ✅ {label}: \"{kw}\"  [{done_count}/{len(all_kws)} done]")
                 pos += 1
             elif result == "skip":
