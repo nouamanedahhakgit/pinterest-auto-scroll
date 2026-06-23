@@ -145,32 +145,39 @@ def connect_selenium():
 
 # ── SortPin button — pure JavaScript, zero mouse ──────────────────────────────
 SORTPIN_JS = """
-    // Search entire document for 'Start Scroll' button
-    var all = Array.from(document.querySelectorAll('button'));
-    var btn = all.find(function(b) {
+    // SortPin uses Plasmo framework — UI lives inside <plasmo-csui> Shadow DOM.
+    // Regular querySelectorAll can't see into Shadow DOM, so we pierce it first.
+    var host = document.querySelector('plasmo-csui');
+    if (!host)        return 'no_plasmo_host';
+    var root = host.shadowRoot;
+    if (!root)        return 'no_shadow_root';
+    var btns = Array.from(root.querySelectorAll('button'));
+    var btn  = btns.find(function(b) {
         return b.innerText && b.innerText.includes('Start Scroll');
     });
     if (btn) {
-        btn.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+        btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
         return 'clicked';
     }
-    return 'not_found';
+    // Debug: return what buttons were found
+    return 'not_found:' + btns.map(function(b){ return b.innerText.trim(); }).join('|');
 """
 
 def click_sortpin_button(driver):
-    """Click SortPin 'Start Scroll' button via JS — no mouse needed."""
+    """Click SortPin 'Start Scroll' button via JS inside Plasmo Shadow DOM."""
     for attempt in range(1, BTN_FIND_TRIES + 1):
         try:
             result = driver.execute_script(SORTPIN_JS)
             if result == "clicked":
-                print(f"\n  ✅ SortPin button clicked via JavaScript")
+                print(f"\n  ✅ SortPin button clicked (Shadow DOM)")
                 return True
+            # Show debug info so we know what's happening
+            print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] SortPin: {result}"
+                  f"  (retry in {BTN_RETRY_WAIT}s)          ", end="", flush=True)
         except Exception as e:
-            pass
-        print(f"\r  🔍 Waiting for SortPin button... {attempt}/{BTN_FIND_TRIES}"
-              f"  ({BTN_RETRY_WAIT}s)", end="", flush=True)
+            print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] JS error: {e}", end="", flush=True)
         time.sleep(BTN_RETRY_WAIT)
-    print(f"\n  ⚠  SortPin button not found — continuing anyway")
+    print(f"\n  ⚠  SortPin button not found after {BTN_FIND_TRIES} tries — continuing anyway")
     return False
 
 # ── Shared state & keyboard listener ─────────────────────────────────────────
