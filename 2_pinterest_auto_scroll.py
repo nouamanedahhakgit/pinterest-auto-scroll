@@ -143,6 +143,33 @@ def connect_selenium():
     driver.implicitly_wait(3)
     return driver
 
+def navigate_new_tab(driver, url):
+    """
+    Open URL via subprocess so Brave creates the tab naturally.
+    Tabs opened this way are NOT flagged as WebDriver-controlled,
+    so navigator.webdriver stays false → Plasmo/SortPin injects.
+    Then we switch Selenium's focus to the new tab via CDP.
+    """
+    existing = set(driver.window_handles)
+    subprocess.Popen([BRAVE_PATH, url])
+    # Wait up to 15 s for the new tab to appear in CDP handles
+    for _ in range(15):
+        time.sleep(1)
+        new_handles = set(driver.window_handles) - existing
+        if new_handles:
+            driver.switch_to.window(next(iter(new_handles)))
+            return True
+    # Fallback: use whatever handle is available
+    if driver.window_handles:
+        driver.switch_to.window(driver.window_handles[-1])
+    return False
+
+def close_current_tab(driver):
+    """Close current keyword tab; switch Selenium to a remaining tab."""
+    if len(driver.window_handles) > 1:
+        driver.close()
+        driver.switch_to.window(driver.window_handles[-1])
+
 # ── SortPin button — pure JavaScript, zero mouse ──────────────────────────────
 SORTPIN_JS = """
     // SortPin uses Plasmo framework — UI lives inside <plasmo-csui> Shadow DOM.
@@ -324,9 +351,11 @@ def main():
             kw  = remaining[pos]
             url = make_url(kw)
 
-            # ── Navigate via driver.get() — no mouse, no keyboard ────────
+            # ── Open in a new Brave tab (subprocess, not driver.get) ─────
+            # This avoids navigator.webdriver=true so Plasmo/SortPin injects.
             print(f"  ▶  [{pos+1}/{len(remaining)}]  {kw}")
-            driver.get(url)
+            print(f"     Opening new tab via Brave (SortPin-friendly)...")
+            navigate_new_tab(driver, url)
             print(f"     Waiting {PAGE_LOAD_WAIT}s for page + SortPin...")
             time.sleep(PAGE_LOAD_WAIT)
 
@@ -338,11 +367,14 @@ def main():
                   f"  —  SortPin saving pins (you can use your PC now)")
             result = countdown(kw, pos + 1, len(remaining), s["duration"])
 
+            # ── Close this keyword's tab before moving on ─────────────────
+            close_current_tab(driver)
+
             # ── Result ────────────────────────────────────────────────────
             if result in ("done", "next"):
                 mark_done(progress, kw)
                 done_count += 1
-                label = "⏰ Time up" if result == "done" else "⏭  Early skip"
+                label = "⏰ Time up" if result == "done" else "⏭  Early done"
                 print(f"\n  ✅ {label}: \"{kw}\"  [{done_count}/{len(all_kws)} done]")
                 pos += 1
             elif result == "skip":
