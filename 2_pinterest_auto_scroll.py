@@ -152,6 +152,9 @@ def navigate_new_tab(driver, url):
     Tabs opened this way are NOT flagged as WebDriver-controlled,
     so navigator.webdriver stays false → Plasmo/SortPin injects.
     Then we switch Selenium's focus to the new tab via CDP.
+
+    Returns the new tab's window handle (or None) so the caller can close
+    exactly that tab later instead of guessing.
     """
     existing = set(driver.window_handles)
     subprocess.Popen([BRAVE_PATH, url])
@@ -160,18 +163,40 @@ def navigate_new_tab(driver, url):
         time.sleep(1)
         new_handles = set(driver.window_handles) - existing
         if new_handles:
-            driver.switch_to.window(next(iter(new_handles)))
-            return True
+            h = next(iter(new_handles))
+            driver.switch_to.window(h)
+            return h
     # Fallback: use whatever handle is available
     if driver.window_handles:
-        driver.switch_to.window(driver.window_handles[-1])
-    return False
+        h = driver.window_handles[-1]
+        driver.switch_to.window(h)
+        return h
+    return None
 
-def close_current_tab(driver):
-    """Close current keyword tab; switch Selenium to a remaining tab."""
-    if len(driver.window_handles) > 1:
-        driver.close()
-        driver.switch_to.window(driver.window_handles[-1])
+def close_keyword_tabs(driver, keep=None):
+    """
+    Close EVERY Pinterest tab so tabs never pile up — keeping at most the
+    `keep` handle (and always leaving at least one tab alive so Brave/CDP
+    stays connected). Call this after each keyword to clean up.
+    """
+    for h in list(driver.window_handles):
+        if h == keep:
+            continue
+        if len(driver.window_handles) <= 1:
+            break                      # never close the very last tab
+        try:
+            driver.switch_to.window(h)
+            cur = driver.current_url or ""
+            if "pinterest.com" in cur:
+                driver.close()
+        except Exception:
+            continue
+    # Leave focus on a surviving tab
+    try:
+        if driver.window_handles:
+            driver.switch_to.window(driver.window_handles[-1])
+    except Exception:
+        pass
 
 # ── SortPin button — native (trusted) clicks on the CURRENT tab only ──────────
 # IMPORTANT: SortPin only reacts to TRUSTED clicks (event.isTrusted===true).
@@ -430,7 +455,10 @@ def main():
             # This avoids navigator.webdriver=true so Plasmo/SortPin injects.
             print(f"  ▶  [{pos+1}/{len(remaining)}]  {kw}")
             print(f"     Opening new tab via Brave (SortPin-friendly)...")
-            navigate_new_tab(driver, url)
+            # Close any leftover Pinterest tabs from before opening this one,
+            # so we never accumulate tabs.
+            close_keyword_tabs(driver)
+            kw_tab = navigate_new_tab(driver, url)
             print(f"     Waiting {PAGE_LOAD_WAIT}s for page + SortPin...")
             time.sleep(PAGE_LOAD_WAIT)
 
@@ -442,9 +470,9 @@ def main():
                   f"  —  SortPin saving pins (you can use your PC now)")
             result = countdown(driver, kw, pos + 1, len(remaining), s["duration"])
 
-            # ── Close this keyword's tab before moving on ─────────────────
+            # ── Close this keyword's tab before moving on (no tab pile-up) ─
             try:
-                close_current_tab(driver)
+                close_keyword_tabs(driver)
             except Exception:
                 pass
 
