@@ -172,22 +172,18 @@ def close_current_tab(driver):
 
 # ── SortPin button — pure JavaScript, zero mouse ──────────────────────────────
 SORTPIN_JS = """
-    // SortPin uses Plasmo framework — UI lives inside <plasmo-csui> Shadow DOM.
-    // Regular querySelectorAll can't see into Shadow DOM, so we pierce it first.
-    var host = document.querySelector('plasmo-csui');
-    if (!host)        return 'no_plasmo_host';
-    var root = host.shadowRoot;
-    if (!root)        return 'no_shadow_root';
+    // SortPin injects its UI as <div id="pinterest-one-root"> in the main document.
+    var root = document.querySelector('#pinterest-one-root');
+    if (!root) return 'no_sortpin_root';
     var btns = Array.from(root.querySelectorAll('button'));
     var btn  = btns.find(function(b) {
         return b.innerText && b.innerText.includes('Start Scroll');
     });
     if (btn) {
-        btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+        btn.click();
         return 'clicked';
     }
-    // Debug: return what buttons were found
-    return 'not_found:' + btns.map(function(b){ return b.innerText.trim(); }).join('|');
+    return 'not_found:' + btns.map(function(b){ return b.innerText.trim().slice(0,30); }).join('|');
 """
 
 def click_sortpin_button(driver):
@@ -368,7 +364,10 @@ def main():
             result = countdown(kw, pos + 1, len(remaining), s["duration"])
 
             # ── Close this keyword's tab before moving on ─────────────────
-            close_current_tab(driver)
+            try:
+                close_current_tab(driver)
+            except Exception:
+                pass
 
             # ── Result ────────────────────────────────────────────────────
             if result in ("done", "next"):
