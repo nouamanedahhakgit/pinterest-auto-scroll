@@ -93,19 +93,26 @@ def make_url(kw):
 
 # ── Browser helpers ───────────────────────────────────────────────────────────
 def navigate(url):
-    pyperclip.copy(url)
-    pyautogui.hotkey("ctrl", "l")
-    time.sleep(0.4)
-    pyautogui.hotkey("ctrl", "a")
-    time.sleep(0.1)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(0.1)
-    pyautogui.press("enter")
+    """Open URL in Brave directly — no clipboard, no keyboard, no focus needed."""
+    subprocess.Popen([BRAVE_PATH, url])
 
-def focus_center():
-    w, h = pyautogui.size()
-    pyautogui.click(w // 2, int(h * 0.55))
-    time.sleep(0.3)
+def bring_brave_to_front():
+    """
+    Focus Brave window briefly (just for clicking SortPin button).
+    Releases control immediately after — user can keep working on PC normally.
+    """
+    try:
+        import pygetwindow as gw
+        wins = gw.getWindowsWithTitle("Pinterest")
+        if not wins:
+            wins = gw.getWindowsWithTitle("Brave")
+        if wins:
+            wins[0].activate()
+            time.sleep(0.8)
+            return True
+    except Exception as e:
+        print(f"\n  ⚠  Could not focus Brave: {e}")
+    return False
 
 # ── SortPin button finder (numpy pixel scan) ──────────────────────────────────
 def find_sortpin_button():
@@ -296,9 +303,8 @@ def main():
     first_url = make_url(remaining[0])
     print(f"  Opening Brave → {first_url}")
     print(f"  Waiting {PAGE_LOAD_WAIT}s for page + SortPin to load...\n")
-    subprocess.Popen([BRAVE_PATH, first_url])
+    navigate(first_url)
     time.sleep(PAGE_LOAD_WAIT)
-    focus_center()
 
     total_start  = time.time()
     pos          = 0
@@ -314,16 +320,18 @@ def main():
         else:
             print(f"\n\n  ▶  [{pos+1}/{len(remaining)}]  {kw}")
             print(f"     {url}")
-            navigate(url)
+            navigate(url)                          # opens new tab, no clipboard needed
             print(f"     Waiting {PAGE_LOAD_WAIT}s for page + SortPin...")
             time.sleep(PAGE_LOAD_WAIT)
-            focus_center()
 
-        # ── Click SortPin button ──────────────────────────────────────────
+        # ── Focus Brave briefly just to click SortPin button ──────────────
         print(f"\n  [{pos+1}/{len(remaining)}]  \"{kw}\"")
+        print(f"  Focusing Brave for button click (releases immediately after)...")
+        bring_brave_to_front()
         clicked = click_sortpin_button()
         if not clicked:
             print(f"  ↳ Continuing anyway (SortPin may need a moment)")
+        # ── Brave focus released — you can use your PC normally now ───────
 
         # ── 15-minute countdown ───────────────────────────────────────────
         print(f"\n  ⏱  Scrolling for {s['duration']//60} min "
