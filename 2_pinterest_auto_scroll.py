@@ -29,6 +29,7 @@ import subprocess, time, sys, os, json, re, socket
 import keyboard
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════════════════
@@ -171,94 +172,79 @@ def close_current_tab(driver):
         driver.switch_to.window(driver.window_handles[-1])
 
 # ── SortPin button — pure JavaScript, zero mouse ──────────────────────────────
-SORTPIN_JS = r"""
-    // Find SortPin's "Start Scroll" button ANYWHERE in the document
-    // (main DOM, #pinterest-one-root, and any open shadow roots), then
-    // fire a full, realistic event sequence so React/SortPin reacts.
-    function findStartBtn(scope) {
-        var btns = Array.from(scope.querySelectorAll('button'));
-        return btns.find(function(b) {
-            var t = (b.innerText || b.textContent || '');
-            return /start\s*scroll/i.test(t);
-        });
-    }
+# JS used ONLY to read state (never to click — SortPin ignores scripted clicks)
+_IS_RUNNING_JS = (
+    "return Array.from(document.querySelectorAll('button'))"
+    ".some(function(b){return /stop\\s*scroll/i.test(b.innerText||'');});"
+)
 
-    // 1) main document
-    var btn = findStartBtn(document);
-
-    // 2) any open shadow roots (Plasmo / web-component injection)
-    if (!btn) {
-        var hosts = Array.from(document.querySelectorAll('*'))
-                         .filter(function(e){ return e.shadowRoot; });
-        for (var i = 0; i < hosts.length; i++) {
-            btn = findStartBtn(hosts[i].shadowRoot);
-            if (btn) break;
-        }
-    }
-
-    if (!btn) {
-        var root = document.querySelector('#pinterest-one-root');
-        var allTxt = Array.from(document.querySelectorAll('button'))
-                          .map(function(b){ return (b.innerText||'').trim().slice(0,20); })
-                          .filter(Boolean).slice(0,6).join('|');
-        return (root ? 'root_no_btn:' : 'no_ui:') + allTxt;
-    }
-
-    // The clickable target may be the button or an inner <span>/<p>.
-    btn.scrollIntoView({block: 'center'});
-    var rect = btn.getBoundingClientRect();
-    var cx = rect.left + rect.width / 2;
-    var cy = rect.top + rect.height / 2;
-    var opts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window};
-
-    ['pointerover','pointerenter','mouseover','pointerdown','mousedown',
-     'pointerup','mouseup','click'].forEach(function(type) {
-        var ev;
-        try {
-            if (type.indexOf('pointer') === 0) {
-                ev = new PointerEvent(type, Object.assign({pointerId: 1, isPrimary: true}, opts));
-            } else {
-                ev = new MouseEvent(type, opts);
-            }
-            btn.dispatchEvent(ev);
-        } catch (e) {}
-    });
-    try { btn.click(); } catch (e) {}
-    return 'clicked';
-"""
-
-def _scan_all_tabs_for_button(driver):
+def _native_click_start_in_current_tab(driver):
     """
-    Run SORTPIN_JS in EVERY open tab and return the first 'clicked'.
-    Pinterest may not be the tab Selenium is currently focused on, so we
-    check them all and leave focus on the tab where the button was found.
+    In the CURRENTLY focused tab, find SortPin's 'Start Scroll' button and
+    give it a NATIVE Selenium click.
+
+    WHY NATIVE: SortPin only reacts to TRUSTED clicks (event.isTrusted===true).
+    A scripted click via driver.execute_script('el.click()') is untrusted and
+    SortPin silently ignores it — that was the original bug. Selenium's
+    WebElement.click() goes through the browser's real input pipeline (CDP),
+    so isTrusted is true and SortPin activates.
     """
-    last = "no_ui:"
-    for handle in list(driver.window_handles):
+    try:
+        buttons = driver.find_elements(By.TAG_NAME, "button")
+    except Exception as e:
+        return f"find_err:{e}"
+
+    for b in buttons:
         try:
-            driver.switch_to.window(handle)
-            result = driver.execute_script(SORTPIN_JS)
-            if result == "clicked":
+            txt = (b.text or "").lower()
+        except Exception:
+            continue
+        if "stop scroll" in txt:
+            return "already_running"          # already scrolling — nothing to do
+        if "start scroll" in txt:
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", b)
+                time.sleep(0.3)
+                b.click()                      # ← TRUSTED native click
                 return "clicked"
-            last = result
-        except Exception as e:
-            last = f"js_error:{e}"
-    return last
+            except Exception as e:
+                return f"click_err:{e}"
+    return "no_button"
 
 def click_sortpin_button(driver):
-    """Click SortPin 'Start Scroll' button via JS, scanning all open tabs."""
+    """
+    Start SortPin scrolling. Scans every open tab (Pinterest may not be the
+    focused one), does a native trusted click, and VERIFIES the button flipped
+    to 'Stop Scroll' before declaring success.
+    """
+    last = "no_button"
     for attempt in range(1, BTN_FIND_TRIES + 1):
-        try:
-            result = _scan_all_tabs_for_button(driver)
-            if result == "clicked":
-                print(f"\n  ✅ SortPin 'Start Scroll' clicked")
+        for handle in list(driver.window_handles):
+            try:
+                driver.switch_to.window(handle)
+            except Exception:
+                continue
+            res = _native_click_start_in_current_tab(driver)
+            if res == "already_running":
+                print(f"\n  ✅ SortPin already scrolling")
                 return True
-            print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] SortPin: {result}"
-                  f"  (retry in {BTN_RETRY_WAIT}s)          ", end="", flush=True)
-        except Exception as e:
-            print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] JS error: {e}", end="", flush=True)
+            if res == "clicked":
+                time.sleep(1.5)               # give SortPin a moment to flip state
+                try:
+                    started = driver.execute_script(_IS_RUNNING_JS)
+                except Exception:
+                    started = False
+                if started:
+                    print(f"\n  ✅ SortPin scrolling started (Stop Scroll active)")
+                    return True
+                last = "clicked_but_no_start"  # clicked but didn't activate — retry
+            else:
+                last = res
+        print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] SortPin: {last}"
+              f"  (retry in {BTN_RETRY_WAIT}s)          ", end="", flush=True)
         time.sleep(BTN_RETRY_WAIT)
-    print(f"\n  ⚠  SortPin button not found after {BTN_FIND_TRIES} tries — continuing anyway")
+    print(f"\n  ⚠  Could not start SortPin after {BTN_FIND_TRIES} tries — continuing anyway")
     return False
 
 # ── Shared state & keyboard listener ─────────────────────────────────────────
