@@ -171,30 +171,88 @@ def close_current_tab(driver):
         driver.switch_to.window(driver.window_handles[-1])
 
 # ── SortPin button — pure JavaScript, zero mouse ──────────────────────────────
-SORTPIN_JS = """
-    // SortPin injects its UI as <div id="pinterest-one-root"> in the main document.
-    var root = document.querySelector('#pinterest-one-root');
-    if (!root) return 'no_sortpin_root';
-    var btns = Array.from(root.querySelectorAll('button'));
-    var btn  = btns.find(function(b) {
-        return b.innerText && b.innerText.includes('Start Scroll');
-    });
-    if (btn) {
-        btn.click();
-        return 'clicked';
+SORTPIN_JS = r"""
+    // Find SortPin's "Start Scroll" button ANYWHERE in the document
+    // (main DOM, #pinterest-one-root, and any open shadow roots), then
+    // fire a full, realistic event sequence so React/SortPin reacts.
+    function findStartBtn(scope) {
+        var btns = Array.from(scope.querySelectorAll('button'));
+        return btns.find(function(b) {
+            var t = (b.innerText || b.textContent || '');
+            return /start\s*scroll/i.test(t);
+        });
     }
-    return 'not_found:' + btns.map(function(b){ return b.innerText.trim().slice(0,30); }).join('|');
+
+    // 1) main document
+    var btn = findStartBtn(document);
+
+    // 2) any open shadow roots (Plasmo / web-component injection)
+    if (!btn) {
+        var hosts = Array.from(document.querySelectorAll('*'))
+                         .filter(function(e){ return e.shadowRoot; });
+        for (var i = 0; i < hosts.length; i++) {
+            btn = findStartBtn(hosts[i].shadowRoot);
+            if (btn) break;
+        }
+    }
+
+    if (!btn) {
+        var root = document.querySelector('#pinterest-one-root');
+        var allTxt = Array.from(document.querySelectorAll('button'))
+                          .map(function(b){ return (b.innerText||'').trim().slice(0,20); })
+                          .filter(Boolean).slice(0,6).join('|');
+        return (root ? 'root_no_btn:' : 'no_ui:') + allTxt;
+    }
+
+    // The clickable target may be the button or an inner <span>/<p>.
+    btn.scrollIntoView({block: 'center'});
+    var rect = btn.getBoundingClientRect();
+    var cx = rect.left + rect.width / 2;
+    var cy = rect.top + rect.height / 2;
+    var opts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window};
+
+    ['pointerover','pointerenter','mouseover','pointerdown','mousedown',
+     'pointerup','mouseup','click'].forEach(function(type) {
+        var ev;
+        try {
+            if (type.indexOf('pointer') === 0) {
+                ev = new PointerEvent(type, Object.assign({pointerId: 1, isPrimary: true}, opts));
+            } else {
+                ev = new MouseEvent(type, opts);
+            }
+            btn.dispatchEvent(ev);
+        } catch (e) {}
+    });
+    try { btn.click(); } catch (e) {}
+    return 'clicked';
 """
 
-def click_sortpin_button(driver):
-    """Click SortPin 'Start Scroll' button via JS inside Plasmo Shadow DOM."""
-    for attempt in range(1, BTN_FIND_TRIES + 1):
+def _scan_all_tabs_for_button(driver):
+    """
+    Run SORTPIN_JS in EVERY open tab and return the first 'clicked'.
+    Pinterest may not be the tab Selenium is currently focused on, so we
+    check them all and leave focus on the tab where the button was found.
+    """
+    last = "no_ui:"
+    for handle in list(driver.window_handles):
         try:
+            driver.switch_to.window(handle)
             result = driver.execute_script(SORTPIN_JS)
             if result == "clicked":
-                print(f"\n  ✅ SortPin button clicked (Shadow DOM)")
+                return "clicked"
+            last = result
+        except Exception as e:
+            last = f"js_error:{e}"
+    return last
+
+def click_sortpin_button(driver):
+    """Click SortPin 'Start Scroll' button via JS, scanning all open tabs."""
+    for attempt in range(1, BTN_FIND_TRIES + 1):
+        try:
+            result = _scan_all_tabs_for_button(driver)
+            if result == "clicked":
+                print(f"\n  ✅ SortPin 'Start Scroll' clicked")
                 return True
-            # Show debug info so we know what's happening
             print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] SortPin: {result}"
                   f"  (retry in {BTN_RETRY_WAIT}s)          ", end="", flush=True)
         except Exception as e:
