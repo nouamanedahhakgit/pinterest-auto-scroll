@@ -171,80 +171,80 @@ def close_current_tab(driver):
         driver.close()
         driver.switch_to.window(driver.window_handles[-1])
 
-# ── SortPin button — pure JavaScript, zero mouse ──────────────────────────────
-# JS used ONLY to read state (never to click — SortPin ignores scripted clicks)
-_IS_RUNNING_JS = (
-    "return Array.from(document.querySelectorAll('button'))"
-    ".some(function(b){return /stop\\s*scroll/i.test(b.innerText||'');});"
-)
+# ── SortPin button — native (trusted) clicks on the CURRENT tab only ──────────
+# IMPORTANT: SortPin only reacts to TRUSTED clicks (event.isTrusted===true).
+# A scripted click via driver.execute_script('el.click()') is untrusted and is
+# silently ignored. Selenium's WebElement.click() goes through the browser's
+# real input pipeline (CDP) → isTrusted=true → SortPin activates.
+#
+# Also: SortPin's run state can carry over to a new keyword's tab (it shows
+# 'Stop Scroll' even on a freshly opened page). If we just see 'Stop Scroll'
+# and assume "already running", the scroll stays bound to the OLD keyword and
+# the new keyword never actually scrolls. So for every keyword we STOP any
+# existing scroll first, then START fresh — binding the scroll to THIS tab.
 
-def _native_click_start_in_current_tab(driver):
-    """
-    In the CURRENTLY focused tab, find SortPin's 'Start Scroll' button and
-    give it a NATIVE Selenium click.
-
-    WHY NATIVE: SortPin only reacts to TRUSTED clicks (event.isTrusted===true).
-    A scripted click via driver.execute_script('el.click()') is untrusted and
-    SortPin silently ignores it — that was the original bug. Selenium's
-    WebElement.click() goes through the browser's real input pipeline (CDP),
-    so isTrusted is true and SortPin activates.
-    """
+def _sortpin_state(driver):
+    """Read SortPin state in the CURRENT tab: 'running', 'idle', or 'none'."""
     try:
-        buttons = driver.find_elements(By.TAG_NAME, "button")
-    except Exception as e:
-        return f"find_err:{e}"
+        labels = [(b.text or "").lower()
+                  for b in driver.find_elements(By.TAG_NAME, "button")]
+    except Exception:
+        return "none"
+    if any("stop scroll"  in t for t in labels):  return "running"
+    if any("start scroll" in t for t in labels):  return "idle"
+    return "none"
 
-    for b in buttons:
+def _click_button_by_text(driver, needle):
+    """Native trusted-click the first CURRENT-tab button whose text contains
+    `needle` (lowercase). Returns True if a click was issued."""
+    for b in driver.find_elements(By.TAG_NAME, "button"):
         try:
             txt = (b.text or "").lower()
         except Exception:
             continue
-        if "stop scroll" in txt:
-            return "already_running"          # already scrolling — nothing to do
-        if "start scroll" in txt:
+        if needle in txt:
             try:
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block:'center'});", b)
-                time.sleep(0.3)
+                time.sleep(0.2)
                 b.click()                      # ← TRUSTED native click
-                return "clicked"
-            except Exception as e:
-                return f"click_err:{e}"
-    return "no_button"
+                return True
+            except Exception:
+                return False
+    return False
 
 def click_sortpin_button(driver):
     """
-    Start SortPin scrolling. Scans every open tab (Pinterest may not be the
-    focused one), does a native trusted click, and VERIFIES the button flipped
-    to 'Stop Scroll' before declaring success.
+    Start a FRESH SortPin scroll on the CURRENT (new-keyword) tab.
+
+    Only the focused tab is touched — navigate_new_tab() already switched focus
+    to the new keyword's tab. If SortPin is still 'running' (leftover from the
+    previous keyword), we STOP it first so the scroll re-binds to this keyword,
+    then START and verify it flipped to 'Stop Scroll'.
     """
-    last = "no_button"
     for attempt in range(1, BTN_FIND_TRIES + 1):
-        for handle in list(driver.window_handles):
-            try:
-                driver.switch_to.window(handle)
-            except Exception:
-                continue
-            res = _native_click_start_in_current_tab(driver)
-            if res == "already_running":
-                print(f"\n  ✅ SortPin already scrolling")
-                return True
-            if res == "clicked":
-                time.sleep(1.5)               # give SortPin a moment to flip state
-                try:
-                    started = driver.execute_script(_IS_RUNNING_JS)
-                except Exception:
-                    started = False
-                if started:
-                    print(f"\n  ✅ SortPin scrolling started (Stop Scroll active)")
+        st = _sortpin_state(driver)
+
+        # Leftover scroll from previous keyword → stop it so we can start fresh.
+        if st == "running":
+            _click_button_by_text(driver, "stop scroll")
+            time.sleep(1.0)
+            st = _sortpin_state(driver)
+
+        # Now idle → start fresh on THIS keyword's tab.
+        if st == "idle":
+            if _click_button_by_text(driver, "start scroll"):
+                time.sleep(1.5)               # let SortPin flip state
+                if _sortpin_state(driver) == "running":
+                    print(f"\n  ✅ SortPin scrolling started (fresh, this keyword)")
                     return True
-                last = "clicked_but_no_start"  # clicked but didn't activate — retry
-            else:
-                last = res
-        print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] SortPin: {last}"
+
+        print(f"\r  🔍 [{attempt}/{BTN_FIND_TRIES}] SortPin: {st}"
               f"  (retry in {BTN_RETRY_WAIT}s)          ", end="", flush=True)
         time.sleep(BTN_RETRY_WAIT)
-    print(f"\n  ⚠  Could not start SortPin after {BTN_FIND_TRIES} tries — continuing anyway")
+
+    print(f"\n  ⚠  Could not start SortPin on this keyword "
+          f"after {BTN_FIND_TRIES} tries — continuing anyway")
     return False
 
 # ── Shared state & keyboard listener ─────────────────────────────────────────
