@@ -584,17 +584,59 @@ def _trim_row(o):
                 pass
     return r
 
-def try_disk_extension():
-    """Read SortPin's data straight from Brave's IndexedDB files on disk using
-    dfindexeddb — no browser, no CDP. Brave's open files are copied to a temp
-    folder first so it works even while Brave is running. Returns
-    (leads, boards, pins) or None."""
+def _disk_rows_ccl(folder):
+    """Read all object-store records from a leveldb folder via ccl_chromium_reader
+    (pure-Python, no compiler). Yields dict values."""
+    from ccl_chromium_reader import ccl_chromium_indexeddb as _idb
+    wrapper = _idb.WrappedIndexDB(folder)
+    for dbid in wrapper.database_ids:
+        db = wrapper[dbid.dbid_no]
+        for store_name in list(db.object_store_names):
+            try:
+                store = db.get_object_store_by_name(store_name)
+            except Exception:
+                continue
+            for rec in store.iterate_records(
+                    live_only=True,
+                    bad_deserializer_data_handler=lambda k, d: None):
+                v = getattr(rec, "value", None)
+                if isinstance(v, dict):
+                    yield v
+
+def _disk_rows_df(folder):
+    """Read records via dfindexeddb (needs python-snappy/zstd, may need a compiler)."""
+    import pathlib
+    from dfindexeddb.indexeddb.chromium import record as _cr
     try:
-        import pathlib, shutil, tempfile
-        from dfindexeddb.indexeddb.chromium import record as _cr
+        it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(use_manifest=True, load_blobs=False)
     except Exception:
-        print("  (disk) dfindexeddb not installed — run: pip install dfindexeddb")
-        return None
+        it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
+    for rec in it:
+        v = getattr(rec, "value", None)
+        if isinstance(v, dict):
+            yield v
+
+def try_disk_extension():
+    """Read SortPin's data straight from Brave's IndexedDB files on disk — no
+    browser, no CDP. Uses ccl_chromium_reader (pure-Python, recommended) or
+    dfindexeddb if present. Reads the folder in place; if files are locked
+    (Brave open) it copies them to a temp folder. Returns (leads,boards,pins)."""
+    import shutil, tempfile
+    # pick an available backend
+    reader = None
+    try:
+        import ccl_chromium_reader  # noqa: F401
+        reader = _disk_rows_ccl
+        print("  (disk) using ccl_chromium_reader (pure-Python)")
+    except Exception:
+        try:
+            import dfindexeddb  # noqa: F401
+            reader = _disk_rows_df
+            print("  (disk) using dfindexeddb")
+        except Exception:
+            print("  (disk) no disk parser installed. Recommended (no compiler):")
+            print("        python -m pip install ccl_chromium_reader")
+            return None
 
     dirs = _idb_leveldb_dirs()
     if not dirs:
@@ -604,17 +646,8 @@ def try_disk_extension():
     buckets = {"leads": [], "boards": [], "pins": []}
 
     def _parse(folder):
-        """Read one leveldb folder into the buckets; return #records added."""
         added = 0
-        try:
-            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(
-                use_manifest=True, load_blobs=False)
-        except Exception:
-            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
-        for rec in it:
-            v = getattr(rec, "value", None)
-            if not isinstance(v, dict):
-                continue
+        for v in reader(folder):
             kind = _classify_keys(v.keys())
             if not kind:
                 continue
@@ -681,7 +714,7 @@ def main():
                 # disk-only mode: do NOT open the browser (huge data can't load
                 # on the page). Just build from the CSVs already in the folder.
                 print("  (disk) disk read unavailable — NOT opening the browser.")
-                print("        Install the parser:  python -m pip install dfindexeddb")
+                print("        Install the parser:  python -m pip install ccl_chromium_reader")
                 print("        Building from existing CSV snapshots instead.")
         else:
             print("  Pulling LIVE from the SortPin extension in Brave...")
