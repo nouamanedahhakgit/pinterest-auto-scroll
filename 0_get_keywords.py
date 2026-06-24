@@ -111,51 +111,52 @@ def connect_selenium():
 # ── Source 1: trends.pinterest.com via Selenium ───────────────
 EXTRACT_JS = """
 (function() {
-    var kws = [];
-    var seen = {};
+    try {
+        var kws = [];
+        var seen = {};
 
-    function add(text) {
-        var t = text.trim().toLowerCase().replace(/\\s+/g, ' ');
-        // Keep only keyword-shaped strings: 2-7 words, 5-60 chars
-        if (!t || seen[t]) return;
-        var words = t.split(' ').length;
-        if (t.length < 5 || t.length > 60 || words < 1 || words > 7) return;
-        // Skip obvious non-keyword strings (nav items, dates, numbers)
-        if (/^(home|about|log in|sign up|english|privacy|terms|\\d+)$/i.test(t)) return;
-        seen[t] = true;
-        kws.push(t);
+        function txt(el) {
+            try { return (el.innerText || el.textContent || '').trim(); }
+            catch(e) { return ''; }
+        }
+
+        function add(text) {
+            var t = (text || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+            if (!t || seen[t]) return;
+            var words = t.split(' ').length;
+            if (t.length < 4 || t.length > 65 || words < 1 || words > 7) return;
+            if (/^(home|about|log in|sign up|english|privacy|terms|follow|save|\\d+)$/i.test(t)) return;
+            seen[t] = true;
+            kws.push(t);
+        }
+
+        // Pinterest explore links (most reliable — keyword IS the link text)
+        try { document.querySelectorAll('a[href*="/explore/"]').forEach(function(a){ add(txt(a)); }); } catch(e){}
+
+        // Trend/keyword-named class elements
+        try { document.querySelectorAll('[class*="trend"],[class*="Trend"],[class*="keyword"],[class*="Keyword"],[class*="term"],[class*="Term"]').forEach(function(el){ add(txt(el)); }); } catch(e){}
+
+        // Headings in main content
+        try { document.querySelectorAll('main h1,main h2,main h3,main h4,[role="main"] h2,[role="main"] h3').forEach(function(el){ add(txt(el)); }); } catch(e){}
+
+        // Short list items / pills
+        try { document.querySelectorAll('li,[role="listitem"],button[class*="chip"],span[class*="chip"]').forEach(function(el){ var t=txt(el); if(t.split(' ').length<=6) add(t); }); } catch(e){}
+
+        // data-test-id attributes that mention keyword/trend
+        try { document.querySelectorAll('[data-test-id*="keyword"],[data-test-id*="trend"],[data-test-id*="term"]').forEach(function(el){ add(txt(el)); }); } catch(e){}
+
+        return kws.slice(0, 300);
+    } catch(globalErr) {
+        return ['__js_error__:' + String(globalErr)];
     }
-
-    // Strategy 1: links pointing to Pinterest explore/trends pages
-    document.querySelectorAll('a[href*="/explore/"], a[href*="trends.pinterest"]').forEach(function(a) {
-        add(a.innerText);
-    });
-
-    // Strategy 2: elements with 'trend' or 'keyword' in their class/id
-    document.querySelectorAll('[class*="trend"], [class*="keyword"], [class*="Trend"], [class*="Keyword"]').forEach(function(el) {
-        add(el.innerText);
-    });
-
-    // Strategy 3: heading elements inside main content
-    document.querySelectorAll('main h2, main h3, main h4, [role="main"] h2, [role="main"] h3').forEach(function(el) {
-        add(el.innerText);
-    });
-
-    // Strategy 4: list items / cards that look like keyword pills
-    document.querySelectorAll('li, [role="listitem"]').forEach(function(el) {
-        // Only pick short text (a keyword, not a paragraph)
-        var t = el.innerText.trim();
-        if (t.split(' ').length <= 6) add(t);
-    });
-
-    return kws.slice(0, 200);
 })();
 """
 
 def fetch_pinterest_trends_browser():
     """
-    Opens trends.pinterest.com in a real Brave tab (subprocess, so extensions
-    inject and the page loads normally), then extracts trending keywords via JS.
+    Navigates to trends.pinterest.com using the existing Brave/CDP session
+    (reuses the logged-in Pinterest session) and extracts keyword text via JS.
+    No subprocess tab needed — trends.pinterest.com doesn't require SortPin.
     """
     print("  Launching Brave + Selenium...")
     launch_brave_cdp()
@@ -167,48 +168,25 @@ def fetch_pinterest_trends_browser():
         print(f"  ✗ Could not connect to Brave: {e}")
         return []
 
-    url  = "https://trends.pinterest.com/"
     results = []
-
     try:
-        existing_handles = set(driver.window_handles)
-        subprocess.Popen([BRAVE_PATH, url])
+        # Use driver.get() — simpler, reuses Brave's logged-in Pinterest session
+        driver.get("https://trends.pinterest.com/")
+        print("  Waiting 12s for Pinterest Trends to load...")
+        time.sleep(12)
 
-        # Wait for tab to open
-        new_handle = None
-        for _ in range(15):
-            time.sleep(1)
-            new = set(driver.window_handles) - existing_handles
-            if new:
-                new_handle = next(iter(new))
-                driver.switch_to.window(new_handle)
-                break
+        keywords = driver.execute_script(EXTRACT_JS) or []
+        if keywords and keywords[0].startswith("__js_error__"):
+            print(f"  ⚠ JS error on page: {keywords[0]}")
+            keywords = []
 
-        if not new_handle:
-            print("  ⚠ New tab did not appear — trying direct navigation")
-            driver.get(url)
-
-        print("  Waiting 8s for Pinterest Trends to load...")
-        time.sleep(8)
-
-        keywords = driver.execute_script(EXTRACT_JS)
         print(f"  ✅ Pinterest Trends: {len(keywords)} keywords extracted")
-
         for kw in keywords:
-            results.append((kw.lower(), 80, "pinterest-trends"))
+            if kw and not kw.startswith("__"):
+                results.append((kw.lower(), 80, "pinterest-trends"))
 
     except Exception as e:
-        print(f"  ⚠ Pinterest Trends scrape error: {e}")
-    finally:
-        # Close the trends tab
-        try:
-            if new_handle and len(driver.window_handles) > 1:
-                driver.switch_to.window(new_handle)
-                driver.execute_script("window.onbeforeunload=null;")
-                driver.close()
-                driver.switch_to.window(driver.window_handles[-1])
-        except Exception:
-            pass
+        print(f"  ⚠ Pinterest Trends error: {e}")
 
     return results
 
