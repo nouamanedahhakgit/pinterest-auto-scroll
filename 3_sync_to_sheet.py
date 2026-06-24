@@ -1,37 +1,84 @@
 """
 STEP 3 — Sync progress.json statuses to Google Sheet (column D)
 ================================================================
-Reads your local progress.json and updates column D in the sheet
-with "Done" or "Not Yet" for every keyword.
+Updates column D in the background — no browser, no clipboard, no clicking.
 
 HOW TO USE:
-  1. Run: python 3_sync_to_sheet.py
-  2. Brave opens your Google Sheet automatically
-  3. Make sure you are LOGGED IN to Google
-  4. Press ENTER in this terminal when the sheet is ready
-  5. Statuses paste into column D automatically
+  python 3_sync_to_sheet.py
 
-You can run this any time after a scrolling session.
+ONE-TIME SETUP (pick one):
+  A) google_service_account.json  — Google Cloud service account (silent)
+  B) google_credentials.json    — OAuth (browser once, then silent)
+  C) google_sheets_webapp.json    — Apps Script web app (easiest, see SETUP_MSG)
 """
 
-import os, sys, json, time
-import subprocess, pyperclip, pyautogui
+import os
+import sys
+import json
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 # ═══ CONFIG ══════════════════════════════════════════════════════════════════
-BRAVE_PATH     = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 KEYWORDS_FILE  = "keywords.txt"
 PROGRESS_FILE  = "progress.json"
-SHEET_URL      = "https://docs.google.com/spreadsheets/d/1ZaIcgG7E2ChZYtUr9UZP78bfO-YNMArlbWZk_71E_VE/edit"
+SPREADSHEET_ID = "1ZaIcgG7E2ChZYtUr9UZP78bfO-YNMArlbWZk_71E_VE"
 STATUS_DONE    = "Done"
 STATUS_NOT_YET = "Not Yet"
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SA_FILE      = "google_service_account.json"
+OAUTH_FILE   = "google_credentials.json"
+TOKEN_FILE   = "google_token.json"
+WEBAPP_FILE  = "google_sheets_webapp.json"
+APPS_SCRIPT  = "google_sheets_apps_script.js"
 # ═════════════════════════════════════════════════════════════════════════════
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
+SETUP_MSG = f"""
+{'═'*62}
+  ONE-TIME SETUP — Google Sheets API (background sync)
+{'─'*62}
+
+  Service account (recommended — fully silent after setup):
+
+    1. https://console.cloud.google.com/ → create/select a project
+    2. APIs & Services → Library → enable "Google Sheets API"
+    3. Credentials → Create → Service account → Create key → JSON
+    4. Save the JSON file here as:
+         {os.path.join(BASE, SA_FILE)}
+    5. Open that JSON → copy "client_email"
+    6. Share your Google Sheet with that email → Editor
+    7. Run again:  python 3_sync_to_sheet.py
+
+  OAuth alternative (browser opens once on first run only):
+
+    1. Same GCP project → Credentials → OAuth client ID → Desktop app
+    2. Download JSON → save as {OAUTH_FILE} in this folder
+    3. Run:  python 3_sync_to_sheet.py
+
+  Apps Script web app (easiest — no Google Cloud):
+
+    1. Open your Google Sheet → Extensions → Apps Script
+    2. Paste the code from:  {os.path.join(BASE, APPS_SCRIPT)}
+    3. Deploy → New deployment → Web app
+         Execute as: Me  |  Who has access: Anyone
+    4. Copy the Web App URL into {WEBAPP_FILE}:
+         {{"url": "https://script.google.com/macros/s/.../exec", "secret": "pinterest-scan-2026"}}
+    5. Run:  python 3_sync_to_sheet.py
+
+{'═'*62}
+"""
+
+
 def load_keywords():
     path = os.path.join(BASE, KEYWORDS_FILE)
     if not os.path.exists(path):
-        print(f"ERROR: {KEYWORDS_FILE} not found."); sys.exit(1)
+        print(f"ERROR: {KEYWORDS_FILE} not found.")
+        sys.exit(1)
     kws = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -40,6 +87,7 @@ def load_keywords():
                 kws.append(line)
     return kws
 
+
 def load_progress():
     path = os.path.join(BASE, PROGRESS_FILE)
     if not os.path.exists(path):
@@ -47,79 +95,191 @@ def load_progress():
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
+
+def status_for(progress, kw):
+    if progress.get(kw, {}).get("status") == "done":
+        return STATUS_DONE
+    return STATUS_NOT_YET
+
+
+def get_gspread_client():
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials as SA_Creds
+    except ImportError:
+        print("  Missing packages. Run:")
+        print("  pip install gspread google-api-python-client google-auth-oauthlib")
+        sys.exit(1)
+
+    sa_path = os.path.join(BASE, SA_FILE)
+    if os.path.exists(sa_path):
+        creds = SA_Creds.from_service_account_file(sa_path, scopes=SCOPES)
+        return gspread.authorize(creds), "service account"
+
+    oauth_path = os.path.join(BASE, OAUTH_FILE)
+    token_path = os.path.join(BASE, TOKEN_FILE)
+    if os.path.exists(oauth_path):
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials as UserCreds
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
+        creds = None
+        if os.path.exists(token_path):
+            creds = UserCreds.from_authorized_user_file(token_path, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                print("  First OAuth login — browser will open once...")
+                flow = InstalledAppFlow.from_client_secrets_file(oauth_path, SCOPES)
+                creds = flow.run_local_server(port=0, prompt="consent")
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+        return gspread.authorize(creds), "oauth"
+
+    return None, None
+
+
+def load_webapp_config():
+    path = os.path.join(BASE, WEBAPP_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    if cfg.get("url"):
+        return cfg
+    return None
+
+
+def sync_via_webapp(statuses, cfg):
+    if requests is None:
+        print("  requests package required for web app sync.")
+        sys.exit(1)
+
+    flat = [row[0] for row in statuses]
+    payload = {
+        "secret": cfg.get("secret", "pinterest-scan-2026"),
+        "statuses": flat,
+    }
+    r = requests.post(cfg["url"], json=payload, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "web app returned error"))
+    return data.get("count", len(flat))
+
+
+def build_status_column(keywords, progress, sheet_keywords):
+    """Align statuses to sheet rows (column A), fall back to keywords.txt order."""
+    if sheet_keywords:
+        statuses = []
+        progress_lc = {k.lower(): v for k, v in progress.items()}
+        keywords_lc = {k.lower(): k for k in keywords}
+        for raw in sheet_keywords:
+            kw = (raw or "").strip()
+            if not kw:
+                statuses.append([""])
+                continue
+            key = keywords_lc.get(kw.lower(), kw)
+            if progress.get(key, progress_lc.get(kw.lower(), {})).get("status") == "done":
+                statuses.append([STATUS_DONE])
+            else:
+                statuses.append([STATUS_NOT_YET])
+        return statuses
+
+    return [[status_for(progress, kw)] for kw in keywords]
+
+
+def sync_to_sheet(ws, statuses):
+    if not statuses:
+        return 0
+    end_row = len(statuses) + 1
+    ws.update(f"D2:D{end_row}", statuses, value_input_option="RAW")
+    return len(statuses)
+
+
 def main():
     keywords = load_keywords()
     progress = load_progress()
     total    = len(keywords)
 
-    done_count = sum(1 for kw in keywords
-                     if progress.get(kw, {}).get("status") == "done")
+    done_count = sum(1 for kw in keywords if progress.get(kw, {}).get("status") == "done")
     not_yet    = total - done_count
 
     print(f"\n{'═'*55}")
-    print(f"  Google Sheet Status Sync")
+    print(f"  Google Sheet Status Sync  (background API)")
     print(f"{'─'*55}")
     print(f"  Keywords  : {total}")
     print(f"  Done      : {done_count}")
     print(f"  Not Yet   : {not_yet}")
     print(f"{'═'*55}\n")
 
-    # Preview first 10
-    print("  Preview (first 10):")
-    print(f"  {'Keyword':<38} Status")
-    print(f"  {'─'*38} ──────────")
-    for kw in keywords[:10]:
-        st = STATUS_DONE if progress.get(kw, {}).get("status") == "done" else STATUS_NOT_YET
-        mark = "✅" if st == STATUS_DONE else "⏳"
-        print(f"  {kw:<38} {mark} {st}")
-    if total > 10:
-        print(f"  ... and {total - 10} more\n")
+    webapp     = load_webapp_config()
+    sa_exists  = os.path.exists(os.path.join(BASE, SA_FILE))
+    oauth_exists = os.path.exists(os.path.join(BASE, OAUTH_FILE))
+
+    if not sa_exists and not oauth_exists and not webapp:
+        print(SETUP_MSG)
+        sys.exit(1)
+
+    if webapp and not sa_exists and not oauth_exists:
+        statuses = build_status_column(keywords, progress, sheet_keywords=None)
+        print("  Syncing via Apps Script web app (background)...")
+        try:
+            written = sync_via_webapp(statuses, webapp)
+        except Exception as e:
+            print(f"\n  ✗ Web app sync failed: {e}\n")
+            sys.exit(1)
     else:
-        print()
+        print("  Connecting to Google Sheets API...")
+        try:
+            client = get_gspread_client()
+            if client[0] is None:
+                print(SETUP_MSG)
+                sys.exit(1)
+            gc, auth_mode = client
+            sh = gc.open_by_key(SPREADSHEET_ID)
+            ws = sh.sheet1
+        except Exception as e:
+            err = str(e)
+            print(f"\n  ✗ Could not access sheet: {err}\n")
+            if "403" in err or "permission" in err.lower():
+                print("  → Share the sheet with your service account email (Editor).")
+            elif "404" in err:
+                print("  → Check SPREADSHEET_ID in this script.")
+            sys.exit(1)
 
-    # Build status column (one value per line = one row in Sheets)
-    statuses = []
-    for kw in keywords:
-        st = STATUS_DONE if progress.get(kw, {}).get("status") == "done" else STATUS_NOT_YET
-        statuses.append(st)
+        print(f"  Auth: {auth_mode}")
+        print(f"  Sheet: {sh.title} / tab: {ws.title}")
 
-    pyperclip.copy("\n".join(statuses))
-    print(f"  ✅ {total} statuses copied to clipboard\n")
+        if (ws.acell("D1").value or "").strip().lower() != "status":
+            ws.update("D1", [["Status"]], value_input_option="RAW")
 
-    # Open sheet in Brave
-    print(f"  Opening Google Sheet in Brave...")
-    subprocess.Popen([BRAVE_PATH, SHEET_URL])
+        col_a = ws.col_values(1)
+        if col_a and col_a[0].strip().lower() in ("keyword", "keywords"):
+            sheet_keywords = col_a[1:]
+        else:
+            sheet_keywords = col_a[1:] if len(col_a) > 1 else []
 
-    print(f"\n{'═'*55}")
-    print(f"  WAITING FOR YOU:")
-    print(f"  1. Make sure you are LOGGED IN to Google in Brave")
-    print(f"  2. Wait for the sheet to fully load")
-    print(f"  3. Press ENTER here (do NOT click the sheet yet)")
-    print(f"{'═'*55}")
-    input("\n  >> Press ENTER when the sheet is loaded: ")
+        statuses = build_status_column(keywords, progress, sheet_keywords)
+        if len(sheet_keywords) < len(keywords) and not sheet_keywords:
+            print(f"  Sheet column A empty — writing {len(keywords)} rows by keywords.txt order")
+        elif len(sheet_keywords) != len(keywords):
+            print(f"  Sheet rows: {len(sheet_keywords)} | keywords.txt: {len(keywords)}")
+            print(f"  Matching by keyword text in column A")
 
-    print(f"\n  Navigating to cell D2 in 3 seconds...")
-    print(f"  Keep Brave as the focused window!\n")
-    time.sleep(3)
+        print(f"  Updating column D ({len(statuses)} rows)...")
+        try:
+            written = sync_to_sheet(ws, statuses)
+        except Exception as e:
+            print(f"\n  ✗ Update failed: {e}\n")
+            sys.exit(1)
 
-    # Navigate to D2:
-    # Ctrl+Home → A1, then 3x Right → D1, then 1x Down → D2
-    pyautogui.hotkey("ctrl", "Home")
-    time.sleep(0.4)
-    pyautogui.press("right", presses=3, interval=0.12)   # A1 → D1
-    time.sleep(0.2)
-    pyautogui.press("down",  presses=1)                   # D1 → D2
-    time.sleep(0.2)
+    print(f"\n  ✅ Done! {written} statuses written to column D.")
+    print(f"     Done      = {done_count}")
+    print(f"     Not Yet   = {not_yet}\n")
+    print(f"  Sheet: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit\n")
 
-    # Paste (each line goes to the next row automatically in Sheets)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(2)
-
-    print(f"  ✅ Done! {total} statuses written to column D.")
-    print(f"     Done      = {done_count} rows")
-    print(f"     Not Yet   = {not_yet} rows\n")
-    print(f"  Tip: In the sheet, use Filter → column D → 'Not Yet'")
-    print(f"  to see exactly which keywords still need scrolling.\n")
 
 if __name__ == "__main__":
     main()
