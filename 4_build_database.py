@@ -33,8 +33,11 @@ from datetime import datetime
 csv.field_size_limit(10_000_000)              # SortPin rows have huge fields
 
 BASE      = os.path.dirname(os.path.abspath(__file__))
-DB_PATH   = os.path.join(BASE, "sortpin.db")
+# All scraped data is saved here (SQLite + importable MySQL .sql). Keep this folder!
+DB_DIR    = os.path.join(BASE, "IMPORTANT_DATABASE")
+DB_PATH   = os.path.join(BASE, "sortpin.db")            # SQLite (also copied to DB_DIR)
 JSON_PATH = os.path.join(BASE, "sortpin_data.json")
+MYSQL_PATH= os.path.join(DB_DIR, "sortpin_mysql.sql")   # import into MySQL/phpMyAdmin
 CDP_PORT  = 9222
 EXT_ID    = "djcledakkebdgjncnemijiabiaimbaic"   # SortPin extension id
 BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
@@ -237,6 +240,79 @@ def write_sqlite(data):
     """)
     con.commit()
     con.close()
+
+# ── write a MySQL-importable .sql dump (no live connection needed) ────────────
+# Column specs: (name, mysql_type, is_int).  Mirror the SQLite schema.
+_MYSQL_COLS = {
+    "pinners": [("username","VARCHAR(190)",0),("full_name","TEXT",0),("website_url","TEXT",0),
+        ("domain_url","TEXT",0),("contact_email","VARCHAR(255)",0),("contact_phone","VARCHAR(64)",0),
+        ("image_url","TEXT",0),("board_count","BIGINT",1),("follower_count","BIGINT",1),
+        ("following_count","BIGINT",1),("pin_count","BIGINT",1),("profile_reach","BIGINT",1),
+        ("profile_views","BIGINT",1),("last_pin_at","VARCHAR(64)",0)],
+    "boards": [("id","VARCHAR(64)",0),("name","TEXT",0),("description","TEXT",0),("url","TEXT",0),
+        ("image_cover_url","TEXT",0),("follower_count","BIGINT",1),("section_count","BIGINT",1),
+        ("pin_count","BIGINT",1),("category","VARCHAR(190)",0),("privacy","VARCHAR(64)",0),
+        ("modified_at","VARCHAR(64)",0),("owner_username","VARCHAR(190)",0)],
+    "pins": [("id","VARCHAR(64)",0),("title","TEXT",0),("description","TEXT",0),("link","TEXT",0),
+        ("pin_url","TEXT",0),("image","TEXT",0),("saves","BIGINT",1),("repin_count","BIGINT",1),
+        ("comment_count","BIGINT",1),("like_count","BIGINT",1),("created_at","VARCHAR(64)",0),
+        ("board_url","TEXT",0),("board_id","VARCHAR(64)",0),("board_name","TEXT",0),
+        ("pinner_username","VARCHAR(190)",0)],
+}
+# map normalized dict keys → column names (DB uses last_pin_at / modified_at)
+_KEYMAP = {"last_pin_at": "last_pin_at", "modified_at": "modified_at"}
+
+def _sql_val(v, is_int):
+    if v is None or v == "":
+        return "0" if is_int else "''"
+    if is_int:
+        try: return str(int(float(v)))
+        except (ValueError, TypeError): return "0"
+    s = str(v).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+    return "'" + s + "'"
+
+def _row_get(row, col):
+    # normalized rows use last_pin_at/modified_at already; boards use 'modified_at'? they use 'modified_at'
+    return row.get(col, row.get(col.replace("modified_at", "modified_at"), ""))
+
+def write_mysql_dump(data):
+    os.makedirs(DB_DIR, exist_ok=True)
+    with open(MYSQL_PATH, "w", encoding="utf-8") as f:
+        f.write("-- SortPin scraped data — import into MySQL:\n")
+        f.write("--   mysql -u USER -p DBNAME < sortpin_mysql.sql   (or use phpMyAdmin → Import)\n")
+        f.write(f"-- generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n")
+        for table in ("pins", "boards", "pinners"):
+            f.write(f"DROP TABLE IF EXISTS `{table}`;\n")
+        for table in ("pinners", "boards", "pins"):
+            cols = _MYSQL_COLS[table]
+            defs = ",\n  ".join(f"`{c}` {t}" for c, t, _ in cols)
+            pk = cols[0][0]
+            f.write(f"\nCREATE TABLE `{table}` (\n  {defs},\n  PRIMARY KEY (`{pk}`)\n"
+                    f") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n")
+        f.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
+        for table in ("pinners", "boards", "pins"):
+            cols = _MYSQL_COLS[table]
+            rows = data[table]
+            if not rows:
+                continue
+            collist = ", ".join(f"`{c}`" for c, _, _ in cols)
+            f.write(f"\n-- {len(rows)} {table}\n")
+            BATCH = 400
+            for i in range(0, len(rows), BATCH):
+                chunk = rows[i:i+BATCH]
+                f.write(f"INSERT INTO `{table}` ({collist}) VALUES\n")
+                vals = []
+                for r in chunk:
+                    cells = ", ".join(_sql_val(r.get(c), is_int) for c, _, is_int in cols)
+                    vals.append(f"({cells})")
+                f.write(",\n".join(vals) + ";\n")
+    # also keep a copy of the SQLite db next to it
+    try:
+        import shutil
+        shutil.copy2(DB_PATH, os.path.join(DB_DIR, os.path.basename(DB_PATH)))
+    except Exception:
+        pass
 
 # ── write FLAT JSON (pinners / boards / pins arrays) for the viewer ───────────
 def write_json(data):
@@ -595,15 +671,17 @@ def _sub(d, *keys):
     return ""
 
 def _best_image(o):
-    """Reconstruct a pin image URL from the raw object."""
-    sig = o.get("image_signature") or o.get("image_signature_unique")
-    if isinstance(sig, str) and len(sig) >= 6:
-        return f"https://i.pinimg.com/originals/{sig[0:2]}/{sig[2:4]}/{sig[4:6]}/{sig}.jpg"
+    """Reconstruct a pin image URL from the raw object. Prefer an actual size
+    URL from `images`; otherwise build a 736x URL from the signature (the 736x
+    size almost always exists, unlike 'originals' which often 404s)."""
     imgs = o.get("images")
     if isinstance(imgs, dict):
-        for key in ("orig", "736x", "564x", "474x", "236x"):
+        for key in ("736x", "orig", "564x", "474x", "236x"):
             if isinstance(imgs.get(key), dict) and imgs[key].get("url"):
                 return imgs[key]["url"]
+    sig = o.get("image_signature") or o.get("image_signature_unique")
+    if isinstance(sig, str) and len(sig) >= 6:
+        return f"https://i.pinimg.com/736x/{sig[0:2]}/{sig[2:4]}/{sig[4:6]}/{sig}.jpg"
     return ""
 
 def _flatten_raw(kind, o):
@@ -824,6 +902,7 @@ def main():
     data = normalize(leads, boards, pins)
     write_sqlite(data)
     write_json(data)
+    write_mysql_dump(data)
 
     print(f"\n  ✅ Built local database:")
     print(f"     • pinners : {len(data['pinners']):>6}")
@@ -831,6 +910,7 @@ def main():
     print(f"     • pins    : {len(data['pins']):>6}")
     print(f"\n     → {os.path.basename(DB_PATH)}   (SQLite, relational)")
     print(f"     → {os.path.basename(JSON_PATH)}   (pinners/boards/pins, for the viewer)")
+    print(f"     → IMPORTANT_DATABASE/sortpin_mysql.sql   (import into MySQL)")
     print(f"\n  Next:  python 5_view_data.py   (stats + browse the data)\n")
 
 if __name__ == "__main__":

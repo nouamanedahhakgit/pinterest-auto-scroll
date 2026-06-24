@@ -29,6 +29,9 @@ import os, sys, glob, shutil, subprocess, time
 EXT_ID = "djcledakkebdgjncnemijiabiaimbaic"   # SortPin extension id
 USER_DATA = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                          "BraveSoftware", "Brave-Browser", "User Data")
+BASE = os.path.dirname(os.path.abspath(__file__))
+# deleted extension data is backed up here before removal (never auto-deleted)
+ARCHIVE_DIR = os.path.join(BASE, "_SORTPIN_ARCHIVE")
 
 def _dir_size(path):
     total = 0
@@ -110,6 +113,26 @@ def main():
         print("\n  Closing Brave (its files are locked while it runs)...")
         close_brave()
 
+    # 1) ARCHIVE (backup) every folder into the project before deleting it
+    import time as _t
+    stamp = _t.strftime("%Y-%m-%d_%H-%M-%S")
+    archive_root = os.path.join(ARCHIVE_DIR, stamp)
+    print(f"\n  Archiving a backup into _SORTPIN_ARCHIVE/{stamp}/ ...")
+    archived = 0
+    for t in targets:
+        try:
+            # keep the profile name + folder name so backups are identifiable
+            prof = os.path.basename(os.path.dirname(os.path.dirname(t)))
+            dest = os.path.join(archive_root, prof, os.path.basename(t))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copytree(t, dest)
+            archived += 1
+        except Exception as e:
+            print(f"     ⚠ could not archive {t}: {e}")
+    if archived:
+        print(f"     ✅ backed up {archived} folder(s) → _SORTPIN_ARCHIVE/{stamp}/")
+
+    # 2) DELETE from the extension
     deleted, failed = [], []
     for t in targets:
         try:
@@ -118,12 +141,13 @@ def main():
         except Exception as e:
             failed.append((t, str(e)))
 
-    print(f"\n  ✅ Deleted {len(deleted)} folder(s), freed ~{_human(total)}.")
+    print(f"\n  ✅ Deleted {len(deleted)} folder(s) from the extension, freed ~{_human(total)}.")
     for t, e in failed:
         print(f"     ⚠ could not delete {t}\n        {e}")
     if failed:
         print("     (Make sure Brave is fully closed, then re-run.)")
     print(f"\n  Done. SortPin will start empty next time you open Brave.")
+    print(f"  A backup of the deleted data is in:  _SORTPIN_ARCHIVE/{stamp}/")
     print(f"  Your CSV snapshots and sortpin.db are untouched.\n")
 
 if __name__ == "__main__":

@@ -17,10 +17,14 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `3_sync_to_sheet.py` | Writes Done/Not Yet from progress.json into column D of the sheet. |
 | `4_build_database.py` | Builds a local **relational** DB from SortPin data: Pinner→Boards→Pins. Outputs `sortpin.db` + `sortpin_data.json`. |
 | `5_view_data.py` | Prints statistics + builds/opens `sortpin_viewer.html` to browse Pinner→Boards→Pins. |
-| `6_clear_sortpin.py` | Clears the SortPin extension's stored data (IndexedDB + big storage arrays) so it stops growing. Run step 4 first to save. |
+| `6_clear_sortpin.py` | Archives extension data into `_SORTPIN_ARCHIVE/` then clears it from Brave. Run step 4 first to save. |
+| `magic_scroll.py` | **All-in-one multi-computer loop:** claim 5 keywords from sheet (pending) → scroll → build DB → mark Done → clear SortPin → repeat. |
 | `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
-| `sortpin_data.json` | Auto-created (step 4). Nested Pinner→Boards→Pins (feeds the viewer). |
-| `sortpin_viewer.html` | Auto-created (step 5). Self-contained offline browser of the data. |
+| `sortpin_data.json` | Auto-created (step 4). Flat pinners/boards/pins arrays (feeds the viewer). |
+| `sortpin_viewer.html` | Auto-created (step 5). Offline browser with Pinners / Boards / Pins tabs. |
+| `IMPORTANT_DATABASE/` | Auto-created (step 4). `sortpin_mysql.sql` (import into MySQL) + a copy of `sortpin.db`. |
+| `_SORTPIN_ARCHIVE/` | Auto-created (step 6). Timestamped backups of cleared extension data. Gitignored. |
+| `google_sheets_apps_script.js` | Apps Script web app (v3): setup/column/**claim**/**mark** (LockService = multi-PC safe). Redeploy after edits. |
 | `Pinterest_Trends_Analysis_June2026.xlsx` | Full trend data (5 sheets). |
 
 ## Run commands
@@ -36,9 +40,23 @@ python 3_sync_to_sheet.py               # push statuses to sheet
 python 4_build_database.py              # LIVE pull from SortPin extension via Brave (CDP)
 python 4_build_database.py --disk       # read IndexedDB files directly, NO browser (pip install ccl_chromium_reader)
 python 4_build_database.py --csv        # skip live; build only from CSV exports in folder
-python 5_view_data.py                   # stats + open the visual data browser
-python 6_clear_sortpin.py               # clear extension data (run step 4 first!)
+python 4_build_database.py              # also writes IMPORTANT_DATABASE/sortpin_mysql.sql
+python 5_view_data.py                   # static viewer (reads sortpin.db → Pinners/Boards/Pins tabs)
+python 5_view_data.py --server          # LIVE local server: card+TABLE views, full pin detail, images
+python 6_clear_sortpin.py               # archives backup → _SORTPIN_ARCHIVE/ then clears
+python 6_clear_sortpin.py --yes         # no confirmation prompt
+python magic_scroll.py                  # multi-PC: claim→scroll→build→done→clear→repeat (5 min/kw)
+python magic_scroll.py --2m --batch 5   # 2 min per keyword, 5 keywords per cycle
+python magic_scroll.py --disk           # build DB from disk each cycle (needs ccl_chromium_reader)
 ```
+
+## magic_scroll — multi-computer workflow
+- Each computer loops: **claim** up to N "Not Yet" keywords from the sheet (→ "pending",
+  atomic via Apps Script `LockService` so no two PCs take the same), **scroll** them in
+  Brave, run step 4 to **save** all data (sortpin.db + sortpin_mysql.sql), **mark Done**
+  on the sheet, run step 6 to **clear** SortPin (archived first), then repeat.
+- One-time: redeploy `google_sheets_apps_script.js` (v3, has claim/mark) as the web app;
+  `google_sheets_webapp.json` holds the `/exec` URL. Sheet col A = keyword, col D = Status.
 
 ## Steps 4 & 5 — SortPin data → relational DB + viewer
 - **Data model:** `leads` CSV = master pinners; `boards` link to pinner via `owner_username`;

@@ -14,7 +14,7 @@ const SPREADSHEET_ID = "1ZaIcgG7E2ChZYtUr9UZP78bfO-YNMArlbWZk_71E_VE";
 const SECRET = "pinterest-scan-2026";
 
 function doGet() {
-  return jsonOut({ ok: true, version: 2, message: "Web app ready — doPost exists" });
+  return jsonOut({ ok: true, version: 3, message: "Web app ready — claim/mark supported" });
 }
 
 function doPost(e) {
@@ -30,10 +30,68 @@ function doPost(e) {
     if (data.action === "setup" && data.rows && data.rows.length > 0) {
       return setupKeywords(sheet, data.rows);
     }
+    if (data.action === "claim") {
+      return claimKeywords(sheet, data.count || 5);
+    }
+    if (data.action === "mark") {
+      return markKeywords(sheet, data.keywords || [], data.status || "Done");
+    }
 
     return writeColumn(sheet, data);
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
+  }
+}
+
+// Atomically claim up to n keywords whose Status is empty/"Not Yet": set them to
+// "pending" and return them. LockService serialises concurrent computers so the
+// same keyword is never handed to two machines.
+function claimKeywords(sheet, n) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const last = sheet.getLastRow();
+    if (last < 2) return jsonOut({ ok: true, action: "claim", claimed: [] });
+    const vals = sheet.getRange(2, 1, last - 1, 4).getValues();   // A2:D(last)
+    const claimed = [];
+    for (let i = 0; i < vals.length && claimed.length < n; i++) {
+      const kw = (vals[i][0] || "").toString().trim();
+      const st = (vals[i][3] || "").toString().trim().toLowerCase();
+      if (kw && (st === "" || st === "not yet")) {
+        vals[i][3] = "pending";
+        claimed.push({ row: i + 2, keyword: kw });
+      }
+    }
+    if (claimed.length) {
+      sheet.getRange(2, 4, vals.length, 1).setValues(vals.map(function (r) { return [r[3]]; }));
+      SpreadsheetApp.flush();
+    }
+    return jsonOut({ ok: true, action: "claim", claimed: claimed });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Set Status for the given keywords (column A match) to `status` (e.g. "Done").
+function markKeywords(sheet, keywords, status) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const last = sheet.getLastRow();
+    if (last < 2) return jsonOut({ ok: true, action: "mark", count: 0 });
+    const vals = sheet.getRange(2, 1, last - 1, 4).getValues();
+    const want = {};
+    keywords.forEach(function (k) { want[(k || "").toString().trim().toLowerCase()] = 1; });
+    let count = 0;
+    for (let i = 0; i < vals.length; i++) {
+      const kw = (vals[i][0] || "").toString().trim().toLowerCase();
+      if (want[kw]) { vals[i][3] = status; count++; }
+    }
+    sheet.getRange(2, 4, vals.length, 1).setValues(vals.map(function (r) { return [r[3]]; }));
+    SpreadsheetApp.flush();
+    return jsonOut({ ok: true, action: "mark", count: count });
+  } finally {
+    lock.releaseLock();
   }
 }
 
