@@ -62,15 +62,22 @@ def pin_id_from_url(pin_url, fallback=""):
     fb = _clean(fallback)
     return fb if (fb and "E+" not in fb.upper()) else ""
 
-def newest(pattern):
-    hits = sorted(glob.glob(os.path.join(BASE, pattern)))
-    return hits[-1] if hits else None
-
 def read_csv(path):
     if not path or not os.path.exists(path):
         return []
     with open(path, encoding="utf-8", newline="") as f:
         return list(csv.DictReader(f))
+
+def read_all(pattern):
+    """Read & concatenate EVERY CSV matching pattern, oldest→newest by mtime.
+    Merging all exports (from any computer) lets the DB accumulate across
+    machines; duplicates are collapsed later by primary key (newest wins)."""
+    files = sorted(glob.glob(os.path.join(BASE, pattern)),
+                   key=lambda p: os.path.getmtime(p))
+    rows = []
+    for fp in files:
+        rows += read_csv(fp)
+    return rows, files
 
 # ── normalisation: raw rows → pinners / boards / pins ─────────────────────────
 def normalize(leads, boards, pins):
@@ -113,9 +120,9 @@ def normalize(leads, boards, pins):
         p["profile_views"]  = _int(l.get("profile_views"))
         p["last_pin_at"]    = _clean(l.get("lastPinAt"))
 
-    # 2) Boards (link to pinner via owner_username)
+    # 2) Boards (link to pinner via owner_username) — dedup by board id
     board_by_url = {}
-    out_boards   = []
+    boards_by_id = {}                 # id -> board (newest occurrence wins)
     for b in boards:
         owner = _clean(b.get("owner_username"))
         p = ensure_pinner(owner, b.get("owner_full_name"))
@@ -138,22 +145,21 @@ def normalize(leads, boards, pins):
         }
         if not rec["id"]:
             continue
-        out_boards.append(rec)
+        boards_by_id[rec["id"]] = rec          # dedup: newest export wins
         if rec["url"]:
             board_by_url[rec["url"]] = rec["id"]
+    out_boards = list(boards_by_id.values())
 
     # 3) Pins (link to pinner via pinner_username, to board via board_url)
-    out_pins = []
-    seen_pin = set()
+    pins_by_id = {}                            # pin id -> pin (newest wins)
     for pn in pins:
         pinner = _clean(pn.get("pinner_username"))
         ensure_pinner(pinner, pn.get("pinner_name"))
         pid = pin_id_from_url(pn.get("pin_url"), pn.get("id"))
-        if not pid or pid in seen_pin:
+        if not pid:
             continue
-        seen_pin.add(pid)
         burl = _clean(pn.get("board_url"))
-        out_pins.append({
+        pins_by_id[pid] = {
             "id":             pid,
             "title":          _clean(pn.get("title")),
             "description":    _clean(pn.get("description")),
@@ -169,7 +175,8 @@ def normalize(leads, boards, pins):
             "board_id":       board_by_url.get(burl) or None,   # None → FK not enforced
             "board_name":     _clean(pn.get("board_name")),
             "pinner_username":pinner or None,
-        })
+        }
+    out_pins = list(pins_by_id.values())
 
     return {"pinners": list(pinners.values()),
             "boards":  out_boards,
@@ -375,13 +382,14 @@ def try_live_extension():
 
 # ── data source 2: CSV exports in this folder ─────────────────────────────────
 def load_from_csv():
-    leads_f  = newest("*all_leads*.csv")
-    boards_f = newest("*all_boards*.csv")
-    pins_f   = newest("*all_pins*.csv")
-    print(f"  leads CSV : {os.path.basename(leads_f)  if leads_f  else '— none —'}")
-    print(f"  boards CSV: {os.path.basename(boards_f) if boards_f else '— none —'}")
-    print(f"  pins CSV  : {os.path.basename(pins_f)   if pins_f   else '— none —'}")
-    return read_csv(leads_f), read_csv(boards_f), read_csv(pins_f)
+    leads,  lf = read_all("*all_leads*.csv")
+    boards, bf = read_all("*all_boards*.csv")
+    pins,   pf = read_all("*all_pins*.csv")
+    print(f"  leads  : {len(lf)} file(s) → {len(leads):>5} rows")
+    print(f"  boards : {len(bf)} file(s) → {len(boards):>5} rows")
+    print(f"  pins   : {len(pf)} file(s) → {len(pins):>5} rows")
+    print(f"  (all CSV exports in this folder are merged & de-duplicated)")
+    return leads, boards, pins
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
