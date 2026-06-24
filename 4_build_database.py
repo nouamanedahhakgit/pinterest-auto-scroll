@@ -120,6 +120,8 @@ def normalize(leads, boards, pins):
         p["profile_reach"]  = _int(l.get("profile_reach"))
         p["profile_views"]  = _int(l.get("profile_views"))
         p["last_pin_at"]    = _clean(l.get("lastPinAt"))
+        if not p["image_url"]:
+            p["image_url"]  = _clean(l.get("image_medium_url")) or _clean(l.get("image_small_url"))
 
     # 2) Boards (link to pinner via owner_username) — dedup by board id
     board_by_url = {}
@@ -236,53 +238,43 @@ def write_sqlite(data):
     con.commit()
     con.close()
 
-# ── write nested JSON (Pinner → Boards → Pins) for the viewer ─────────────────
+# ── write FLAT JSON (pinners / boards / pins arrays) for the viewer ───────────
 def write_json(data):
-    boards_by_owner = {}
+    # per-pinner counts so the Pinners tab can show/sort them
+    n_boards = {}; n_pins = {}
     for b in data["boards"]:
-        boards_by_owner.setdefault(b["owner_username"], []).append(b)
-    pins_by_pinner = {}
+        if b.get("owner_username"):
+            n_boards[b["owner_username"]] = n_boards.get(b["owner_username"], 0) + 1
     for p in data["pins"]:
-        pins_by_pinner.setdefault(p["pinner_username"], []).append(p)
+        if p.get("pinner_username"):
+            n_pins[p["pinner_username"]] = n_pins.get(p["pinner_username"], 0) + 1
 
-    pinners_out = []
+    pinners = []
     for p in data["pinners"]:
         u = p["username"]
-        my_boards = boards_by_owner.get(u, [])
-        my_pins   = pins_by_pinner.get(u, [])
-        pins_by_board = {}
-        loose = []
-        board_ids = {b["id"] for b in my_boards}
-        for pin in my_pins:
-            if pin["board_id"] and pin["board_id"] in board_ids:
-                pins_by_board.setdefault(pin["board_id"], []).append(pin)
-            else:
-                loose.append(pin)
-        boards_nested = []
-        for b in sorted(my_boards, key=lambda x: x["pin_count"], reverse=True):
-            bb = dict(b)
-            bb["pins"] = pins_by_board.get(b["id"], [])
-            boards_nested.append(bb)
-        rec = dict(p)
-        rec["boards"]      = boards_nested
-        rec["loose_pins"]  = loose
-        rec["_n_boards"]   = len(my_boards)
-        rec["_n_pins"]     = len(my_pins)
-        pinners_out.append(rec)
+        pinners.append({
+            "username": u, "full_name": p.get("full_name", ""),
+            "image_url": p.get("image_url", ""), "website_url": p.get("website_url", ""),
+            "domain_url": p.get("domain_url", ""), "contact_email": p.get("contact_email", ""),
+            "follower_count": p.get("follower_count", 0), "pin_count": p.get("pin_count", 0),
+            "board_count": p.get("board_count", 0), "profile_reach": p.get("profile_reach", 0),
+            "nb": n_boards.get(u, 0), "np": n_pins.get(u, 0),
+        })
+    pinners.sort(key=lambda x: (x["np"], x["follower_count"]), reverse=True)
 
-    pinners_out.sort(key=lambda x: (x["follower_count"], x["_n_pins"]), reverse=True)
+    boards = sorted(data["boards"], key=lambda b: b.get("pin_count", 0), reverse=True)
+    pins   = sorted(data["pins"],   key=lambda p: p.get("repin_count", 0), reverse=True)
 
     out = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "stats": {
-            "pinners": len(data["pinners"]),
-            "boards":  len(data["boards"]),
-            "pins":    len(data["pins"]),
-        },
-        "pinners": pinners_out,
+        "stats": {"pinners": len(data["pinners"]), "boards": len(data["boards"]),
+                  "pins": len(data["pins"])},
+        "pinners": pinners,
+        "boards":  boards,
+        "pins":    pins,
     }
     with open(JSON_PATH, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+        json.dump(out, f, ensure_ascii=False)
 
 # ── data source 1: LIVE from the SortPin extension in Brave ───────────────────
 def _cdp_up():
@@ -367,11 +359,18 @@ _READ_IDB_CHUNK_JS = r"""
 const dbName = arguments[0], store = arguments[1], afterKey = arguments[2],
       count = arguments[3], done = arguments[4];
 (async () => {
+  // keep scalars, small nested, AND the relationship objects we need to link
+  const KEEP = {pinner:1, board:1, owner:1, native_creator:1, origin_pinner:1, pinned_to_board:1};
   function trim(o){
     if (o===null || typeof o!=='object') return o;
     const r = {};
     for (const k in o){ const v=o[k], t=typeof v;
       if (v===null||t==='string'||t==='number'||t==='boolean') r[k]=v;
+      else if (KEEP[k] && v && typeof v==='object') {
+        // keep just the linking sub-fields of the related object
+        r[k] = {username:v.username, full_name:v.full_name, url:v.url, id:v.id,
+                name:v.name, image_medium_url:v.image_medium_url};
+      }
       else { try { const s=JSON.stringify(v); if (s && s.length<=800) r[k]=v; } catch(e){} } }
     return r;
   }
@@ -519,7 +518,8 @@ def try_live_extension():
                 start += len(chunk)
                 print(f"\r  (live) reading {name} as {kind} ({len(rows)}/{n})   ", end="", flush=True)
         print()
-        picked[kind] = rows
+        # flatten raw Pinterest objects → flat schema the linker expects
+        picked[kind] = [_flatten_raw(kind, r) for r in rows]
 
     try: driver.close()
     except Exception: pass
@@ -583,6 +583,90 @@ def _trim_row(o):
             except Exception:
                 pass
     return r
+
+def _sub(d, *keys):
+    """Safe nested getter: _sub(obj, 'username') from a nested object/dict."""
+    if not isinstance(d, dict):
+        return ""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return ""
+
+def _best_image(o):
+    """Reconstruct a pin image URL from the raw object."""
+    sig = o.get("image_signature") or o.get("image_signature_unique")
+    if isinstance(sig, str) and len(sig) >= 6:
+        return f"https://i.pinimg.com/originals/{sig[0:2]}/{sig[2:4]}/{sig[4:6]}/{sig}.jpg"
+    imgs = o.get("images")
+    if isinstance(imgs, dict):
+        for key in ("orig", "736x", "564x", "474x", "236x"):
+            if isinstance(imgs.get(key), dict) and imgs[key].get("url"):
+                return imgs[key]["url"]
+    return ""
+
+def _flatten_raw(kind, o):
+    """Map a RAW Pinterest IndexedDB object to the flat schema the linker/CSV
+    use, pulling owner/pinner/board out of their nested objects."""
+    if not isinstance(o, dict):
+        return {}
+    if kind == "pins":
+        pinner = o.get("pinner") or o.get("native_creator") or o.get("origin_pinner") or {}
+        board  = o.get("board") or o.get("pinned_to_board") or {}
+        pid = str(o.get("id") or "")
+        return {
+            "id": pid,
+            "pin_url": f"https://www.pinterest.com/pin/{pid}" if pid else "",
+            "title": o.get("title") or o.get("grid_title") or "",
+            "description": o.get("description") or "",
+            "link": o.get("link") or o.get("mobile_link") or "",
+            "image": _best_image(o),
+            "saves": o.get("saves") or o.get("repin_count") or 0,
+            "repin_count": o.get("repin_count") or 0,
+            "comment_count": o.get("comment_count") or 0,
+            "like_count": 0,
+            "created_at": o.get("created_at") or o.get("createdAt") or "",
+            "board_url": _sub(board, "url"),
+            "board_name": _sub(board, "name"),
+            "pinner_username": _sub(pinner, "username"),
+        }
+    if kind == "boards":
+        owner = o.get("owner") or {}
+        return {
+            "id": str(o.get("id") or ""),
+            "name": o.get("name") or "",
+            "description": o.get("description") or "",
+            "url": o.get("url") or "",
+            "image_cover_url": o.get("image_cover_url") or "",
+            "follower_count": o.get("follower_count") or 0,
+            "section_count": o.get("section_count") or 0,
+            "pin_count": o.get("pin_count") or 0,
+            "category": o.get("category") or "",
+            "privacy": o.get("privacy") or "",
+            "modifiedAt": o.get("modifiedAt") or o.get("createdAt") or "",
+            "owner_username": _sub(owner, "username"),
+            "owner_full_name": _sub(owner, "full_name"),
+            "owner_image_medium_url": _sub(owner, "image_medium_url", "image_small_url"),
+        }
+    if kind == "leads":
+        return {
+            "username": o.get("username") or "",
+            "full_name": o.get("full_name") or "",
+            "website_url": o.get("website_url") or o.get("listed_website_url") or "",
+            "domain_url": o.get("domain_url") or "",
+            "contact_email": o.get("contact_email") or "",   # not present in raw
+            "contact_phone": o.get("contact_phone") or "",
+            "board_count": o.get("board_count") or 0,
+            "follower_count": o.get("follower_count") or 0,
+            "following_count": o.get("following_count") or 0,
+            "pin_count": o.get("pin_count") or 0,
+            "profile_reach": o.get("profile_reach") or 0,
+            "profile_views": o.get("profile_views") or o.get("profile_view") or 0,
+            "lastPinAt": o.get("lastPinAt") or "",
+            "image_medium_url": o.get("image_medium_url") or o.get("image_small_url") or "",
+        }
+    return {}
 
 def _disk_rows_ccl(folder):
     """Read all object-store records from a leveldb folder via ccl_chromium_reader
@@ -651,7 +735,9 @@ def try_disk_extension():
             kind = _classify_keys(v.keys())
             if not kind:
                 continue
-            buckets[kind].append(_trim_row(v)); added += 1
+            flat = _flatten_raw(kind, v)
+            if flat:
+                buckets[kind].append(flat); added += 1
         return added
 
     for d in dirs:
@@ -744,7 +830,7 @@ def main():
     print(f"     • boards  : {len(data['boards']):>6}")
     print(f"     • pins    : {len(data['pins']):>6}")
     print(f"\n     → {os.path.basename(DB_PATH)}   (SQLite, relational)")
-    print(f"     → {os.path.basename(JSON_PATH)}   (nested, for the viewer)")
+    print(f"     → {os.path.basename(JSON_PATH)}   (pinners/boards/pins, for the viewer)")
     print(f"\n  Next:  python 5_view_data.py   (stats + browse the data)\n")
 
 if __name__ == "__main__":
