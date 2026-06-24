@@ -27,7 +27,7 @@ Run:
   python 4_build_database.py --live     # try the live extension first, else CSV
 """
 
-import os, sys, csv, json, re, glob, sqlite3
+import os, sys, csv, json, re, glob, sqlite3, socket, subprocess, time
 from datetime import datetime
 
 csv.field_size_limit(10_000_000)              # SortPin rows have huge fields
@@ -37,6 +37,7 @@ DB_PATH   = os.path.join(BASE, "sortpin.db")
 JSON_PATH = os.path.join(BASE, "sortpin_data.json")
 CDP_PORT  = 9222
 EXT_ID    = "djcledakkebdgjncnemijiabiaimbaic"   # SortPin extension id
+BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 
 # ── small helpers ─────────────────────────────────────────────────────────────
 def _int(v, default=0):
@@ -283,102 +284,153 @@ def write_json(data):
     with open(JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
-# ── data source 1: live extension (best-effort) ───────────────────────────────
-def try_live_extension():
-    """
-    Best-effort: connect to Brave via CDP, open the SortPin extension page, and
-    read its stored data (chrome.storage.local + IndexedDB) from the extension
-    context. Returns (leads, boards, pins) or None if it can't.
+# ── data source 1: LIVE from the SortPin extension in Brave ───────────────────
+def _cdp_up():
+    try:
+        s = socket.create_connection(("127.0.0.1", CDP_PORT), timeout=1); s.close()
+        return True
+    except OSError:
+        return False
 
-    This needs Brave running with --remote-debugging-port=9222 (same as step 2)
-    and selenium installed. If anything fails we return None and the caller
-    falls back to the CSV exports.
-    """
+def _ensure_brave_cdp():
+    """Attach to a Brave already on the debug port, or launch one (default
+    profile, so the SortPin extension + its stored data are present)."""
+    if _cdp_up():
+        print(f"  (live) Brave already on CDP :{CDP_PORT}")
+        return True
+    if not os.path.exists(BRAVE_PATH):
+        print(f"  (live) Brave not found at {BRAVE_PATH}")
+        return False
+    print(f"  (live) launching Brave with debug port {CDP_PORT}...")
+    subprocess.run(["taskkill", "/F", "/IM", "brave.exe"], capture_output=True)
+    time.sleep(2)
+    subprocess.Popen([BRAVE_PATH, f"--remote-debugging-port={CDP_PORT}",
+                      "--no-first-run", "--no-default-browser-check"])
+    for _ in range(15):
+        if _cdp_up():
+            time.sleep(2); return True
+        time.sleep(1)
+    return False
+
+# JS run IN THE EXTENSION PAGE: dump chrome.storage.local + every IndexedDB store
+_DUMP_JS = r"""
+const done = arguments[arguments.length - 1];
+(async () => {
+  const result = {storage:{}, idb:{}, errors:[]};
+  // chrome.storage.local
+  try {
+    if (typeof chrome!=='undefined' && chrome.storage && chrome.storage.local) {
+      result.storage = await new Promise(r => chrome.storage.local.get(null, d => r(d||{})));
+    }
+  } catch(e){ result.errors.push('storage:'+e); }
+  // IndexedDB (all DBs, all stores)
+  try {
+    const dbs = (indexedDB.databases ? await indexedDB.databases() : []);
+    for (const meta of dbs) {
+      const db = await new Promise((res,rej)=>{const r=indexedDB.open(meta.name);
+        r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error);});
+      for (const s of Array.from(db.objectStoreNames)) {
+        const rows = await new Promise(res=>{const tx=db.transaction(s,'readonly');
+          const rq=tx.objectStore(s).getAll(); rq.onsuccess=()=>res(rq.result||[]);
+          rq.onerror=()=>res([]);});
+        result.idb[meta.name+'/'+s] = rows;
+      }
+      db.close();
+    }
+  } catch(e){ result.errors.push('idb:'+e); }
+  done(result);
+})();
+"""
+
+def _collect_arrays(blob):
+    """Yield every list-of-objects found anywhere inside a dump (storage/idb),
+    even when nested one level inside an object."""
+    if not isinstance(blob, dict):
+        return
+    for source in ("storage", "idb"):
+        section = blob.get(source, {})
+        if not isinstance(section, dict):
+            continue
+        for key, val in section.items():
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                yield key, val
+            elif isinstance(val, dict):
+                for k2, v2 in val.items():
+                    if isinstance(v2, list) and v2 and isinstance(v2[0], dict):
+                        yield f"{key}.{k2}", v2
+
+def _classify(arr):
+    keys = set(arr[0].keys())
+    if ("pin_url" in keys) or ("pinner_username" in keys) or ("repin_count" in keys):
+        return "pins"
+    if ("owner_username" in keys) or ("image_cover_url" in keys) or ("section_count" in keys):
+        return "boards"
+    if ("contact_email" in keys) or ("website_url" in keys and "username" in keys) \
+       or ("profile_reach" in keys):
+        return "leads"
+    return None
+
+def try_live_extension():
+    """Read SortPin's data live from the extension in Brave. Returns
+    (leads, boards, pins) or None. Self-diagnoses: prints what it finds so the
+    storage layout is visible even if classification needs tuning."""
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
     except Exception:
+        print("  (live) selenium not installed — run: pip install selenium")
+        return None
+    if not _ensure_brave_cdp():
+        print(f"  (live) could not get Brave on the debug port — falling back to CSV")
         return None
     try:
         opts = Options()
         opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{CDP_PORT}")
         driver = webdriver.Chrome(options=opts)
     except Exception as e:
-        print(f"  (live) could not attach to Brave on :{CDP_PORT} — {e}")
+        print(f"  (live) could not attach Selenium to Brave — {e}")
         return None
 
     try:
-        # open the extension page in a new tab so we run in the extension origin
         driver.switch_to.new_window("tab")
-        driver.get(f"chrome-extension://{EXT_ID}/popup.html")
-        import time as _t; _t.sleep(3)
-
-        # 1) chrome.storage.local dump
-        store = driver.execute_async_script("""
-            const done = arguments[arguments.length - 1];
-            try {
-                if (chrome && chrome.storage && chrome.storage.local) {
-                    chrome.storage.local.get(null, d => done(d || {}));
-                } else { done(null); }
-            } catch (e) { done(null); }
-        """)
-
-        # 2) IndexedDB dump (all DBs / all object stores)
-        idb = driver.execute_async_script("""
-            const done = arguments[arguments.length - 1];
-            (async () => {
-                const out = {};
-                try {
-                    const dbs = (indexedDB.databases ? await indexedDB.databases() : []);
-                    for (const meta of dbs) {
-                        const db = await new Promise((res, rej) => {
-                            const r = indexedDB.open(meta.name);
-                            r.onsuccess = () => res(r.result);
-                            r.onerror   = () => rej(r.error);
-                        });
-                        for (const storeName of Array.from(db.objectStoreNames)) {
-                            const rows = await new Promise((res) => {
-                                const tx = db.transaction(storeName, 'readonly');
-                                const rq = tx.objectStore(storeName).getAll();
-                                rq.onsuccess = () => res(rq.result || []);
-                                rq.onerror   = () => res([]);
-                            });
-                            out[meta.name + '/' + storeName] = rows;
-                        }
-                        db.close();
-                    }
-                } catch (e) {}
-                done(out);
-            })();
-        """)
+        # open the popup pages so the extension initialises its data store
+        for route in ("#/pinners", "#/boards", "#/pins"):
+            try:
+                driver.get(f"chrome-extension://{EXT_ID}/popup.html{route}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"  (live) could not open extension page {route} — {e}")
+        time.sleep(2)
+        dump = driver.execute_async_script(_DUMP_JS)
         try: driver.close()
         except Exception: pass
-
-        # flatten every array of objects we found and bucket by signature fields
-        buckets = []
-        for blob in (store, idb):
-            if isinstance(blob, dict):
-                for v in blob.values():
-                    if isinstance(v, list) and v and isinstance(v[0], dict):
-                        buckets.append(v)
-        leads = boards = pins = None
-        for arr in buckets:
-            keys = set(arr[0].keys())
-            if {"contact_email", "username"} & keys and "owner_username" not in keys and "pin_url" not in keys:
-                leads = leads or arr
-            elif "owner_username" in keys or "image_cover_url" in keys:
-                boards = boards or arr
-            elif "pin_url" in keys or "pinner_username" in keys:
-                pins = pins or arr
-        if any([leads, boards, pins]):
-            print(f"  (live) extension data found: "
-                  f"{len(leads or [])} leads, {len(boards or [])} boards, {len(pins or [])} pins")
-            return (leads or [], boards or [], pins or [])
-        print("  (live) extension reachable but no recognizable data — using CSVs")
-        return None
     except Exception as e:
         print(f"  (live) extraction failed — {e}")
         return None
+
+    # diagnostics: show every data array we found
+    arrays = list(_collect_arrays(dump))
+    if arrays:
+        print("  (live) data containers found in the extension:")
+        for name, arr in arrays:
+            print(f"        {name:<40} {len(arr):>6} rows  → looks like: {_classify(arr) or '?'}")
+    else:
+        errs = (dump or {}).get("errors") if isinstance(dump, dict) else None
+        print(f"  (live) no data arrays found in the extension storage. {errs or ''}")
+        return None
+
+    leads = boards = pins = None
+    for name, arr in sorted(arrays, key=lambda x: -len(x[1])):  # biggest first
+        kind = _classify(arr)
+        if kind == "leads"  and not leads:  leads  = arr
+        if kind == "boards" and not boards: boards = arr
+        if kind == "pins"   and not pins:   pins   = arr
+    if any([leads, boards, pins]):
+        print(f"  (live) using: {len(leads or [])} pinners, "
+              f"{len(boards or [])} boards, {len(pins or [])} pins")
+        return (leads or [], boards or [], pins or [])
+    print("  (live) found data but couldn't classify it — falling back to CSV")
+    return None
 
 # ── data source 2: CSV exports in this folder ─────────────────────────────────
 def load_from_csv():
@@ -394,17 +446,19 @@ def load_from_csv():
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     print(f"\n{'='*60}\n  STEP 4 — Build local relational SortPin database\n{'='*60}")
-    use_live = "--live" in sys.argv[1:]
+    # LIVE-from-extension is the default. Use --csv to skip it and read the
+    # CSV exports only.  (--live also works and is the same as the default.)
+    csv_only = "--csv" in sys.argv[1:]
 
     leads = boards = pins = None
-    if use_live:
-        print("  Trying live extension pull from Brave...")
+    if not csv_only:
+        print("  Pulling LIVE from the SortPin extension in Brave...")
         live = try_live_extension()
         if live:
             leads, boards, pins = live
 
     if leads is None and boards is None and pins is None:
-        print("  Reading SortPin CSV exports from this folder...")
+        print("  Reading SortPin CSV exports from this folder (fallback)...")
         leads, boards, pins = load_from_csv()
 
     if not (leads or boards or pins):

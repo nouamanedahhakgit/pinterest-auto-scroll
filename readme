@@ -1,0 +1,3 @@
+
+git rm --cached --ignore-unmatch sortpin.db sortpin_data.json sortpin_viewer.html
+.\sync.bat

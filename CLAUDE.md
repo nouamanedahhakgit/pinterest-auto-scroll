@@ -32,17 +32,22 @@ python 2_pinterest_auto_scroll.py --5m  # 5 min per keyword
 python 2_pinterest_auto_scroll.py --2m  # 2 min per keyword
 python 2_pinterest_auto_scroll.py       # interactive prompt
 python 3_sync_to_sheet.py               # push statuses to sheet
-python 4_build_database.py              # SortPin CSV exports → relational DB + JSON
-python 4_build_database.py --live       # try pulling live from the extension first
+python 4_build_database.py              # LIVE pull from SortPin extension (falls back to CSV)
+python 4_build_database.py --csv        # skip live; build only from CSV exports in folder
 python 5_view_data.py                   # stats + open the visual data browser
 ```
 
 ## Steps 4 & 5 — SortPin data → relational DB + viewer
 - **Data model:** `leads` CSV = master pinners; `boards` link to pinner via `owner_username`;
   `pins` link to pinner via `pinner_username` and to a board via `board_url`.
-- **Step 4 input:** export Pins / Boards / Pinners from the SortPin popup (the 3
-  `SortPin.com_all_*.csv` files) into this folder, then run step 4. `--live` tries
-  to read the extension's storage directly via CDP first, falling back to the CSVs.
+- **Step 4 input:** by DEFAULT step 4 pulls live from the SortPin extension —
+  it launches/attaches Brave on the debug port (closing any open Brave, like
+  step 2), opens the extension popup pages via Selenium, and reads the
+  extension's `chrome.storage.local` + IndexedDB. Data arrays are auto-detected
+  by field signature (`pin_url`→pins, `owner_username`→boards, `contact_email`→
+  pinners), so storage key names don't matter. If the live read fails it falls
+  back to merging the `SortPin.com_all_*.csv` exports in the folder. Use `--csv`
+  to force the CSV path only.
 - **Note:** pins CSV `id` column is Excel-mangled (`1.00001E+18`); real pin id is
   recovered from `pin_url` (`/pin/<id>`). Empty phantom CSV rows are skipped.
 - **Step 5:** `sortpin_viewer.html` is one offline file (data embedded) — searchable,
