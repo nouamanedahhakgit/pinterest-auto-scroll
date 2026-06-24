@@ -602,38 +602,46 @@ def try_disk_extension():
         return None
 
     buckets = {"leads": [], "boards": [], "pins": []}
-    for d in dirs:
-        tmp = tempfile.mkdtemp(prefix="sortpin_idb_")
-        copydir = os.path.join(tmp, "leveldb"); os.makedirs(copydir, exist_ok=True)
+
+    def _parse(folder):
+        """Read one leveldb folder into the buckets; return #records added."""
+        added = 0
         try:
-            for fn in os.listdir(d):           # copy (LOCK can't be copied while open)
-                if fn == "LOCK":
-                    continue
-                try: shutil.copy2(os.path.join(d, fn), os.path.join(copydir, fn))
-                except Exception: pass
-            counts = {}
-            reader = _cr.FolderReader(pathlib.Path(copydir))
-            def _iter():
-                # active records only; fall back to all records if needed
-                try:
-                    yield from reader.GetRecords(use_manifest=True, load_blobs=False)
-                except Exception:
-                    yield from _cr.FolderReader(pathlib.Path(copydir)).GetRecords(load_blobs=False)
-            for rec in _iter():
-                v = getattr(rec, "value", None)
-                if not isinstance(v, dict):
-                    continue
-                kind = _classify_keys(v.keys())
-                if not kind:
-                    continue
-                buckets[kind].append(_trim_row(v))
-                counts[kind] = counts.get(kind, 0) + 1
-            if counts:
-                print(f"  (disk) {os.path.basename(os.path.dirname(os.path.dirname(d)))}: {counts}")
+            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(
+                use_manifest=True, load_blobs=False)
+        except Exception:
+            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
+        for rec in it:
+            v = getattr(rec, "value", None)
+            if not isinstance(v, dict):
+                continue
+            kind = _classify_keys(v.keys())
+            if not kind:
+                continue
+            buckets[kind].append(_trim_row(v)); added += 1
+        return added
+
+    for d in dirs:
+        print(f"  (disk) reading {d}")
+        n = 0
+        try:                                   # 1) read the folder DIRECTLY (in place)
+            n = _parse(d)
         except Exception as e:
-            print(f"  (disk) read error — {e}")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            print(f"  (disk) direct read failed ({e}) — copying files (Brave open?)...")
+        if n == 0:                             # 2) locked/empty → copy to temp, retry
+            tmp = tempfile.mkdtemp(prefix="sortpin_idb_")
+            copydir = os.path.join(tmp, "leveldb"); os.makedirs(copydir, exist_ok=True)
+            try:
+                for fn in os.listdir(d):
+                    if fn == "LOCK":
+                        continue
+                    try: shutil.copy2(os.path.join(d, fn), os.path.join(copydir, fn))
+                    except Exception: pass
+                _parse(copydir)
+            except Exception as e:
+                print(f"  (disk) copy read failed — {e}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
 
     if any(buckets.values()):
         print(f"  (disk) read {len(buckets['leads'])} pinners, "
@@ -670,8 +678,11 @@ def main():
             print("  Reading SortPin data from disk (IndexedDB files, no browser)...")
             live = try_disk_extension()
             if not live:
-                print("  Falling back to live CDP read...")
-                live = try_live_extension()
+                # disk-only mode: do NOT open the browser (huge data can't load
+                # on the page). Just build from the CSVs already in the folder.
+                print("  (disk) disk read unavailable — NOT opening the browser.")
+                print("        Install the parser:  python -m pip install dfindexeddb")
+                print("        Building from existing CSV snapshots instead.")
         else:
             print("  Pulling LIVE from the SortPin extension in Brave...")
             live = try_live_extension()
