@@ -202,13 +202,41 @@ def fetch_google_trends(seeds):
 
     pytrends = TrendReq(hl='en-US', tz=300, timeout=(10, 30))
     results  = []
-    errors   = 0
 
+    # ── Method A: today's trending searches (no seed, very reliable) ──
+    try:
+        trending = pytrends.trending_searches(pn='united_states')
+        for term in trending[0].tolist()[:50]:
+            kw = str(term).lower().strip()
+            if 3 < len(kw) <= 60 and len(kw.split()) <= 7:
+                results.append((kw, 90, "trending-today"))
+        print(f"  Trending today: {len([r for r in results if r[2]=='trending-today'])} terms")
+    except Exception as e:
+        print(f"  ⚠  Trending searches error: {e}")
+
+    # ── Method B: autocomplete suggestions per seed (lightweight) ─────
+    print(f"  Getting suggestions for {len(seeds)} seeds...")
     for i, seed in enumerate(seeds):
-        print(f"\r  [{i+1:2d}/{len(seeds)}] \"{seed[:45]}\"          ",
-              end="", flush=True)
+        print(f"\r  [{i+1:2d}/{len(seeds)}] suggest \"{seed[:40]}\"       ", end="", flush=True)
         try:
-            pytrends.build_payload([seed], timeframe='now 30-d', geo='US')
+            sugs = pytrends.suggestions(keyword=seed)
+            for s in sugs:
+                kw = (s.get("title") or "").lower().strip()
+                if 3 < len(kw) <= 60 and len(kw.split()) <= 7:
+                    results.append((kw, 60, "suggestion"))
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"\n  ⚠  suggest \"{seed}\": {e}")
+    print(f"\r  Suggestions done.                                      ")
+
+    # ── Method C: related queries per seed (richer but can 400) ──────
+    # timeframe must be 'today 1-m', 'today 3-m', 'today 12-m', etc.
+    # 'now 30-d' is INVALID and causes 400 — use 'today 3-m' instead.
+    errors = 0
+    for i, seed in enumerate(seeds[:8]):   # limit to avoid rate-limits
+        print(f"\r  [{i+1:2d}/8 ] related \"{seed[:40]}\"       ", end="", flush=True)
+        try:
+            pytrends.build_payload([seed], timeframe='today 3-m', geo='US')
             related = pytrends.related_queries()
             info    = related.get(seed, {})
 
@@ -228,22 +256,23 @@ def fetch_google_trends(seeds):
                     if 3 < len(kw) <= 60 and len(kw.split()) <= 7:
                         results.append((kw, val, "top"))
 
-            time.sleep(1.5)
+            time.sleep(2)
 
         except Exception as e:
             msg = str(e)
             if "429" in msg or "Too Many" in msg:
-                print(f"\n  ⚠  Rate-limited — waiting 45s...")
-                time.sleep(45)
+                print(f"\n  ⚠  Rate-limited — waiting 30s...")
+                time.sleep(30)
                 errors += 1
-                if errors >= 3:
-                    print("  ⚠  Too many rate-limit errors. Try again later.")
+                if errors >= 2:
+                    print("  ⚠  Rate-limit limit hit — skipping remaining related queries.")
                     break
+            elif "400" in msg:
+                print(f"\n  ⚠  related_queries 400 for \"{seed}\" — skipping")
             else:
                 print(f"\n  ⚠  \"{seed}\": {e}")
 
-    print(f"\r  ✅ Google Trends: {len(results)} raw results from {len(seeds)} seeds"
-          + " " * 20)
+    print(f"\r  ✅ Google Trends: {len(results)} total results              ")
     return results
 
 
