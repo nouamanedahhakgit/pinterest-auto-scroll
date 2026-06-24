@@ -556,6 +556,92 @@ def save_snapshot(leads, boards, pins):
         print(f"  (live) saved snapshot: {', '.join(written)}")
     return written
 
+# ── data source 1b: DISK — read the extension's IndexedDB files (no browser) ───
+def _idb_leveldb_dirs():
+    ud = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                      "BraveSoftware", "Brave-Browser", "User Data")
+    out = []
+    for prof in glob.glob(os.path.join(ud, "*")):
+        p = os.path.join(prof, "IndexedDB",
+                         f"chrome-extension_{EXT_ID}_0.indexeddb.leveldb")
+        if os.path.isdir(p):
+            out.append(p)
+    return out
+
+def _trim_row(o):
+    """Keep scalar fields + small nested ones; drop big blobs (images maps…)."""
+    if not isinstance(o, dict):
+        return o
+    r = {}
+    for k, v in o.items():
+        if v is None or isinstance(v, (str, int, float, bool)):
+            r[k] = v
+        else:
+            try:
+                if len(json.dumps(v, default=str)) <= 800:
+                    r[k] = v
+            except Exception:
+                pass
+    return r
+
+def try_disk_extension():
+    """Read SortPin's data straight from Brave's IndexedDB files on disk using
+    dfindexeddb — no browser, no CDP. Brave's open files are copied to a temp
+    folder first so it works even while Brave is running. Returns
+    (leads, boards, pins) or None."""
+    try:
+        import pathlib, shutil, tempfile
+        from dfindexeddb.indexeddb.chromium import record as _cr
+    except Exception:
+        print("  (disk) dfindexeddb not installed — run: pip install dfindexeddb")
+        return None
+
+    dirs = _idb_leveldb_dirs()
+    if not dirs:
+        print("  (disk) no SortPin IndexedDB folder found under Brave profiles")
+        return None
+
+    buckets = {"leads": [], "boards": [], "pins": []}
+    for d in dirs:
+        tmp = tempfile.mkdtemp(prefix="sortpin_idb_")
+        copydir = os.path.join(tmp, "leveldb"); os.makedirs(copydir, exist_ok=True)
+        try:
+            for fn in os.listdir(d):           # copy (LOCK can't be copied while open)
+                if fn == "LOCK":
+                    continue
+                try: shutil.copy2(os.path.join(d, fn), os.path.join(copydir, fn))
+                except Exception: pass
+            counts = {}
+            reader = _cr.FolderReader(pathlib.Path(copydir))
+            def _iter():
+                # active records only; fall back to all records if needed
+                try:
+                    yield from reader.GetRecords(use_manifest=True, load_blobs=False)
+                except Exception:
+                    yield from _cr.FolderReader(pathlib.Path(copydir)).GetRecords(load_blobs=False)
+            for rec in _iter():
+                v = getattr(rec, "value", None)
+                if not isinstance(v, dict):
+                    continue
+                kind = _classify_keys(v.keys())
+                if not kind:
+                    continue
+                buckets[kind].append(_trim_row(v))
+                counts[kind] = counts.get(kind, 0) + 1
+            if counts:
+                print(f"  (disk) {os.path.basename(os.path.dirname(os.path.dirname(d)))}: {counts}")
+        except Exception as e:
+            print(f"  (disk) read error — {e}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    if any(buckets.values()):
+        print(f"  (disk) read {len(buckets['leads'])} pinners, "
+              f"{len(buckets['boards'])} boards, {len(buckets['pins'])} pins from disk")
+        return (buckets["leads"], buckets["boards"], buckets["pins"])
+    print("  (disk) found the files but no usable records — falling back")
+    return None
+
 # ── data source 2: CSV exports in this folder ─────────────────────────────────
 def load_from_csv():
     leads,  lf = read_all("*all_leads*.csv")
@@ -574,11 +660,21 @@ def main():
     # CSV exports only.  (--live also works and is the same as the default.)
     csv_only = "--csv" in sys.argv[1:]
 
-    # 1) LIVE pull → save a timestamped CSV snapshot (preserves data on disk so it
-    #    survives clearing the extension in step 6, and git-syncs to other PCs).
+    # 1) Pull the current extension data → save a timestamped CSV snapshot
+    #    (preserves it on disk so it survives clearing in step 6 + git-syncs).
+    #    --disk = read IndexedDB files directly (no browser), CDP as fallback.
+    #    default = live read via the running Brave (CDP).
     if not csv_only:
-        print("  Pulling LIVE from the SortPin extension in Brave...")
-        live = try_live_extension()
+        live = None
+        if "--disk" in sys.argv[1:]:
+            print("  Reading SortPin data from disk (IndexedDB files, no browser)...")
+            live = try_disk_extension()
+            if not live:
+                print("  Falling back to live CDP read...")
+                live = try_live_extension()
+        else:
+            print("  Pulling LIVE from the SortPin extension in Brave...")
+            live = try_live_extension()
         if live:
             save_snapshot(*live)
 

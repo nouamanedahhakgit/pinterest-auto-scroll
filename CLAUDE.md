@@ -33,7 +33,8 @@ python 2_pinterest_auto_scroll.py --5m  # 5 min per keyword
 python 2_pinterest_auto_scroll.py --2m  # 2 min per keyword
 python 2_pinterest_auto_scroll.py       # interactive prompt
 python 3_sync_to_sheet.py               # push statuses to sheet
-python 4_build_database.py              # LIVE pull from SortPin extension (falls back to CSV)
+python 4_build_database.py              # LIVE pull from SortPin extension via Brave (CDP)
+python 4_build_database.py --disk       # read IndexedDB files directly, NO browser (pip install dfindexeddb)
 python 4_build_database.py --csv        # skip live; build only from CSV exports in folder
 python 5_view_data.py                   # stats + open the visual data browser
 python 6_clear_sortpin.py               # clear extension data (run step 4 first!)
