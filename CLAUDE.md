@@ -9,8 +9,9 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 ## Files
 | File | Purpose |
 |---|---|
-| `keywords.txt` | 193 keywords, one per line. Lines starting `#` are skipped. |
+| `keywords.txt` | 193+ keywords, one per line. Lines starting `#` are skipped. |
 | `progress.json` | Auto-created. Tracks Done / Not Yet per keyword. Delete to reset. |
+| `0_get_keywords.py` | **Step 0.** Fetches trending keywords via Pinterest API or Google Trends → appends to keywords.txt. |
 | `1_setup_google_sheet.py` | Pastes keywords + URLs into Google Sheet column A/B/C. Run once. |
 | `2_pinterest_auto_scroll.py` | **Main script.** Opens Brave, clicks SortPin button, counts down, auto-advances. |
 | `3_sync_to_sheet.py` | Writes Done/Not Yet from progress.json into column D of the sheet. |
@@ -23,6 +24,9 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 
 ## Run commands
 ```
+python 0_get_keywords.py                # fetch trending keywords → append to keywords.txt
+python 0_get_keywords.py --google       # force Google Trends (no token needed)
+python 0_get_keywords.py --pinterest    # force Pinterest API only
 python 1_setup_google_sheet.py          # fill Google Sheet once
 python 2_pinterest_auto_scroll.py --5m  # 5 min per keyword
 python 2_pinterest_auto_scroll.py --2m  # 2 min per keyword
