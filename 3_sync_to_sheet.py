@@ -67,7 +67,7 @@ SETUP_MSG = f"""
     3. Deploy → New deployment → Web app
          Execute as: Me  |  Who has access: Anyone
     4. Copy the Web App URL into {WEBAPP_FILE}:
-         {{"url": "https://script.google.com/macros/s/.../exec", "secret": "pinterest-scan-2026"}}
+         {{"url": "https://script.google.com/macros/s/AKfycbxbjorgkQbdKQ2K46yZ8utsNudOBAT9yFROPZhCRE3po3796pmHVgsySHfmIr5uqeC3/exec", "secret": "pinterest-scan-2026"}}
     5. Run:  python 3_sync_to_sheet.py
 
 {'═'*62}
@@ -161,12 +161,33 @@ def sync_via_webapp(statuses, cfg):
         "secret": cfg.get("secret", "pinterest-scan-2026"),
         "statuses": flat,
     }
-    r = requests.post(cfg["url"], json=payload, timeout=60)
+    url = cfg["url"]
+    r = requests.post(url, json=payload, timeout=120, allow_redirects=True)
     r.raise_for_status()
-    data = r.json()
+
+    try:
+        data = r.json()
+    except ValueError:
+        snippet = (r.text or "")[:200].replace("\n", " ")
+        raise RuntimeError(
+            "Web app did not return JSON. Check deployment is Web app (not API), "
+            f"access = Anyone, and URL ends with /exec. Response: {snippet}"
+        ) from None
+
     if not data.get("ok"):
         raise RuntimeError(data.get("error", "web app returned error"))
     return data.get("count", len(flat))
+
+
+def webapp_from_argv():
+    """Allow: python 3_sync_to_sheet.py --webapp-url https://script.google.com/.../exec"""
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--webapp-url" and i + 1 < len(args):
+            return {"url": args[i + 1], "secret": "pinterest-scan-2026"}
+        if arg.startswith("--webapp-url="):
+            return {"url": arg.split("=", 1)[1], "secret": "pinterest-scan-2026"}
+    return None
 
 
 def build_status_column(keywords, progress, sheet_keywords):
@@ -214,13 +235,18 @@ def main():
     print(f"  Not Yet   : {not_yet}")
     print(f"{'═'*55}\n")
 
-    webapp     = load_webapp_config()
-    sa_exists  = os.path.exists(os.path.join(BASE, SA_FILE))
+    webapp       = load_webapp_config() or webapp_from_argv()
+    sa_exists    = os.path.exists(os.path.join(BASE, SA_FILE))
     oauth_exists = os.path.exists(os.path.join(BASE, OAUTH_FILE))
+    webapp_path  = os.path.join(BASE, WEBAPP_FILE)
 
     if not sa_exists and not oauth_exists and not webapp:
+        print(f"  ✗ Missing {WEBAPP_FILE} in this folder.\n")
         print(SETUP_MSG)
         sys.exit(1)
+
+    if webapp and not os.path.exists(webapp_path) and not (sa_exists or oauth_exists):
+        print(f"  Using web app URL (save to {WEBAPP_FILE} to skip --webapp-url next time)")
 
     if webapp and not sa_exists and not oauth_exists:
         statuses = build_status_column(keywords, progress, sheet_keywords=None)
@@ -228,8 +254,12 @@ def main():
         try:
             written = sync_via_webapp(statuses, webapp)
         except Exception as e:
-            print(f"\n  ✗ Web app sync failed: {e}\n")
-            sys.exit(1)
+            print(f"  Web app failed: {e}")
+            print("  Falling back to Brave auto-paste (column D)...\n")
+            from google_sheets_brave import upload_status_column
+            flat = [row[0] for row in statuses]
+            upload_status_column(flat)
+            written = len(flat)
     else:
         print("  Connecting to Google Sheets API...")
         try:

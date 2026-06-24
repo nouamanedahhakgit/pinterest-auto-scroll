@@ -1,92 +1,208 @@
 """
-STEP 1 — Upload keywords to Google Sheet
-=========================================
-Opens your Google Sheet in Brave and pastes all keywords
-with their Pinterest URLs into columns A and B.
+STEP 1 — Upload keywords to Google Sheet (background)
+======================================================
+Writes keywords + Pinterest URLs + Trends URLs + Status into columns A–D.
 
 HOW TO USE:
-  1. Run this script: python 1_setup_google_sheet.py
-  2. Wait for the sheet to open in Brave
-  3. Make sure you are LOGGED IN to Google
-  4. Click once on cell A1 in the sheet
-  5. Come back to this terminal and press ENTER
-  6. Keywords will be pasted automatically
+  python 1_setup_google_sheet.py           # tries web app, then Brave auto-paste
+  python 1_setup_google_sheet.py --brave # force Brave paste (no Apps Script)
+  python 1_setup_google_sheet.py --check # test web app deployment
 """
 
-import subprocess
-import time
-import sys
+import json
 import os
-import pyperclip
-import pyautogui
+import sys
 
-# ═══ CONFIG ══════════════════════════════════════════════════════════════════
-BRAVE_PATH    = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+from google_sheets_client import (
+    BASE,
+    SPREADSHEET_ID,
+    SETUP_MSG,
+    APPS_SCRIPT,
+    WEBAPP_FILE,
+    choose_backend,
+    get_gspread_client,
+    post_webapp,
+    probe_webapp,
+    resolve_webapp,
+)
+
 KEYWORDS_FILE = "keywords.txt"
-SHEET_URL     = "https://docs.google.com/spreadsheets/d/1ZaIcgG7E2ChZYtUr9UZP78bfO-YNMArlbWZk_71E_VE/edit"
-# ═════════════════════════════════════════════════════════════════════════════
+PROGRESS_FILE = "progress.json"
+STATUS_DONE = "Done"
+STATUS_NOT_YET = "Not Yet"
+CHUNK_SIZE = 400
+FORCE_BRAVE = "--brave" in sys.argv
+
 
 def load_keywords():
-    if not os.path.exists(KEYWORDS_FILE):
-        print(f"ERROR: {KEYWORDS_FILE} not found. Run this from the pinterest scan folder.")
+    path = os.path.join(BASE, KEYWORDS_FILE)
+    if not os.path.exists(path):
+        print(f"ERROR: {KEYWORDS_FILE} not found.")
         sys.exit(1)
     kws = []
-    with open(KEYWORDS_FILE, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
                 kws.append(line)
     return kws
 
+
+def load_progress():
+    path = os.path.join(BASE, PROGRESS_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def make_pinterest_url(kw):
     return "https://www.pinterest.com/search/pins/?q=" + kw.replace(" ", "+") + "&rs=typed"
+
 
 def make_trends_url(kw):
     return "https://trends.pinterest.com/search?country=US&query=" + kw.replace(" ", "+")
 
+
+def build_rows(keywords, progress):
+    rows = []
+    for kw in keywords:
+        st = STATUS_DONE if progress.get(kw, {}).get("status") == "done" else STATUS_NOT_YET
+        rows.append([kw, make_pinterest_url(kw), make_trends_url(kw), st])
+    return rows
+
+
+def build_tsv(rows):
+    lines = ["Keyword\tPinterest Search URL\tPinterest Trends URL\tStatus"]
+    for row in rows:
+        lines.append("\t".join(row))
+    return "\n".join(lines)
+
+
+def upload_via_webapp_setup(rows, cfg):
+    data = post_webapp(cfg, {"action": "setup", "rows": rows})
+    if data.get("action") != "setup":
+        raise RuntimeError("setup not supported")
+    return data.get("count", len(rows))
+
+
+def upload_via_webapp_columns(rows, cfg):
+    keywords, pin_urls, trends_urls, statuses = zip(*rows) if rows else ([], [], [], [])
+    post_webapp(cfg, {"column": 1, "set_header": True, "statuses": list(keywords)})
+    post_webapp(cfg, {"column": 2, "statuses": list(pin_urls)})
+    post_webapp(cfg, {"column": 3, "statuses": list(trends_urls)})
+    post_webapp(cfg, {"column": 4, "statuses": list(statuses)})
+    return len(rows)
+
+
+def upload_via_webapp(rows, cfg):
+    mode = probe_webapp(cfg)
+    if mode == "sync-only":
+        raise RuntimeError("sync-only")
+    if mode == "setup":
+        print("  Mode: full upload (setup)")
+        return upload_via_webapp_setup(rows, cfg)
+    print("  Mode: column upload (A → B → C → D)")
+    return upload_via_webapp_columns(rows, cfg)
+
+
+def upload_via_api(rows):
+    gc, auth_mode = get_gspread_client()
+    if gc is None:
+        raise RuntimeError("no api credentials")
+
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.sheet1
+    header = [["Keyword", "Pinterest Search URL", "Pinterest Trends URL", "Status"]]
+    ws.clear()
+    ws.update("A1:D1", header, value_input_option="RAW")
+
+    total = 0
+    for i in range(0, len(rows), CHUNK_SIZE):
+        chunk = rows[i : i + CHUNK_SIZE]
+        start_row = i + 2
+        end_row = start_row + len(chunk) - 1
+        ws.update(f"A{start_row}:D{end_row}", chunk, value_input_option="RAW")
+        total += len(chunk)
+        print(f"  Uploaded rows {start_row}–{end_row}...")
+
+    print(f"  Auth: {auth_mode} | Sheet: {sh.title}")
+    return total
+
+
+def upload_via_brave(rows):
+    from google_sheets_brave import upload_tsv_full
+
+    print("  Apps Script not working — using Brave auto-paste (logged-in Google required)")
+    print("  A sheet tab will open briefly and paste all data at A1...")
+    tsv = build_tsv(rows)
+    upload_tsv_full(tsv)
+    return len(rows)
+
+
+def cmd_check():
+    webapp = resolve_webapp()
+    if not webapp:
+        print(f"  ✗ Missing {WEBAPP_FILE}\n")
+        sys.exit(1)
+
+    print(f"\n  Web app URL: {webapp['url'][:72]}...")
+    try:
+        mode = probe_webapp(webapp)
+        print(f"  Apps Script: ✅ OK ({mode}) — background upload works\n")
+        sys.exit(0)
+    except RuntimeError as e:
+        print(f"  Apps Script: ✗ {e}\n")
+        print("  You can still upload without fixing Apps Script:")
+        print("    python 1_setup_google_sheet.py --brave\n")
+        sys.exit(1)
+
+
 def main():
+    if "--check" in sys.argv:
+        cmd_check()
+
     keywords = load_keywords()
-    total    = len(keywords)
+    progress = load_progress()
+    rows = build_rows(keywords, progress)
+    total = len(rows)
 
-    print(f"\n{'='*55}")
+    print(f"\n{'═'*55}")
     print(f"  Pinterest → Google Sheet Setup")
-    print(f"  {total} keywords found in {KEYWORDS_FILE}")
-    print(f"{'='*55}\n")
+    print(f"{'─'*55}")
+    print(f"  Keywords  : {total}")
+    print(f"{'═'*55}\n")
 
-    # Build tab-separated data: Keyword | Pinterest Search URL | Trends URL | #
-    header = "Keyword\tPinterest Search URL\tPinterest Trends URL\tStatus"
-    rows   = [header]
-    for i, kw in enumerate(keywords, 1):
-        pin_url    = make_pinterest_url(kw)
-        trends_url = make_trends_url(kw)
-        rows.append(f"{kw}\t{pin_url}\t{trends_url}\t")
+    written = None
 
-    tsv_data = "\n".join(rows)
-    pyperclip.copy(tsv_data)
-    print(f"  ✅ {total} keywords copied to clipboard (Tab-Separated)\n")
+    if FORCE_BRAVE:
+        written = upload_via_brave(rows)
+    else:
+        webapp = resolve_webapp()
+        backend = choose_backend(webapp)
 
-    # Open sheet in Brave
-    print(f"  Opening Google Sheet in Brave...")
-    subprocess.Popen([BRAVE_PATH, SHEET_URL])
+        if not backend:
+            print(f"  No {WEBAPP_FILE} — using Brave auto-paste...\n")
+            written = upload_via_brave(rows)
+        else:
+            try:
+                if backend == "webapp":
+                    print("  Uploading via Apps Script web app...")
+                    written = upload_via_webapp(rows, webapp)
+                else:
+                    print("  Uploading via Google Sheets API...")
+                    written = upload_via_api(rows)
+            except Exception as e:
+                err = str(e)
+                print(f"  Web app failed: {err}")
+                print("  Falling back to Brave auto-paste...\n")
+                written = upload_via_brave(rows)
 
-    print(f"\n{'='*55}")
-    print(f"  WAITING FOR YOU:")
-    print(f"  1. Make sure you are LOGGED IN to Google in Brave")
-    print(f"  2. Click on cell A1 in the spreadsheet")
-    print(f"  3. Come back here and press ENTER")
-    print(f"{'='*55}")
-    input("\n  >> Press ENTER when you have clicked on cell A1: ")
-
-    print(f"\n  Pasting in 3 seconds... keep Brave focused!")
-    time.sleep(3)
-
-    # Paste (Ctrl+V)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(2)
-
-    print(f"\n  ✅ Done! {total} keywords + URLs pasted into your Google Sheet.")
+    print(f"\n  ✅ Done! {written} keywords uploaded.")
     print(f"  Columns: A=Keyword | B=Pinterest URL | C=Trends URL | D=Status\n")
-    print(f"  Next step: run  python 2_pinterest_auto_scroll.py\n")
+    print(f"  Sheet: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit\n")
+    print(f"  Next: python 2_pinterest_auto_scroll.py --5m\n")
+
 
 if __name__ == "__main__":
     main()
