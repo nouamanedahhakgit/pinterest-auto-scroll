@@ -67,7 +67,7 @@ SETUP_MSG = f"""
     3. Deploy → New deployment → Web app
          Execute as: Me  |  Who has access: Anyone
     4. Copy the Web App URL into {WEBAPP_FILE}:
-         {{"url": "https://script.google.com/macros/s/AKfycbxbjorgkQbdKQ2K46yZ8utsNudOBAT9yFROPZhCRE3po3796pmHVgsySHfmIr5uqeC3/exec", "secret": "pinterest-scan-2026"}}
+         {{"url": "https://script.google.com/macros/s/AKfycbx2Qck5m_eckYLuo-CM6N1PdA1MsZgxFjHCI8UROrp2_U5WqMeEUGlsNjTzyE12Svpg/exec", "secret": "pinterest-scan-2026"}}
     5. Run:  python 3_sync_to_sheet.py
 
 {'═'*62}
