@@ -117,18 +117,47 @@ def click_start(driver):
     """Native (trusted) click on SortPin's 'Start Scroll' for the current tab."""
     from selenium.webdriver.common.by import By
     for _ in range(12):
-        btns = driver.find_elements(By.TAG_NAME, "button")
-        if any("stop scroll" in (b.text or "").lower() for b in btns):
-            return True                                    # already scrolling
+        try:
+            btns = driver.find_elements(By.TAG_NAME, "button")
+        except Exception:
+            time.sleep(2)
+            continue
+
+        # Check if already scrolling
+        has_stop = False
         for b in btns:
-            try: t = (b.text or "").lower()
-            except Exception: continue
+            try:
+                if "stop scroll" in (b.text or "").lower():
+                    has_stop = True
+                    break
+            except Exception:
+                pass
+
+        if has_stop:
+            return True                                    # already scrolling
+
+        for b in btns:
+            try:
+                t = (b.text or "").lower()
+            except Exception:
+                continue
             if "start scroll" in t:
                 try:
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
-                    time.sleep(0.2); b.click(); time.sleep(1.5)
-                    if any("stop scroll" in (x.text or "").lower()
-                           for x in driver.find_elements(By.TAG_NAME, "button")):
+                    time.sleep(0.2)
+                    b.click()
+                    time.sleep(1.5)
+                    
+                    # Verify it flipped to stop scroll
+                    has_stop_after = False
+                    for x in driver.find_elements(By.TAG_NAME, "button"):
+                        try:
+                            if "stop scroll" in (x.text or "").lower():
+                                has_stop_after = True
+                                break
+                        except Exception:
+                            pass
+                    if has_stop_after:
                         return True
                 except Exception:
                     pass
