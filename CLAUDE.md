@@ -14,6 +14,11 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `1_setup_google_sheet.py` | Pastes keywords + URLs into Google Sheet column A/B/C. Run once. |
 | `2_pinterest_auto_scroll.py` | **Main script.** Opens Brave, clicks SortPin button, counts down, auto-advances. |
 | `3_sync_to_sheet.py` | Writes Done/Not Yet from progress.json into column D of the sheet. |
+| `4_build_database.py` | Builds a local **relational** DB from SortPin data: Pinner→Boards→Pins. Outputs `sortpin.db` + `sortpin_data.json`. |
+| `5_view_data.py` | Prints statistics + builds/opens `sortpin_viewer.html` to browse Pinner→Boards→Pins. |
+| `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
+| `sortpin_data.json` | Auto-created (step 4). Nested Pinner→Boards→Pins (feeds the viewer). |
+| `sortpin_viewer.html` | Auto-created (step 5). Self-contained offline browser of the data. |
 | `Pinterest_Trends_Analysis_June2026.xlsx` | Full trend data (5 sheets). |
 
 ## Run commands
@@ -23,7 +28,21 @@ python 2_pinterest_auto_scroll.py --5m  # 5 min per keyword
 python 2_pinterest_auto_scroll.py --2m  # 2 min per keyword
 python 2_pinterest_auto_scroll.py       # interactive prompt
 python 3_sync_to_sheet.py               # push statuses to sheet
+python 4_build_database.py              # SortPin CSV exports → relational DB + JSON
+python 4_build_database.py --live       # try pulling live from the extension first
+python 5_view_data.py                   # stats + open the visual data browser
 ```
+
+## Steps 4 & 5 — SortPin data → relational DB + viewer
+- **Data model:** `leads` CSV = master pinners; `boards` link to pinner via `owner_username`;
+  `pins` link to pinner via `pinner_username` and to a board via `board_url`.
+- **Step 4 input:** export Pins / Boards / Pinners from the SortPin popup (the 3
+  `SortPin.com_all_*.csv` files) into this folder, then run step 4. `--live` tries
+  to read the extension's storage directly via CDP first, falling back to the CSVs.
+- **Note:** pins CSV `id` column is Excel-mangled (`1.00001E+18`); real pin id is
+  recovered from `pin_url` (`/pin/<id>`). Empty phantom CSV rows are skipped.
+- **Step 5:** `sortpin_viewer.html` is one offline file (data embedded) — searchable,
+  sortable pinner list → click a pinner → their boards → click a board → its pins.
 
 ## Script 2 — how it works
 1. Reads `progress.json`, skips already-Done keywords

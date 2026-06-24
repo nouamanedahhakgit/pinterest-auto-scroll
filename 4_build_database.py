@@ -1,0 +1,422 @@
+"""
+STEP 4 — Build a local relational database from SortPin data
+============================================================
+Turns the SortPin extension's data (pinners / boards / pins) into a clean,
+RELATIONAL local database you can query and browse:
+
+        PINNER  ──1:N──►  BOARD  ──1:N──►  PIN
+          │                                 ▲
+          └──────────── 1:N ────────────────┘   (a pinner's pins)
+
+OUTPUTS (written next to this script):
+  • sortpin.db          → SQLite database (tables: pinners, boards, pins)
+  • sortpin_data.json   → same data, nested Pinner → Boards → Pins (for the viewer)
+
+DATA SOURCES (tried in this order):
+  1. LIVE from the SortPin extension in Brave (best-effort, needs Brave + CDP).
+       python 4_build_database.py --live
+  2. The extension's CSV exports placed in this folder (the reliable path):
+       SortPin.com_all_leads_*.csv
+       SortPin.com_all_boards_*.csv
+       SortPin.com_all_pins_*.csv
+     (In the extension popup: Pins / Boards / Pinners → Export — drop the 3
+      CSVs into this folder, then run `python 4_build_database.py`.)
+
+Run:
+  python 4_build_database.py            # build from the newest CSV exports here
+  python 4_build_database.py --live     # try the live extension first, else CSV
+"""
+
+import os, sys, csv, json, re, glob, sqlite3
+from datetime import datetime
+
+csv.field_size_limit(10_000_000)              # SortPin rows have huge fields
+
+BASE      = os.path.dirname(os.path.abspath(__file__))
+DB_PATH   = os.path.join(BASE, "sortpin.db")
+JSON_PATH = os.path.join(BASE, "sortpin_data.json")
+CDP_PORT  = 9222
+EXT_ID    = "djcledakkebdgjncnemijiabiaimbaic"   # SortPin extension id
+
+# ── small helpers ─────────────────────────────────────────────────────────────
+def _int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except (ValueError, TypeError):
+        return default
+
+def _clean(v):
+    if v is None:
+        return ""
+    return str(v).strip()
+
+_PIN_ID_RE = re.compile(r"/pin/(\d+)")
+def pin_id_from_url(pin_url, fallback=""):
+    """The CSV 'id' column is mangled by Excel into 1.00001E+18 — recover the
+    real id from the pin_url (.../pin/<id>)."""
+    m = _PIN_ID_RE.search(pin_url or "")
+    if m:
+        return m.group(1)
+    fb = _clean(fallback)
+    return fb if (fb and "E+" not in fb.upper()) else ""
+
+def newest(pattern):
+    hits = sorted(glob.glob(os.path.join(BASE, pattern)))
+    return hits[-1] if hits else None
+
+def read_csv(path):
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+# ── normalisation: raw rows → pinners / boards / pins ─────────────────────────
+def normalize(leads, boards, pins):
+    """Return dict(pinners=..., boards=..., pins=...) keyed for relational use."""
+    pinners = {}   # username -> pinner dict
+
+    def ensure_pinner(username, name=""):
+        username = _clean(username)
+        if not username:
+            return None
+        p = pinners.get(username)
+        if p is None:
+            p = {
+                "username": username, "full_name": _clean(name), "website_url": "",
+                "domain_url": "", "contact_email": "", "contact_phone": "",
+                "image_url": "", "board_count": 0, "follower_count": 0,
+                "following_count": 0, "pin_count": 0, "profile_reach": 0,
+                "profile_views": 0, "last_pin_at": "",
+            }
+            pinners[username] = p
+        elif name and not p["full_name"]:
+            p["full_name"] = _clean(name)
+        return p
+
+    # 1) Leads are the master pinner records (richest: contact info + stats)
+    for l in leads:
+        p = ensure_pinner(l.get("username"), l.get("full_name"))
+        if not p:
+            continue
+        p["full_name"]      = _clean(l.get("full_name")) or p["full_name"]
+        p["website_url"]    = _clean(l.get("website_url"))
+        p["domain_url"]     = _clean(l.get("domain_url"))
+        p["contact_email"]  = _clean(l.get("contact_email"))
+        p["contact_phone"]  = _clean(l.get("contact_phone"))
+        p["board_count"]    = _int(l.get("board_count"))
+        p["follower_count"] = _int(l.get("follower_count"))
+        p["following_count"]= _int(l.get("following_count"))
+        p["pin_count"]      = _int(l.get("pin_count"))
+        p["profile_reach"]  = _int(l.get("profile_reach"))
+        p["profile_views"]  = _int(l.get("profile_views"))
+        p["last_pin_at"]    = _clean(l.get("lastPinAt"))
+
+    # 2) Boards (link to pinner via owner_username)
+    board_by_url = {}
+    out_boards   = []
+    for b in boards:
+        owner = _clean(b.get("owner_username"))
+        p = ensure_pinner(owner, b.get("owner_full_name"))
+        if p and not p["image_url"]:
+            p["image_url"] = _clean(b.get("owner_image_medium_url")) or \
+                             _clean(b.get("owner_image_small_url"))
+        rec = {
+            "id":              _clean(b.get("id")),
+            "name":            _clean(b.get("name")),
+            "description":     _clean(b.get("description")),
+            "url":             _clean(b.get("url")),
+            "image_cover_url": _clean(b.get("image_cover_url")),
+            "follower_count":  _int(b.get("follower_count")),
+            "section_count":   _int(b.get("section_count")),
+            "pin_count":       _int(b.get("pin_count")),
+            "category":        _clean(b.get("category")),
+            "privacy":         _clean(b.get("privacy")),
+            "modified_at":     _clean(b.get("modifiedAt")),
+            "owner_username":  owner or None,   # None (not "") so FK isn't enforced
+        }
+        if not rec["id"]:
+            continue
+        out_boards.append(rec)
+        if rec["url"]:
+            board_by_url[rec["url"]] = rec["id"]
+
+    # 3) Pins (link to pinner via pinner_username, to board via board_url)
+    out_pins = []
+    seen_pin = set()
+    for pn in pins:
+        pinner = _clean(pn.get("pinner_username"))
+        ensure_pinner(pinner, pn.get("pinner_name"))
+        pid = pin_id_from_url(pn.get("pin_url"), pn.get("id"))
+        if not pid or pid in seen_pin:
+            continue
+        seen_pin.add(pid)
+        burl = _clean(pn.get("board_url"))
+        out_pins.append({
+            "id":             pid,
+            "title":          _clean(pn.get("title")),
+            "description":    _clean(pn.get("description")),
+            "link":           _clean(pn.get("link")),
+            "pin_url":        _clean(pn.get("pin_url")),
+            "image":          _clean(pn.get("image")),
+            "saves":          _int(pn.get("saves")),
+            "repin_count":    _int(pn.get("repin_count")),
+            "comment_count":  _int(pn.get("comment_count")),
+            "like_count":     _int(pn.get("like_count")),
+            "created_at":     _clean(pn.get("created_at")),
+            "board_url":      burl,
+            "board_id":       board_by_url.get(burl) or None,   # None → FK not enforced
+            "board_name":     _clean(pn.get("board_name")),
+            "pinner_username":pinner or None,
+        })
+
+    return {"pinners": list(pinners.values()),
+            "boards":  out_boards,
+            "pins":    out_pins}
+
+# ── write SQLite (true relational, with foreign keys + indexes) ───────────────
+def write_sqlite(data):
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA foreign_keys = ON;")
+    con.executescript("""
+        CREATE TABLE pinners (
+            username TEXT PRIMARY KEY, full_name TEXT, website_url TEXT,
+            domain_url TEXT, contact_email TEXT, contact_phone TEXT, image_url TEXT,
+            board_count INTEGER, follower_count INTEGER, following_count INTEGER,
+            pin_count INTEGER, profile_reach INTEGER, profile_views INTEGER,
+            last_pin_at TEXT
+        );
+        CREATE TABLE boards (
+            id TEXT PRIMARY KEY, name TEXT, description TEXT, url TEXT,
+            image_cover_url TEXT, follower_count INTEGER, section_count INTEGER,
+            pin_count INTEGER, category TEXT, privacy TEXT, modified_at TEXT,
+            owner_username TEXT,
+            FOREIGN KEY (owner_username) REFERENCES pinners(username)
+        );
+        CREATE TABLE pins (
+            id TEXT PRIMARY KEY, title TEXT, description TEXT, link TEXT,
+            pin_url TEXT, image TEXT, saves INTEGER, repin_count INTEGER,
+            comment_count INTEGER, like_count INTEGER, created_at TEXT,
+            board_url TEXT, board_id TEXT, board_name TEXT, pinner_username TEXT,
+            FOREIGN KEY (board_id) REFERENCES boards(id),
+            FOREIGN KEY (pinner_username) REFERENCES pinners(username)
+        );
+    """)
+    con.executemany(
+        "INSERT OR REPLACE INTO pinners VALUES "
+        "(:username,:full_name,:website_url,:domain_url,:contact_email,"
+        ":contact_phone,:image_url,:board_count,:follower_count,:following_count,"
+        ":pin_count,:profile_reach,:profile_views,:last_pin_at)", data["pinners"])
+    con.executemany(
+        "INSERT OR REPLACE INTO boards VALUES "
+        "(:id,:name,:description,:url,:image_cover_url,:follower_count,"
+        ":section_count,:pin_count,:category,:privacy,:modified_at,:owner_username)",
+        data["boards"])
+    con.executemany(
+        "INSERT OR REPLACE INTO pins VALUES "
+        "(:id,:title,:description,:link,:pin_url,:image,:saves,:repin_count,"
+        ":comment_count,:like_count,:created_at,:board_url,:board_id,:board_name,"
+        ":pinner_username)", data["pins"])
+    con.executescript("""
+        CREATE INDEX idx_boards_owner ON boards(owner_username);
+        CREATE INDEX idx_pins_pinner  ON pins(pinner_username);
+        CREATE INDEX idx_pins_board   ON pins(board_id);
+    """)
+    con.commit()
+    con.close()
+
+# ── write nested JSON (Pinner → Boards → Pins) for the viewer ─────────────────
+def write_json(data):
+    boards_by_owner = {}
+    for b in data["boards"]:
+        boards_by_owner.setdefault(b["owner_username"], []).append(b)
+    pins_by_pinner = {}
+    for p in data["pins"]:
+        pins_by_pinner.setdefault(p["pinner_username"], []).append(p)
+
+    pinners_out = []
+    for p in data["pinners"]:
+        u = p["username"]
+        my_boards = boards_by_owner.get(u, [])
+        my_pins   = pins_by_pinner.get(u, [])
+        pins_by_board = {}
+        loose = []
+        board_ids = {b["id"] for b in my_boards}
+        for pin in my_pins:
+            if pin["board_id"] and pin["board_id"] in board_ids:
+                pins_by_board.setdefault(pin["board_id"], []).append(pin)
+            else:
+                loose.append(pin)
+        boards_nested = []
+        for b in sorted(my_boards, key=lambda x: x["pin_count"], reverse=True):
+            bb = dict(b)
+            bb["pins"] = pins_by_board.get(b["id"], [])
+            boards_nested.append(bb)
+        rec = dict(p)
+        rec["boards"]      = boards_nested
+        rec["loose_pins"]  = loose
+        rec["_n_boards"]   = len(my_boards)
+        rec["_n_pins"]     = len(my_pins)
+        pinners_out.append(rec)
+
+    pinners_out.sort(key=lambda x: (x["follower_count"], x["_n_pins"]), reverse=True)
+
+    out = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "stats": {
+            "pinners": len(data["pinners"]),
+            "boards":  len(data["boards"]),
+            "pins":    len(data["pins"]),
+        },
+        "pinners": pinners_out,
+    }
+    with open(JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+# ── data source 1: live extension (best-effort) ───────────────────────────────
+def try_live_extension():
+    """
+    Best-effort: connect to Brave via CDP, open the SortPin extension page, and
+    read its stored data (chrome.storage.local + IndexedDB) from the extension
+    context. Returns (leads, boards, pins) or None if it can't.
+
+    This needs Brave running with --remote-debugging-port=9222 (same as step 2)
+    and selenium installed. If anything fails we return None and the caller
+    falls back to the CSV exports.
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+    except Exception:
+        return None
+    try:
+        opts = Options()
+        opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{CDP_PORT}")
+        driver = webdriver.Chrome(options=opts)
+    except Exception as e:
+        print(f"  (live) could not attach to Brave on :{CDP_PORT} — {e}")
+        return None
+
+    try:
+        # open the extension page in a new tab so we run in the extension origin
+        driver.switch_to.new_window("tab")
+        driver.get(f"chrome-extension://{EXT_ID}/popup.html")
+        import time as _t; _t.sleep(3)
+
+        # 1) chrome.storage.local dump
+        store = driver.execute_async_script("""
+            const done = arguments[arguments.length - 1];
+            try {
+                if (chrome && chrome.storage && chrome.storage.local) {
+                    chrome.storage.local.get(null, d => done(d || {}));
+                } else { done(null); }
+            } catch (e) { done(null); }
+        """)
+
+        # 2) IndexedDB dump (all DBs / all object stores)
+        idb = driver.execute_async_script("""
+            const done = arguments[arguments.length - 1];
+            (async () => {
+                const out = {};
+                try {
+                    const dbs = (indexedDB.databases ? await indexedDB.databases() : []);
+                    for (const meta of dbs) {
+                        const db = await new Promise((res, rej) => {
+                            const r = indexedDB.open(meta.name);
+                            r.onsuccess = () => res(r.result);
+                            r.onerror   = () => rej(r.error);
+                        });
+                        for (const storeName of Array.from(db.objectStoreNames)) {
+                            const rows = await new Promise((res) => {
+                                const tx = db.transaction(storeName, 'readonly');
+                                const rq = tx.objectStore(storeName).getAll();
+                                rq.onsuccess = () => res(rq.result || []);
+                                rq.onerror   = () => res([]);
+                            });
+                            out[meta.name + '/' + storeName] = rows;
+                        }
+                        db.close();
+                    }
+                } catch (e) {}
+                done(out);
+            })();
+        """)
+        try: driver.close()
+        except Exception: pass
+
+        # flatten every array of objects we found and bucket by signature fields
+        buckets = []
+        for blob in (store, idb):
+            if isinstance(blob, dict):
+                for v in blob.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        buckets.append(v)
+        leads = boards = pins = None
+        for arr in buckets:
+            keys = set(arr[0].keys())
+            if {"contact_email", "username"} & keys and "owner_username" not in keys and "pin_url" not in keys:
+                leads = leads or arr
+            elif "owner_username" in keys or "image_cover_url" in keys:
+                boards = boards or arr
+            elif "pin_url" in keys or "pinner_username" in keys:
+                pins = pins or arr
+        if any([leads, boards, pins]):
+            print(f"  (live) extension data found: "
+                  f"{len(leads or [])} leads, {len(boards or [])} boards, {len(pins or [])} pins")
+            return (leads or [], boards or [], pins or [])
+        print("  (live) extension reachable but no recognizable data — using CSVs")
+        return None
+    except Exception as e:
+        print(f"  (live) extraction failed — {e}")
+        return None
+
+# ── data source 2: CSV exports in this folder ─────────────────────────────────
+def load_from_csv():
+    leads_f  = newest("*all_leads*.csv")
+    boards_f = newest("*all_boards*.csv")
+    pins_f   = newest("*all_pins*.csv")
+    print(f"  leads CSV : {os.path.basename(leads_f)  if leads_f  else '— none —'}")
+    print(f"  boards CSV: {os.path.basename(boards_f) if boards_f else '— none —'}")
+    print(f"  pins CSV  : {os.path.basename(pins_f)   if pins_f   else '— none —'}")
+    return read_csv(leads_f), read_csv(boards_f), read_csv(pins_f)
+
+# ── main ──────────────────────────────────────────────────────────────────────
+def main():
+    print(f"\n{'='*60}\n  STEP 4 — Build local relational SortPin database\n{'='*60}")
+    use_live = "--live" in sys.argv[1:]
+
+    leads = boards = pins = None
+    if use_live:
+        print("  Trying live extension pull from Brave...")
+        live = try_live_extension()
+        if live:
+            leads, boards, pins = live
+
+    if leads is None and boards is None and pins is None:
+        print("  Reading SortPin CSV exports from this folder...")
+        leads, boards, pins = load_from_csv()
+
+    if not (leads or boards or pins):
+        print("\n  ⚠  No data found.\n"
+              "     Export Pins / Boards / Pinners from the SortPin popup and put\n"
+              "     the 3 CSV files in this folder, then re-run.\n")
+        sys.exit(1)
+
+    print("\n  Normalizing into Pinner → Boards → Pins ...")
+    data = normalize(leads, boards, pins)
+    write_sqlite(data)
+    write_json(data)
+
+    print(f"\n  ✅ Built local database:")
+    print(f"     • pinners : {len(data['pinners']):>6}")
+    print(f"     • boards  : {len(data['boards']):>6}")
+    print(f"     • pins    : {len(data['pins']):>6}")
+    print(f"\n     → {os.path.basename(DB_PATH)}   (SQLite, relational)")
+    print(f"     → {os.path.basename(JSON_PATH)}   (nested, for the viewer)")
+    print(f"\n  Next:  python 5_view_data.py   (stats + browse the data)\n")
+
+if __name__ == "__main__":
+    main()
