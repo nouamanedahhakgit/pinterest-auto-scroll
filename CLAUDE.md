@@ -17,6 +17,7 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `3_sync_to_sheet.py` | Writes Done/Not Yet from progress.json into column D of the sheet. |
 | `4_build_database.py` | Builds a local **relational** DB from SortPin data: Pinner→Boards→Pins. Outputs `sortpin.db` + `sortpin_data.json`. |
 | `5_view_data.py` | Prints statistics + builds/opens `sortpin_viewer.html` to browse Pinner→Boards→Pins. |
+| `6_clear_sortpin.py` | Clears the SortPin extension's stored data (IndexedDB + big storage arrays) so it stops growing. Run step 4 first to save. |
 | `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
 | `sortpin_data.json` | Auto-created (step 4). Nested Pinner→Boards→Pins (feeds the viewer). |
 | `sortpin_viewer.html` | Auto-created (step 5). Self-contained offline browser of the data. |
@@ -35,6 +36,7 @@ python 3_sync_to_sheet.py               # push statuses to sheet
 python 4_build_database.py              # LIVE pull from SortPin extension (falls back to CSV)
 python 4_build_database.py --csv        # skip live; build only from CSV exports in folder
 python 5_view_data.py                   # stats + open the visual data browser
+python 6_clear_sortpin.py               # clear extension data (run step 4 first!)
 ```
 
 ## Steps 4 & 5 — SortPin data → relational DB + viewer

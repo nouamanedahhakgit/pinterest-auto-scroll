@@ -312,68 +312,123 @@ def _ensure_brave_cdp():
         time.sleep(1)
     return False
 
-# JS run IN THE EXTENSION PAGE: dump chrome.storage.local + every IndexedDB store
-_DUMP_JS = r"""
+# STEP 1 (runs in the extension page): cache every data array in page memory
+# (window.__src) and return ONLY metadata (name, length, field keys). This keeps
+# the round-trip tiny even when the database is huge — we slice the data out in
+# chunks afterwards instead of returning it all at once (that caused the timeout).
+_META_JS = r"""
 const done = arguments[arguments.length - 1];
 (async () => {
-  const result = {storage:{}, idb:{}, errors:[]};
-  // chrome.storage.local
+  window.__src = {};
+  const errors = [];
   try {
     if (typeof chrome!=='undefined' && chrome.storage && chrome.storage.local) {
-      result.storage = await new Promise(r => chrome.storage.local.get(null, d => r(d||{})));
+      const all = await new Promise(r => chrome.storage.local.get(null, d => r(d||{})));
+      for (const k in all) {
+        const v = all[k];
+        if (Array.isArray(v) && v.length && typeof v[0]==='object') window.__src['storage:'+k]=v;
+        else if (v && typeof v==='object') {
+          for (const k2 in v) {
+            const v2 = v[k2];
+            if (Array.isArray(v2) && v2.length && typeof v2[0]==='object') window.__src['storage:'+k+'.'+k2]=v2;
+          }
+        }
+      }
     }
-  } catch(e){ result.errors.push('storage:'+e); }
-  // IndexedDB (all DBs, all stores)
+  } catch(e){ errors.push('storage:'+e); }
+  const meta = {};
+  // storage arrays are small/config — keep them cached for slicing
+  for (const n in window.__src){ const a = window.__src[n]; meta[n] = {len:a.length, keys:Object.keys(a[0]||{}), src:'storage'}; }
+  // IndexedDB: only COUNT + sample first row's keys here (no getAll → no hang).
+  // The actual rows are streamed later with a cursor, chunk by chunk.
   try {
     const dbs = (indexedDB.databases ? await indexedDB.databases() : []);
-    for (const meta of dbs) {
-      const db = await new Promise((res,rej)=>{const r=indexedDB.open(meta.name);
+    for (const dbmeta of dbs) {
+      const db = await new Promise((res,rej)=>{const r=indexedDB.open(dbmeta.name);
         r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error);});
       for (const s of Array.from(db.objectStoreNames)) {
-        const rows = await new Promise(res=>{const tx=db.transaction(s,'readonly');
-          const rq=tx.objectStore(s).getAll(); rq.onsuccess=()=>res(rq.result||[]);
-          rq.onerror=()=>res([]);});
-        result.idb[meta.name+'/'+s] = rows;
+        const tx = db.transaction(s,'readonly'); const osx = tx.objectStore(s);
+        const cnt = await new Promise(res=>{const rq=osx.count(); rq.onsuccess=()=>res(rq.result||0); rq.onerror=()=>res(0);});
+        const sampleKeys = await new Promise(res=>{const rq=osx.openCursor();
+          rq.onsuccess=e=>{const c=e.target.result; res(c?Object.keys(c.value||{}):[]);}; rq.onerror=()=>res([]);});
+        if (cnt > 0) meta['idb:'+dbmeta.name+'/'+s] = {len:cnt, keys:sampleKeys, src:'idb',
+                                                       db:dbmeta.name, store:s};
       }
       db.close();
     }
-  } catch(e){ result.errors.push('idb:'+e); }
-  done(result);
+  } catch(e){ errors.push('idb:'+e); }
+  done({meta:meta, errors:errors});
 })();
 """
 
-def _collect_arrays(blob):
-    """Yield every list-of-objects found anywhere inside a dump (storage/idb),
-    even when nested one level inside an object."""
-    if not isinstance(blob, dict):
-        return
-    for source in ("storage", "idb"):
-        section = blob.get(source, {})
-        if not isinstance(section, dict):
-            continue
-        for key, val in section.items():
-            if isinstance(val, list) and val and isinstance(val[0], dict):
-                yield key, val
-            elif isinstance(val, dict):
-                for k2, v2 in val.items():
-                    if isinstance(v2, list) and v2 and isinstance(v2[0], dict):
-                        yield f"{key}.{k2}", v2
+# STEP 2b (async): stream ONE chunk of an IndexedDB store via a cursor, resuming
+# after the last primary key — O(n) total, never loads the whole store at once.
+_READ_IDB_CHUNK_JS = r"""
+const dbName = arguments[0], store = arguments[1], afterKey = arguments[2],
+      count = arguments[3], done = arguments[4];
+(async () => {
+  function trim(o){
+    if (o===null || typeof o!=='object') return o;
+    const r = {};
+    for (const k in o){ const v=o[k], t=typeof v;
+      if (v===null||t==='string'||t==='number'||t==='boolean') r[k]=v;
+      else { try { const s=JSON.stringify(v); if (s && s.length<=800) r[k]=v; } catch(e){} } }
+    return r;
+  }
+  try {
+    const db = await new Promise((res,rej)=>{const r=indexedDB.open(dbName);
+      r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error);});
+    const osx = db.transaction(store,'readonly').objectStore(store);
+    const range = (afterKey===null||afterKey===undefined) ? null
+                  : IDBKeyRange.lowerBound(afterKey, true);
+    const out = []; let lastKey = null;
+    await new Promise(res=>{
+      const rq = osx.openCursor(range);
+      rq.onsuccess = e => { const cur = e.target.result;
+        if (!cur || out.length>=count){ res(); return; }
+        out.push(cur.value); lastKey = cur.primaryKey; cur.continue(); };
+      rq.onerror = () => res();
+    });
+    db.close();
+    done({rows: out.map(trim), lastKey: lastKey});
+  } catch(e){ done({__error:String(e)}); }
+})();
+"""
 
-def _classify(arr):
-    keys = set(arr[0].keys())
+# STEP 2 (sync): return one trimmed slice of a cached array. Big nested fields
+# (image-size maps, videos, etc.) are dropped so each chunk stays small; scalar
+# fields we actually need (pin_url, title, image, owner_username, …) are kept.
+_SLICE_JS = r"""
+const name = arguments[0], start = arguments[1], count = arguments[2];
+const a = (window.__src && window.__src[name]) || [];
+function trim(o){
+  if (o===null || typeof o!=='object') return o;
+  const r = {};
+  for (const k in o){
+    const v = o[k], t = typeof v;
+    if (v===null || t==='string' || t==='number' || t==='boolean') r[k]=v;
+    else { try { const s = JSON.stringify(v); if (s && s.length<=800) r[k]=v; } catch(e){} }
+  }
+  return r;
+}
+return a.slice(start, start+count).map(trim);
+"""
+
+def _classify_keys(keys):
+    keys = set(keys)
     if ("pin_url" in keys) or ("pinner_username" in keys) or ("repin_count" in keys):
         return "pins"
     if ("owner_username" in keys) or ("image_cover_url" in keys) or ("section_count" in keys):
         return "boards"
-    if ("contact_email" in keys) or ("website_url" in keys and "username" in keys) \
-       or ("profile_reach" in keys):
+    if ("contact_email" in keys) or ("profile_reach" in keys) or \
+       ("website_url" in keys and "username" in keys):
         return "leads"
     return None
 
 def try_live_extension():
-    """Read SortPin's data live from the extension in Brave. Returns
-    (leads, boards, pins) or None. Self-diagnoses: prints what it finds so the
-    storage layout is visible even if classification needs tuning."""
+    """Read SortPin's data live from the extension in Brave, in chunks so it
+    works even for a huge database. Returns (leads, boards, pins) or None.
+    Self-diagnoses by printing every data container it finds."""
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
@@ -381,7 +436,7 @@ def try_live_extension():
         print("  (live) selenium not installed — run: pip install selenium")
         return None
     if not _ensure_brave_cdp():
-        print(f"  (live) could not get Brave on the debug port — falling back to CSV")
+        print("  (live) could not get Brave on the debug port — falling back to CSV")
         return None
     try:
         opts = Options()
@@ -392,45 +447,114 @@ def try_live_extension():
         return None
 
     try:
+        driver.set_page_load_timeout(60)
+        driver.set_script_timeout(600)          # huge DBs need a long timeout
         driver.switch_to.new_window("tab")
-        # open the popup pages so the extension initialises its data store
-        for route in ("#/pinners", "#/boards", "#/pins"):
-            try:
-                driver.get(f"chrome-extension://{EXT_ID}/popup.html{route}")
-                time.sleep(2)
-            except Exception as e:
-                print(f"  (live) could not open extension page {route} — {e}")
-        time.sleep(2)
-        dump = driver.execute_async_script(_DUMP_JS)
-        try: driver.close()
-        except Exception: pass
+        # one lightweight load into the extension origin (enough to reach its
+        # chrome.storage + IndexedDB); we don't need the heavy data UI to render
+        try:
+            driver.get(f"chrome-extension://{EXT_ID}/popup.html")
+        except Exception as e:
+            print(f"  (live) could not open extension page — {e}")
+        time.sleep(3)
+        print("  (live) scanning extension storage (counts only)...")
+        res = driver.execute_async_script(_META_JS)   # tiny: metadata only
     except Exception as e:
         print(f"  (live) extraction failed — {e}")
+        try: driver.quit()
+        except Exception: pass
         return None
 
-    # diagnostics: show every data array we found
-    arrays = list(_collect_arrays(dump))
-    if arrays:
-        print("  (live) data containers found in the extension:")
-        for name, arr in arrays:
-            print(f"        {name:<40} {len(arr):>6} rows  → looks like: {_classify(arr) or '?'}")
-    else:
-        errs = (dump or {}).get("errors") if isinstance(dump, dict) else None
-        print(f"  (live) no data arrays found in the extension storage. {errs or ''}")
+    meta = (res or {}).get("meta") or {}
+    errs = (res or {}).get("errors") or []
+    if not meta:
+        print(f"  (live) no data arrays found in the extension. {errs}")
         return None
 
-    leads = boards = pins = None
-    for name, arr in sorted(arrays, key=lambda x: -len(x[1])):  # biggest first
-        kind = _classify(arr)
-        if kind == "leads"  and not leads:  leads  = arr
-        if kind == "boards" and not boards: boards = arr
-        if kind == "pins"   and not pins:   pins   = arr
-    if any([leads, boards, pins]):
-        print(f"  (live) using: {len(leads or [])} pinners, "
-              f"{len(boards or [])} boards, {len(pins or [])} pins")
-        return (leads or [], boards or [], pins or [])
+    print("  (live) data containers found in the extension:")
+    for name, info in sorted(meta.items(), key=lambda kv: -kv[1]["len"]):
+        print(f"        {name:<42} {info['len']:>7} rows  → {(_classify_keys(info['keys']) or '?')}")
+
+    # pull each relevant container in CHUNKS (bounded transfers)
+    picked = {"leads": None, "boards": None, "pins": None}
+    CH = 1000
+    for name, info in sorted(meta.items(), key=lambda kv: -kv[1]["len"]):
+        kind = _classify_keys(info["keys"])
+        if not kind or picked[kind] is not None:
+            continue
+        n = info["len"]; rows = []
+        if info.get("src") == "idb":
+            # stream the IndexedDB store with a cursor (no full load → no hang)
+            after = None
+            while True:
+                try:
+                    r = driver.execute_async_script(
+                        _READ_IDB_CHUNK_JS, info["db"], info["store"], after, CH)
+                except Exception as e:
+                    print(f"\n  (live) idb chunk failed — {e}")
+                    break
+                if isinstance(r, dict) and r.get("__error"):
+                    print(f"\n  (live) idb read error — {r['__error']}")
+                    break
+                chunk = (r or {}).get("rows") or []
+                if not chunk:
+                    break
+                rows += chunk
+                after = r.get("lastKey")
+                print(f"\r  (live) reading {name} as {kind} ({len(rows)}/{n})   ", end="", flush=True)
+                if len(chunk) < CH:
+                    break
+        else:
+            # storage array cached in window.__src — slice it out
+            start = 0
+            while start < n:
+                try:
+                    chunk = driver.execute_script(_SLICE_JS, name, start, CH)
+                except Exception as e:
+                    print(f"\n  (live) chunk failed at {start} — {e}")
+                    break
+                if not chunk:
+                    break
+                rows += chunk
+                start += len(chunk)
+                print(f"\r  (live) reading {name} as {kind} ({len(rows)}/{n})   ", end="", flush=True)
+        print()
+        picked[kind] = rows
+
+    try: driver.close()
+    except Exception: pass
+
+    if any(picked.values()):
+        return (picked["leads"] or [], picked["boards"] or [], picked["pins"] or [])
     print("  (live) found data but couldn't classify it — falling back to CSV")
     return None
+
+# ── persist a live pull to timestamped CSVs (so data survives clearing) ────────
+def save_snapshot(leads, boards, pins):
+    """Write the live-pulled rows to timestamped CSVs in SortPin's naming so the
+    data is preserved on disk, git-syncs across computers, and is re-merged by
+    later runs even after the extension is cleared (step 6)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    written = []
+    for rows, label in ((leads, "leads"), (boards, "boards"), (pins, "pins")):
+        if not rows:
+            continue
+        cols = []
+        seen = set()
+        for r in rows:                       # union of keys, stable order
+            for k in r.keys():
+                if k not in seen:
+                    seen.add(k); cols.append(k)
+        path = os.path.join(BASE, f"SortPin.com_all_{label}_live {ts}.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in cols})
+        written.append(os.path.basename(path))
+    if written:
+        print(f"  (live) saved snapshot: {', '.join(written)}")
+    return written
 
 # ── data source 2: CSV exports in this folder ─────────────────────────────────
 def load_from_csv():
@@ -450,16 +574,19 @@ def main():
     # CSV exports only.  (--live also works and is the same as the default.)
     csv_only = "--csv" in sys.argv[1:]
 
-    leads = boards = pins = None
+    # 1) LIVE pull → save a timestamped CSV snapshot (preserves data on disk so it
+    #    survives clearing the extension in step 6, and git-syncs to other PCs).
     if not csv_only:
         print("  Pulling LIVE from the SortPin extension in Brave...")
         live = try_live_extension()
         if live:
-            leads, boards, pins = live
+            save_snapshot(*live)
 
-    if leads is None and boards is None and pins is None:
-        print("  Reading SortPin CSV exports from this folder (fallback)...")
-        leads, boards, pins = load_from_csv()
+    # 2) Always build the DB from ALL CSVs in the folder (the new snapshot +
+    #    every past snapshot/export), merged & de-duplicated. This way the
+    #    database keeps growing across runs, clears, and computers.
+    print("  Reading SortPin CSV data from this folder...")
+    leads, boards, pins = load_from_csv()
 
     if not (leads or boards or pins):
         print("\n  ⚠  No data found.\n"
