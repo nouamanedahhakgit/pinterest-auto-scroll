@@ -128,7 +128,8 @@ def get_db_connection(db_path):
                 user=user,
                 password=mysql_password,
                 charset="utf8mb4",
-                collation="utf8mb4_general_ci"
+                collation="utf8mb4_general_ci",
+                autocommit=True
             )
             print(f"  Connected to cloud MySQL database successfully.")
             return DBWrapper(is_mysql=True, conn=conn)

@@ -207,7 +207,7 @@ def main():
                 mysql_conn.commit()
                 total_inserted += len(batch)
                 print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
-            except mysql.connector.Error as err:
+            except Exception as err:
                 print(f"  Error syncing batch in `{table}`: {err}")
                 mysql_conn.rollback()
 
@@ -265,7 +265,7 @@ def main():
         
         print("  Metric calculations updated successfully.")
         
-    except mysql.connector.Error as err:
+    except Exception as err:
         print(f"  Error running aggregations: {err}")
         mysql_conn.rollback()
 
