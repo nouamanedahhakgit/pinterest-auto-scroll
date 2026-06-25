@@ -1284,6 +1284,25 @@ def main():
                 pass
             
             if has_pw:
+                # Write newly scraped/imported IDs to new_scraped_ids.json for incremental MySQL sync
+                new_leads_src = (live[0] if (live and live[0]) else []) + csv_leads
+                new_boards_src = (live[1] if (live and live[1]) else []) + csv_boards
+                new_pins_src = (live[2] if (live and live[2]) else []) + csv_pins
+
+                new_usernames = [u for u in set(_clean(l.get("username")) for l in new_leads_src if l.get("username")) if u]
+                new_bids = [bid for bid in set(_clean(b.get("id")) for b in new_boards_src if b.get("id")) if bid]
+                new_pids = [pid for pid in set(pin_id_from_url(p.get("pin_url"), p.get("id")) for p in new_pins_src if p) if pid]
+
+                try:
+                    with open(os.path.join(BASE, "new_scraped_ids.json"), "w", encoding="utf-8") as f:
+                        json.dump({
+                            "pinners": new_usernames,
+                            "boards": new_bids,
+                            "pins": new_pids
+                        }, f, ensure_ascii=False)
+                except Exception as e:
+                    print(f"  ⚠️  Failed to save new_scraped_ids.json: {e}")
+
                 print("  🔄 Automatically syncing local database to Cloud MySQL...")
                 try:
                     import subprocess
