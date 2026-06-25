@@ -14,7 +14,7 @@ const SPREADSHEET_ID = "1ZaIcgG7E2ChZYtUr9UZP78bfO-YNMArlbWZk_71E_VE";
 const SECRET = "pinterest-scan-2026";
 
 function doGet() {
-  return jsonOut({ ok: true, version: 3, message: "Web app ready — claim/mark supported" });
+  return jsonOut({ ok: true, version: 4, message: "Web app ready — websites header check added" });
 }
 
 function doPost(e) {
@@ -141,7 +141,24 @@ function syncWebsites(ss, rows) {
     wsSheet.appendRow(headers);
   }
   
-  const last = wsSheet.getLastRow();
+  let last = wsSheet.getLastRow();
+  let firstRowEmptyOrNoHeader = true;
+  if (last > 0) {
+    const firstRowValues = wsSheet.getRange(1, 1, 1, headers.length).getValues()[0];
+    if (firstRowValues && firstRowValues.length > 0) {
+      const firstCell = String(firstRowValues[0]).trim();
+      if (firstCell.toLowerCase() === "id") {
+        firstRowEmptyOrNoHeader = false;
+      }
+    }
+  }
+
+  if (firstRowEmptyOrNoHeader) {
+    wsSheet.clearContents();
+    wsSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    last = 1;
+  }
+  
   let existingIds = {};
   if (last > 1) {
     const ids = wsSheet.getRange(2, 1, last - 1, 1).getValues();

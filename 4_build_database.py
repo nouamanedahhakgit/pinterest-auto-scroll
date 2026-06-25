@@ -967,10 +967,10 @@ def try_disk_extension():
     read_archive = ("--archive" in args) or ("archive" in args)
     read_live = ("--disk" in args)
 
-    # Default to both live Brave profiles & archives if neither is explicitly specified
+    # Default to only live Brave profiles (and SQLite fallback for history)
+    # unless --archive is requested.
     if not read_archive and not read_live:
         read_live = True
-        read_archive = True
 
     dirs = []
     if read_archive:
@@ -1027,6 +1027,39 @@ def try_disk_extension():
         return (buckets["leads"], buckets["boards"], buckets["pins"])
     print("  (disk) found the files but no usable records — falling back")
     return None
+
+def load_from_sqlite():
+    """Read existing historical records from sortpin.db so we don't have to read disk archives."""
+    if not os.path.exists(DB_PATH):
+        return [], [], []
+    leads, boards, pins = [], [], []
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        
+        # Read pinners
+        try:
+            leads = [dict(r) for r in con.execute("SELECT * FROM pinners")]
+        except Exception:
+            pass
+            
+        # Read boards
+        try:
+            boards = [dict(r) for r in con.execute("SELECT * FROM boards")]
+        except Exception:
+            pass
+            
+        # Read pins
+        try:
+            pins = [dict(r) for r in con.execute("SELECT * FROM pins")]
+        except Exception:
+            pass
+            
+        con.close()
+        print(f"  (sqlite) Loaded historical data from sortpin.db: {len(leads)} pinners, {len(boards)} boards, {len(pins)} pins")
+    except Exception as e:
+        print(f"  (sqlite) Warning: could not load historical data from sortpin.db: {e}")
+    return leads, boards, pins
 
 # ── data source 2: CSV exports in this folder ─────────────────────────────────
 def load_from_csv():
@@ -1146,12 +1179,12 @@ def main():
         if disk_mode:
             has_archive = ("--archive" in args) or ("archive" in args)
             has_disk = ("--disk" in args)
-            if (has_archive and has_disk) or (not has_archive and not has_disk):
+            if has_archive and has_disk:
                 src = "Brave profiles & _SORTPIN_ARCHIVE backups"
             elif has_archive:
                 src = "_SORTPIN_ARCHIVE backups"
             else:
-                src = "IndexedDB files"
+                src = "Brave profiles (active extension)"
             print(f"  Reading SortPin data from disk ({src}, no browser)...")
             live = try_disk_extension()
             if not live:
@@ -1175,10 +1208,16 @@ def main():
     print("  Reading SortPin CSV data from this folder...")
     csv_leads, csv_boards, csv_pins = load_from_csv()
 
-    # 3) Combine live data (CDP or disk IndexedDB) directly with local CSVs
-    leads = (live[0] if (live and live[0]) else []) + csv_leads
-    boards = (live[1] if (live and live[1]) else []) + csv_boards
-    pins = (live[2] if (live and live[2]) else []) + csv_pins
+    # Load historical data from SQLite database to avoid scanning slow disk archives.
+    db_leads, db_boards, db_pins = [], [], []
+    has_archive_arg = ("--archive" in args) or ("archive" in args)
+    if not has_archive_arg:
+        db_leads, db_boards, db_pins = load_from_sqlite()
+
+    # 3) Combine live data (CDP or disk IndexedDB) directly with local CSVs and SQLite historical data
+    leads = (live[0] if (live and live[0]) else []) + db_leads + csv_leads
+    boards = (live[1] if (live and live[1]) else []) + db_boards + csv_boards
+    pins = (live[2] if (live and live[2]) else []) + db_pins + csv_pins
 
     if not (leads or boards or pins):
         print("\n  ⚠  No data found.\n"

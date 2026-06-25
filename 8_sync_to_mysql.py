@@ -215,51 +215,58 @@ def main():
     print("\nOrganizing and recalculating metrics in MySQL (combining data from all workers)...")
     
     try:
-        # Recalculate board pins count
+        # Recalculate board pins count using JOIN
         print("  - Calculating board pin counts...")
         mysql_cursor.execute("""
             UPDATE boards b 
-            SET b.pin_count = (
-                SELECT COUNT(*) FROM pins p WHERE p.board_id = b.id
-            )
+            LEFT JOIN (
+                SELECT board_id, COUNT(*) as cnt 
+                FROM pins 
+                GROUP BY board_id
+            ) p_counts ON b.id = p_counts.board_id
+            SET b.pin_count = COALESCE(p_counts.cnt, 0)
         """)
         mysql_conn.commit()
 
-        # Recalculate pinner total scraped boards
+        # Recalculate pinner total scraped boards using JOIN
         print("  - Calculating pinner board counts...")
         mysql_cursor.execute("""
-            UPDATE pinners p 
-            SET p.scraped_boards_count = (
-                SELECT COUNT(*) FROM boards b WHERE b.owner_username = p.username
-            )
+            UPDATE pinners p
+            LEFT JOIN (
+                SELECT owner_username, COUNT(*) as cnt
+                FROM boards
+                GROUP BY owner_username
+            ) b_counts ON p.username = b_counts.owner_username
+            SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
         """)
         mysql_conn.commit()
 
-        # Recalculate pinner total scraped pins
+        # Recalculate pinner total scraped pins using JOIN
         print("  - Calculating pinner pin counts...")
         mysql_cursor.execute("""
-            UPDATE pinners p 
-            SET p.scraped_pins_count = (
-                SELECT COUNT(*) FROM pins p2 WHERE p2.pinner_username = p.username
-            )
+            UPDATE pinners p
+            LEFT JOIN (
+                SELECT pinner_username, COUNT(*) as cnt
+                FROM pins
+                GROUP BY pinner_username
+            ) p_counts ON p.username = p_counts.pinner_username
+            SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
         """)
         mysql_conn.commit()
 
-        # Recalculate pinner created vs saved counts
+        # Recalculate pinner created vs saved counts using a single combined JOIN
         print("  - Calculating pinner created vs saved pin counts...")
         mysql_cursor.execute("""
-            UPDATE pinners p 
-            SET p.scraped_created_pins_count = (
-                SELECT COUNT(*) FROM pins p2 
-                WHERE p2.pinner_username = p.username AND p2.pin_type = 'created'
-            )
-        """)
-        mysql_cursor.execute("""
-            UPDATE pinners p 
-            SET p.scraped_saved_pins_count = (
-                SELECT COUNT(*) FROM pins p2 
-                WHERE p2.pinner_username = p.username AND p2.pin_type = 'saved'
-            )
+            UPDATE pinners p
+            LEFT JOIN (
+                SELECT pinner_username,
+                       SUM(CASE WHEN pin_type = 'created' THEN 1 ELSE 0 END) as created_cnt,
+                       SUM(CASE WHEN pin_type = 'saved' THEN 1 ELSE 0 END) as saved_cnt
+                FROM pins
+                GROUP BY pinner_username
+            ) p_counts ON p.username = p_counts.pinner_username
+            SET p.scraped_created_pins_count = COALESCE(p_counts.created_cnt, 0),
+                p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
         """)
         mysql_conn.commit()
         
@@ -274,6 +281,16 @@ def main():
     mysql_conn.close()
     
     print("\nLocal database synchronized to MySQL successfully!")
+
+    # Automatically sync websites to Google Sheets
+    try:
+        print("\nAutomatically syncing websites to Google Sheets...")
+        sys.path.insert(0, BASE)
+        vd = __import__("5_view_data")
+        count = vd.run_websites_sync(DB_PATH)
+        print(f"Website sync completed. Added {count} new websites to Google Sheet.")
+    except Exception as e:
+        print(f"Warning: Website auto-sync failed: {e}")
 
 if __name__ == "__main__":
     main()

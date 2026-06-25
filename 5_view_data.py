@@ -237,6 +237,12 @@ def run_websites_sync(db_path):
         headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"]
         try:
             ws = sh.worksheet("websites")
+            # If the sheet is empty or lacks the correct header, clear and write headers
+            first_row = ws.row_values(1)
+            first_cell = first_row[0].strip().lower() if (first_row and len(first_row) > 0 and first_row[0]) else ""
+            if first_cell != "id":
+                ws.clear()
+                ws.update("A1:N1", [headers], value_input_option="RAW")
         except Exception:
             ws = sh.add_worksheet(title="websites", rows="100", cols=str(len(headers)))
             ws.update("A1:N1", [headers], value_input_option="RAW")
