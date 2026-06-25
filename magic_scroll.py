@@ -21,9 +21,13 @@ REQUIREMENTS (one-time):
   • pip install selenium
 
 Run:
-  python magic_scroll.py             # 5 minutes per keyword (default)
+  python magic_scroll.py             # 5 minutes per keyword, batch size 5 (default)
   python magic_scroll.py --2m        # 2 minutes per keyword
-  python magic_scroll.py --batch 5   # keywords claimed per cycle (default 5)
+  python magic_scroll.py --10m       # 10 minutes per keyword
+  python magic_scroll.py --batch 10  # 10 keywords claimed per cycle
+  python magic_scroll.py --kw 10     # 10 keywords claimed per cycle (alternative)
+  python magic_scroll.py --10kw      # 10 keywords claimed per cycle (alternative)
+  python magic_scroll.py --10        # 10 keywords claimed per cycle (alternative)
   python magic_scroll.py --disk      # build DB from disk (needs ccl_chromium_reader)
 """
 
@@ -55,11 +59,28 @@ def _minutes():
 
 def _batch():
     args = sys.argv[1:]
+    # Check for --batch <N>
     for i, a in enumerate(args):
         if a == "--batch" and i + 1 < len(args):
             try: return int(args[i + 1])
             except ValueError: pass
+    # Check for --kw <N>
+    for i, a in enumerate(args):
+        if a == "--kw" and i + 1 < len(args):
+            try: return int(args[i + 1])
+            except ValueError: pass
+    # Check for --<N>kw (e.g. --10kw)
+    for a in args:
+        m = re.match(r"^--(\d+)kw$", a)
+        if m:
+            return int(m.group(1))
+    # Check for --<N> where N is an integer (e.g. --10)
+    for a in args:
+        m = re.match(r"^--(\d+)$", a)
+        if m:
+            return int(m.group(1))
     return 5
+
 
 MINUTES   = _minutes()
 BATCH     = _batch()

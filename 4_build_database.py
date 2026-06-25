@@ -1171,6 +1171,8 @@ def main():
     live_mode = "--live" in sys.argv[1:]
     disk_mode = not csv_only and not live_mode
 
+    no_csv = "--no-csv" in sys.argv[1:]
+
     # 1) Pull the current extension data → save a timestamped CSV snapshot
     #    (preserves it on disk so it survives clearing in step 6 + git-syncs).
     args = sys.argv[1:]
@@ -1197,7 +1199,8 @@ def main():
             print("  Pulling LIVE from the SortPin extension in Brave...")
             live = try_live_extension()
         if live:
-            save_snapshot(*live)
+            if not no_csv:
+                save_snapshot(*live)
             is_archive_only = (("archive" in args or "--archive" in args) and not ("--disk" in args))
             no_clear = ("--no-clear" in args)
             if not is_archive_only and not no_clear:
@@ -1205,8 +1208,12 @@ def main():
                 archive_and_clear_extension_data()
 
     # 2) Read SortPin CSV data from this folder (if any)
-    print("  Reading SortPin CSV data from this folder...")
-    csv_leads, csv_boards, csv_pins = load_from_csv()
+    if no_csv:
+        print("  Skipping reading CSV data (--no-csv)...")
+        csv_leads, csv_boards, csv_pins = [], [], []
+    else:
+        print("  Reading SortPin CSV data from this folder...")
+        csv_leads, csv_boards, csv_pins = load_from_csv()
 
     # Load historical data from SQLite database to avoid scanning slow disk archives.
     db_leads, db_boards, db_pins = [], [], []
