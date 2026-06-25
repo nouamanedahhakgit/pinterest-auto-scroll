@@ -5,3 +5,20 @@ __pycache__/
 # local backups of cleared SortPin data (large, per-machine — not synced)
 _SORTPIN_ARCHIVE/
 
+# Ignore local databases and flat viewer data
+sortpin.db
+sortpin_data.json
+IMPORTANT_DATABASE/sortpin.db
+IMPORTANT_DATABASE/sortpin_mysql.sql
+
+# Ignore environment credentials (database passwords)
+.env
+
+# Ignore local progress tracking and logs
+progress.json
+profiles_progress.json
+magic_log.jsonl
+
+# Ignore local CSV snapshots and output folders
+*.csv
+sortpin_output/

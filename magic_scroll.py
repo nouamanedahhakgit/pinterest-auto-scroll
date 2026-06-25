@@ -63,7 +63,7 @@ def _batch():
 
 MINUTES   = _minutes()
 BATCH     = _batch()
-BUILD_ARGS = ["4_build_database.py"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
+BUILD_ARGS = ["4_build_database.py", "--no-csv"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
 
 # pagination-end detection: stop a keyword early when no new pins load
 STALL_SECS  = 40           # "no more pins" when page height stops growing this long

@@ -51,7 +51,7 @@ def _minutes_opt():
 
 LIMIT    = _opt_int("--limit", 20)
 MAX_MIN  = _minutes_opt()
-BUILD_ARGS = ["4_build_database.py", "--no-clear"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
+BUILD_ARGS = ["4_build_database.py", "--no-clear", "--no-csv"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
 
 
 
@@ -310,7 +310,7 @@ def main():
             processed += 1
             if processed % SAVE_EVERY == 0:
                 run_step("save to database", BUILD_ARGS)
-        final_args = ["4_build_database.py"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
+        final_args = ["4_build_database.py", "--no-csv"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
         run_step("final save & clear extension", final_args)
     finally:
         print(f"\n  Done — processed {processed} pinner(s) this run. "
