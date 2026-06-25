@@ -3,7 +3,7 @@ magic_scroll.py — multi-computer Pinterest auto-scrape orchestrator
 ====================================================================
 Run this on AS MANY COMPUTERS AS YOU LIKE at the same time. Each one loops:
 
-  1. CLAIM up to 5 keywords from the Google Sheet  → status "pending"
+  1. CLAIM up to 10 keywords from the Google Sheet  → status "pending"
        (atomic via the Apps Script LockService — two PCs never grab the same one)
   2. SCROLL each keyword in Brave (SortPin saves the pins)
   3. BUILD the database  → python 4_build_database.py
@@ -21,7 +21,7 @@ REQUIREMENTS (one-time):
   • pip install selenium
 
 Run:
-  python magic_scroll.py             # 5 minutes per keyword, batch size 5 (default)
+  python magic_scroll.py             # 15 minutes per keyword, batch size 10 (default)
   python magic_scroll.py --2m        # 2 minutes per keyword
   python magic_scroll.py --10m       # 10 minutes per keyword
   python magic_scroll.py --batch 10  # 10 keywords claimed per cycle
@@ -38,6 +38,20 @@ CDP_PORT   = 9222
 BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 PY         = sys.executable
 LOG_PATH   = os.path.join(BASE, "magic_log.jsonl")   # job log (the viewer reads this)
+ENV_PATH   = os.path.join(BASE, ".env")
+
+def load_env():
+    env = {}
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    return env
+
+ENV_VARS = load_env()
 
 def log_event(**ev):
     """Append one job-log line (JSONL). The step-5 server shows these live."""
@@ -55,7 +69,10 @@ def _minutes():
         m = re.match(r"^--(\d+(?:\.\d+)?)m$", a)
         if m:
             return float(m.group(1))
-    return 5.0
+    try:
+        return float(ENV_VARS.get("DEFAULT_SCROLL_MINUTES", "15.0"))
+    except ValueError:
+        return 15.0
 
 def _batch():
     args = sys.argv[1:]
@@ -79,7 +96,10 @@ def _batch():
         m = re.match(r"^--(\d+)$", a)
         if m:
             return int(m.group(1))
-    return 5
+    try:
+        return int(ENV_VARS.get("DEFAULT_BATCH_SIZE", "10"))
+    except ValueError:
+        return 10
 
 
 MINUTES   = _minutes()

@@ -1,4 +1,4 @@
-"""
+r"""
 STEP 6 — Clear the SortPin extension's stored data (by deleting its files)
 =========================================================================
 The SortPin extension keeps every pin/board/pinner in Brave's IndexedDB, so it
