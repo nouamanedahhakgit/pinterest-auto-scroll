@@ -1156,11 +1156,14 @@ def main():
                 print("\n  Automatically archiving and clearing live Brave extension data...")
                 archive_and_clear_extension_data()
 
-    # 2) Always build the DB from ALL CSVs in the folder (the new snapshot +
-    #    every past snapshot/export), merged & de-duplicated. This way the
-    #    database keeps growing across runs, clears, and computers.
+    # 2) Read SortPin CSV data from this folder (if any)
     print("  Reading SortPin CSV data from this folder...")
-    leads, boards, pins = load_from_csv()
+    csv_leads, csv_boards, csv_pins = load_from_csv()
+
+    # 3) Combine live data (CDP or disk IndexedDB) directly with local CSVs
+    leads = (live[0] if (live and live[0]) else []) + csv_leads
+    boards = (live[1] if (live and live[1]) else []) + csv_boards
+    pins = (live[2] if (live and live[2]) else []) + csv_pins
 
     if not (leads or boards or pins):
         print("\n  ⚠  No data found.\n"
