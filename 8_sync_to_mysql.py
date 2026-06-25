@@ -64,6 +64,13 @@ def get_mysql_connection(env):
             charset="utf8mb4",
             collation="utf8mb4_general_ci"
         )
+        # Set session isolation level to READ COMMITTED to disable gap locking and prevent timeouts
+        try:
+            cursor = con.cursor()
+            cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            cursor.close()
+        except Exception:
+            pass
         return con
     except mysql.connector.Error as e:
         print(f"\n  ❌ Failed to connect to MySQL: {e}\n")

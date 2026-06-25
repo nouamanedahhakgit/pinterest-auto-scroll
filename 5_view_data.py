@@ -131,6 +131,12 @@ def get_db_connection(db_path):
                 collation="utf8mb4_general_ci",
                 autocommit=True
             )
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                cursor.close()
+            except Exception:
+                pass
             print(f"  Connected to cloud MySQL database successfully.")
             return DBWrapper(is_mysql=True, conn=conn)
         except Exception as e:
