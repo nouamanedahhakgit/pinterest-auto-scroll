@@ -24,6 +24,136 @@ DB_PATH   = os.path.join(BASE, "sortpin.db")
 JSON_PATH = os.path.join(BASE, "sortpin_data.json")
 LOG_PATH  = os.path.join(BASE, "magic_log.jsonl")   # written by magic_scroll.py
 
+class RowWrapper(dict):
+    """Wraps database rows to support both dictionary-style key access (e.g., row['username'])
+    and tuple/list-style integer index access (e.g., row[0]).
+    This maintains full compatibility with sqlite3.Row and dict-only clients."""
+    def __init__(self, data_dict, data_tuple):
+        super().__init__(data_dict)
+        self.tuple = data_tuple
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.tuple[key]
+        return super().__getitem__(key)
+
+class CursorWrapper:
+    """Wraps cursors to return RowWrapper objects for MySQL, or pass-through sqlite3.Row rows."""
+    def __init__(self, cursor, is_mysql):
+        self.cursor = cursor
+        self.is_mysql = is_mysql
+        self.cols = [desc[0] for desc in cursor.description] if cursor.description else []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = next(self.cursor)
+        if self.is_mysql:
+            return RowWrapper(dict(zip(self.cols, row)), row)
+        return row
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        if self.is_mysql:
+            return RowWrapper(dict(zip(self.cols, row)), row)
+        return row
+
+    def fetchall(self):
+        rows = self.cursor.fetchall()
+        if self.is_mysql:
+            return [RowWrapper(dict(zip(self.cols, r)), r) for r in rows]
+        return rows
+
+class DBWrapper:
+    """Unified wrapper around SQLite and MySQL connections."""
+    def __init__(self, is_mysql, conn):
+        self.is_mysql = is_mysql
+        self.conn = conn
+
+    def execute(self, sql, params=None):
+        if params is None:
+            params = []
+        if not isinstance(params, (list, tuple)):
+            params = [params]
+            
+        if self.is_mysql:
+            sql_translated = sql.replace('?', '%s')
+            cursor = self.conn.cursor(buffered=True)
+            cursor.execute(sql_translated, params)
+            return CursorWrapper(cursor, is_mysql=True)
+        else:
+            cursor = self.conn.cursor()
+            cursor.execute(sql, params)
+            return CursorWrapper(cursor, is_mysql=False)
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+def get_db_connection(db_path):
+    """Loads MySQL configuration from env and attempts to connect.
+    Falls back to SQLite if not configured or if connection fails."""
+    env = {}
+    env_path = os.path.join(BASE, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+    mysql_password = env.get("MYSQL_PASSWORD", "")
+    if mysql_password and mysql_password != "YOUR_PASSWORD_HERE":
+        try:
+            import mysql.connector
+            host = env.get("MYSQL_HOST", "72.61.197.144")
+            port = int(env.get("MYSQL_PORT", "3306"))
+            db = env.get("MYSQL_DB", "data_pint")
+            user = env.get("MYSQL_USER", "data_pint_user")
+
+            print(f"  Connecting to cloud MySQL database ({host}:{port})...")
+            conn = mysql.connector.connect(
+                host=host,
+                port=port,
+                database=db,
+                user=user,
+                password=mysql_password,
+                charset="utf8mb4",
+                collation="utf8mb4_general_ci"
+            )
+            print(f"  Connected to cloud MySQL database successfully.")
+            return DBWrapper(is_mysql=True, conn=conn)
+        except Exception as e:
+            print(f"  Warning: MySQL connection failed: {e}. Falling back to SQLite.")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return DBWrapper(is_mysql=False, conn=conn)
+
+def extract_domain(url):
+    """Extract domain from a URL (e.g. https://www.google.com/path -> google.com)."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        netloc = parsed.netloc or parsed.path
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        if ":" in netloc:
+            netloc = netloc.split(":")[0]
+        return netloc.strip().lower()
+    except Exception:
+        return ""
+
 def read_logs(limit=500):
     """Return the most recent job-log events (newest first)."""
     if not os.path.exists(LOG_PATH):
@@ -42,8 +172,7 @@ def read_logs(limit=500):
 
 def run_websites_sync(db_path):
     """Sync all pinners with non-empty website_url to Google Sheets websites tab."""
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
+    con = get_db_connection(db_path)
     # Fetch all details of the pinner
     pinners = [dict(r) for r in con.execute(
         "SELECT username, full_name, website_url, follower_count, profile_reach, "
@@ -140,9 +269,9 @@ def run_websites_sync(db_path):
         return res.get("count", 0)
 
 def load_from_db(db_path):
-    """Read pinners/boards/pins straight from the SQLite DB and build the flat
+    """Read pinners/boards/pins straight from the DB and build the flat
     structure the viewer uses (so the viewer is database-driven)."""
-    con = sqlite3.connect(db_path); con.row_factory = sqlite3.Row
+    con = get_db_connection(db_path)
     pinners = [dict(r) for r in con.execute("SELECT * FROM pinners")]
     boards  = [dict(r) for r in con.execute("SELECT * FROM boards")]
     pins    = [dict(r) for r in con.execute("SELECT * FROM pins")]
@@ -176,8 +305,26 @@ def load_from_db(db_path):
             "pinners": pout, "boards": boards, "pins": pins}
 
 def load():
-    # database first (organised, single source of truth); JSON only as fallback
-    if os.path.exists(DB_PATH):
+    # Check if MySQL is configured
+    env = {}
+    env_path = os.path.join(BASE, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+    has_mysql = env.get("MYSQL_PASSWORD", "") and env.get("MYSQL_PASSWORD", "") != "YOUR_PASSWORD_HERE"
+
+    if has_mysql:
+        print("  Reading from cloud MySQL database...")
+        data = load_from_db(DB_PATH)
+    elif os.path.exists(DB_PATH):
         print(f"  Reading from {os.path.basename(DB_PATH)} (SQLite database)...")
         data = load_from_db(DB_PATH)
     elif os.path.exists(JSON_PATH):
@@ -242,7 +389,10 @@ _PK = {"pinners": "username", "boards": "id", "pins": "id"}
 _DEFAULT_SORT = {"pinners": "follower_count", "boards": "pin_count", "pins": "repin_count"}
 
 def _cols(con, table):
-    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+    if getattr(con, "is_mysql", False):
+        return [r[0] for r in con.execute(f"SHOW COLUMNS FROM `{table}`")]
+    else:
+        return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
 
 def api_list(con, t, q, sort, dir_, limit, offset):
     cols = _cols(con, t)
@@ -648,7 +798,7 @@ def make_handler(db_path):
             g = lambda k, d="": qs.get(k, [d])[0]
             if u.path in ("/", "/index.html"):
                 return self._send(SERVER_PAGE, "text/html; charset=utf-8")
-            con = sqlite3.connect(db_path); con.row_factory = sqlite3.Row
+            con = get_db_connection(db_path)
             try:
                 if u.path == "/api/stats":
                     out = {t: con.execute(f"SELECT COUNT(*) FROM `{t}`").fetchone()[0]
@@ -777,7 +927,22 @@ def make_handler(db_path):
     return H
 
 def serve(db_path, port=8000):
-    if not os.path.exists(db_path):
+    env = {}
+    env_path = os.path.join(BASE, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+    has_mysql = env.get("MYSQL_PASSWORD", "") and env.get("MYSQL_PASSWORD", "") != "YOUR_PASSWORD_HERE"
+
+    if not has_mysql and not os.path.exists(db_path):
         print(f"\n  ⚠  {os.path.basename(db_path)} not found — run step 4 first.\n"); sys.exit(1)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     httpd = None

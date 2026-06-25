@@ -68,6 +68,14 @@ def get_mysql_connection(env):
         sys.exit(1)
 
 def main():
+    import sys
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
+
     if not os.path.exists(DB_PATH):
         print(f"\n  ❌ Local database not found: {DB_PATH}")
         print("  Run step 4 first to build your local SQLite database.\n")
@@ -87,7 +95,7 @@ def main():
         "pins": "id"
     }
 
-    print("\n🚀 Starting Local-to-Cloud Sync...")
+    print("\nStarting Local-to-Cloud Sync...")
 
     for table, pk in tables_pk.items():
         # Get column definitions from SQLite
@@ -95,11 +103,11 @@ def main():
         columns_info = sqlite_cursor.fetchall()
         
         if not columns_info:
-            print(f"  ⚠️  Table '{table}' is empty or does not exist in local SQLite. Skipping.")
+            print(f"  Warning: Table '{table}' is empty or does not exist in local SQLite. Skipping.")
             continue
 
         # 1. Create table in MySQL if it doesn't exist
-        print(f"\n📦 Syncing table '{table}'...")
+        print(f"\nSyncing table '{table}'...")
         col_defs = []
         cols = []
         for col in columns_info:
@@ -154,10 +162,25 @@ def main():
         print(f"  - Read {len(rows)} rows from local SQLite.")
 
         # 3. Build UPSERT query for MySQL
-        # INSERT INTO table (col1, col2) VALUES (%s, %s) ON DUPLICATE KEY UPDATE col1=VALUES(col1), col2=VALUES(col2)
+        # INSERT INTO table (col1, col2) VALUES (%s, %s) ON DUPLICATE KEY UPDATE col1=COALESCE(NULLIF(VALUES(col1), ''), col1)
         col_list = ", ".join(f"`{c}`" for c in cols)
         placeholders = ", ".join(["%s"] * len(cols))
-        update_clause = ", ".join(f"`{c}`=VALUES(`{c}`)" for c in cols if c != pk)
+        
+        update_parts = []
+        for c in cols:
+            if c == pk:
+                continue
+            is_numeric = False
+            for col_info in columns_info:
+                if col_info[1] == c and col_info[2] == "INTEGER":
+                    is_numeric = True
+                    break
+            if is_numeric:
+                update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), 0), `{c}`)")
+            else:
+                update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), ''), `{c}`)")
+                
+        update_clause = ", ".join(update_parts)
         
         upsert_sql = f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders})"
         if update_clause:
@@ -185,11 +208,11 @@ def main():
                 total_inserted += len(batch)
                 print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
             except mysql.connector.Error as err:
-                print(f"  ❌ Error syncing batch in `{table}`: {err}")
+                print(f"  Error syncing batch in `{table}`: {err}")
                 mysql_conn.rollback()
 
     # 5. Run aggregation updates to organize stats and counts (handling multi-computer merges)
-    print("\n🧹 Organizing and recalculating metrics in MySQL (combining data from all workers)...")
+    print("\nOrganizing and recalculating metrics in MySQL (combining data from all workers)...")
     
     try:
         # Recalculate board pins count
@@ -240,17 +263,17 @@ def main():
         """)
         mysql_conn.commit()
         
-        print("  ✅ Metric calculations updated successfully.")
+        print("  Metric calculations updated successfully.")
         
     except mysql.connector.Error as err:
-        print(f"  ❌ Error running aggregations: {err}")
+        print(f"  Error running aggregations: {err}")
         mysql_conn.rollback()
 
     # Close connections
     sqlite_conn.close()
     mysql_conn.close()
     
-    print("\n🎉 Local database synchronized to MySQL successfully!")
+    print("\nLocal database synchronized to MySQL successfully!")
 
 if __name__ == "__main__":
     main()

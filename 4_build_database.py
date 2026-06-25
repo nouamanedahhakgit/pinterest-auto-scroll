@@ -60,6 +60,21 @@ def _clean(v):
         return ""
     return str(v).strip()
 
+def _clean_bytes(o):
+    import datetime
+    if isinstance(o, bytes):
+        try:
+            return o.decode("utf-8", errors="replace")
+        except Exception:
+            return str(o)
+    elif isinstance(o, (datetime.datetime, datetime.date)):
+        return o.isoformat()
+    elif isinstance(o, dict):
+        return {k: _clean_bytes(v) for k, v in o.items()}
+    elif isinstance(o, (list, tuple)):
+        return [_clean_bytes(x) for x in o]
+    return o
+
 _PIN_ID_RE = re.compile(r"/pin/(\d+)")
 def pin_id_from_url(pin_url, fallback=""):
     """The CSV 'id' column is mangled by Excel into 1.00001E+18 — recover the
@@ -1173,6 +1188,7 @@ def main():
 
     print("\n  Normalizing into Pinner → Boards → Pins ...")
     data = normalize(leads, boards, pins)
+    data = _clean_bytes(data)
     write_sqlite(data)
     write_json(data)
     write_mysql_dump(data)
