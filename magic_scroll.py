@@ -27,12 +27,23 @@ Run:
   python magic_scroll.py --disk      # build DB from disk (needs ccl_chromium_reader)
 """
 
-import os, sys, time, socket, subprocess, re
+import os, sys, time, socket, subprocess, re, json, datetime, platform
 
 BASE       = os.path.dirname(os.path.abspath(__file__))
 CDP_PORT   = 9222
 BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 PY         = sys.executable
+LOG_PATH   = os.path.join(BASE, "magic_log.jsonl")   # job log (the viewer reads this)
+
+def log_event(**ev):
+    """Append one job-log line (JSONL). The step-5 server shows these live."""
+    ev["ts"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ev["computer"] = platform.node()
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 # ── CLI options ───────────────────────────────────────────────────────────────
 def _minutes():
@@ -210,15 +221,29 @@ def wait_pins(driver, max_secs):
         time.sleep(1)
     return "time cap"
 
-def scroll_keyword(driver, kw, base_tab, minutes):
+_PINCOUNT_JS = ("return (document.querySelectorAll('div[data-test-id=\"pin\"]').length"
+                " || document.querySelectorAll('div[role=\"listitem\"]').length || 0);")
+
+def _count_pins(driver):
+    try: return int(driver.execute_script(_PINCOUNT_JS) or 0)
+    except Exception: return 0
+
+def scroll_keyword(driver, kw, base_tab, minutes, cycle=0):
     print(f"    ▶ '{kw}' — up to {minutes:g} min")
+    t0 = time.time()
     open_keyword_tab(driver, kw)
     time.sleep(6)
-    print("      " + ("SortPin scrolling" if click_start(driver)
-                      else "⚠ could not start SortPin (continuing)"))
-    why = wait_pins(driver, int(minutes * 60))  # ends early when no new pins
-    print(f"      → moving on ({why})")
+    started = click_start(driver)
+    print("      " + ("SortPin scrolling" if started else "⚠ could not start SortPin (continuing)"))
+    why = wait_pins(driver, int(minutes * 60))   # ends early when no new pins
+    pins = _count_pins(driver)
+    secs = int(time.time() - t0)
+    print(f"      → moving on ({why}) — {secs}s, ~{pins} pins on page")
     close_pinterest_tabs(driver, base_tab)
+    log_event(event="keyword", cycle=cycle, keyword=kw, seconds=secs,
+              minutes=round(secs / 60, 1), pins=pins, why=why,
+              started=bool(started))
+    return {"keyword": kw, "seconds": secs, "pins": pins, "why": why}
 
 # ── run the existing steps as subprocesses ────────────────────────────────────
 def run_step(label, args):
@@ -248,6 +273,7 @@ def main():
             break
         kws = [c["keyword"] for c in claimed]
         print("  claimed (pending):", ", ".join(kws))
+        log_event(event="claim", cycle=cycle, keywords=kws, count=len(kws))
 
         # scroll every claimed keyword
         if not ensure_brave():
@@ -256,8 +282,9 @@ def main():
             break
         driver = connect()
         base_tab = driver.current_window_handle
+        cyc_start = time.time()
         for kw in kws:
-            scroll_keyword(driver, kw, base_tab, MINUTES)
+            scroll_keyword(driver, kw, base_tab, MINUTES, cycle=cycle)
 
         # save scraped data BEFORE clearing the extension
         run_step("build database", BUILD_ARGS)
@@ -268,6 +295,9 @@ def main():
             print("  marked Done:", ", ".join(kws))
         except Exception as e:
             print(f"  ⚠ could not mark Done — {e}")
+
+        log_event(event="cycle_done", cycle=cycle, keywords=kws,
+                  seconds=int(time.time() - cyc_start))
 
         # clear SortPin (archives a backup first); this closes Brave
         run_step("clear SortPin", ["6_clear_sortpin.py", "--yes"])

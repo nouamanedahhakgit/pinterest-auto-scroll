@@ -23,6 +23,23 @@ BASE      = os.path.dirname(os.path.abspath(__file__))
 DB_PATH   = os.path.join(BASE, "sortpin.db")
 JSON_PATH = os.path.join(BASE, "sortpin_data.json")
 HTML_PATH = os.path.join(BASE, "sortpin_viewer.html")
+LOG_PATH  = os.path.join(BASE, "magic_log.jsonl")   # written by magic_scroll.py
+
+def read_logs(limit=500):
+    """Return the most recent job-log events (newest first)."""
+    if not os.path.exists(LOG_PATH):
+        return []
+    out = []
+    try:
+        with open(LOG_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try: out.append(json.loads(line))
+                    except Exception: pass
+    except Exception:
+        return []
+    return out[-limit:][::-1]
 
 def load_from_db(db_path):
     """Read pinners/boards/pins straight from the SQLite DB and build the flat
@@ -394,6 +411,7 @@ SERVER_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
  <div class="tab on" data-t="pinners">Pinners <b id="c_pinners">·</b></div>
  <div class="tab" data-t="boards">Boards <b id="c_boards">·</b></div>
  <div class="tab" data-t="pins">Pins <b id="c_pins">·</b></div>
+ <div class="tab" data-t="jobs">Jobs ⏱</div>
 </header>
 <div class="controls">
  <input id="q" placeholder="Search…">
@@ -422,7 +440,29 @@ function setTab(t){state.t=t;state.off=0;state.q='';q.value='';
  [...document.querySelectorAll('.tab')].forEach(e=>e.classList.toggle('on',e.dataset.t===t));
  const sel=document.getElementById('sort');sel.innerHTML='';
  (SORTS[t]||[]).filter(s=>s[1]!=='—').forEach(([k,l])=>{const o=document.createElement('option');o.value=k;o.textContent='Sort: '+l;sel.appendChild(o);});
- state.sort=sel.value||''; load();}
+ state.sort=sel.value||'';
+ if(t==='jobs'){ renderJobs(); } else { load(); }}
+
+async function renderJobs(){
+ document.getElementById('page').textContent='';
+ const r=await api('/api/logs',{limit:500}); const ev=r.events||[];
+ const m=document.getElementById('main');
+ if(!ev.length){m.innerHTML='<div class="empty">No job log yet.<br>Run <b>python magic_scroll.py</b> — each keyword it scrapes will appear here (auto-refreshes every 5s).</div>';return;}
+ const kw=ev.filter(e=>e.event==='keyword');
+ const totMin=kw.reduce((a,e)=>a+(+e.minutes||0),0).toFixed(1);
+ const totPins=kw.reduce((a,e)=>a+(+e.pins||0),0);
+ const comps=[...new Set(ev.map(e=>e.computer))].join(', ');
+ let html=`<div class="muted" style="margin-bottom:10px"><b>${kw.length}</b> keywords scraped · <b>${totMin}</b> min total · ~<b>${totPins.toLocaleString()}</b> pins · computers: ${esc(comps)} · newest first (live)</div>`;
+ html+='<div class="tblwrap"><table><thead><tr><th>time</th><th>computer</th><th>cycle</th><th>event</th><th>keyword(s)</th><th>min</th><th>pins</th><th>why</th></tr></thead><tbody>';
+ html+=ev.map(e=>{
+   const kwc=e.keyword || (e.keywords?e.keywords.join(', '):'');
+   const col=e.event==='keyword'?'':' style="color:var(--muted)"';
+   return `<tr${col}><td>${esc(e.ts)}</td><td>${esc(e.computer)}</td><td>${esc(e.cycle)}</td><td>${esc(e.event)}</td><td>${esc(kwc)}</td><td>${e.minutes!=null?esc(e.minutes):''}</td><td>${e.pins!=null?esc(e.pins):''}</td><td>${esc(e.why||'')}</td></tr>`;
+ }).join('');
+ html+='</tbody></table></div>';
+ m.innerHTML=html;
+}
+setInterval(()=>{ if(state.t==='jobs') renderJobs(); }, 5000);
 
 function imgCell(p){return p.image?`<img loading="lazy" src="${esc(p.image)}" onerror="this.style.visibility='hidden'">`:`<div style="height:160px"></div>`;}
 
@@ -516,6 +556,8 @@ def make_handler(db_path):
                     out = api_get(con, g("type"), g("id")) or {}
                 elif u.path == "/api/children":
                     out = api_children(con, g("type"), g("id"))
+                elif u.path == "/api/logs":
+                    out = {"events": read_logs(int(g("limit", "500") or 500))}
                 else:
                     out = {"error": "not found"}
                 self._send(json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
