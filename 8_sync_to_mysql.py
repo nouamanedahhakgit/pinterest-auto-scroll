@@ -16,6 +16,7 @@ Requirements:
 import os
 import sys
 import json
+import time
 import sqlite3
 
 # Load configuration from .env file
@@ -67,6 +68,24 @@ def get_mysql_connection(env):
     except mysql.connector.Error as e:
         print(f"\n  ❌ Failed to connect to MySQL: {e}\n")
         sys.exit(1)
+
+def execute_with_retry(cursor, conn, sql, params=None, retries=3, delay=5):
+    for attempt in range(1, retries + 1):
+        try:
+            if params is not None:
+                cursor.execute(sql, params)
+            else:
+                cursor.execute(sql)
+            conn.commit()
+            return True
+        except Exception as err:
+            conn.rollback()
+            is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
+            if is_lock_timeout and attempt < retries:
+                print(f"    ⚠️ Lock wait timeout exceeded. Retrying query in {delay} seconds (attempt {attempt}/{retries})...")
+                time.sleep(delay)
+            else:
+                raise err
 
 def main():
     import sys
@@ -231,14 +250,23 @@ def main():
                     row_vals.append(val)
                 formatted_batch.append(row_vals)
 
-            try:
-                mysql_cursor.executemany(upsert_sql, formatted_batch)
-                mysql_conn.commit()
-                total_inserted += len(batch)
-                print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
-            except Exception as err:
-                print(f"  Error syncing batch in `{table}`: {err}")
-                mysql_conn.rollback()
+            retries = 3
+            for attempt in range(1, retries + 1):
+                try:
+                    mysql_cursor.executemany(upsert_sql, formatted_batch)
+                    mysql_conn.commit()
+                    total_inserted += len(batch)
+                    print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
+                    break
+                except Exception as err:
+                    mysql_conn.rollback()
+                    is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
+                    if is_lock_timeout and attempt < retries:
+                        print(f"  ⚠️ Lock wait timeout on `{table}` batch. Retrying in 5 seconds (attempt {attempt}/{retries})...")
+                        time.sleep(5)
+                    else:
+                        print(f"  Error syncing batch in `{table}`: {err}")
+                        break
 
     # 5. Run aggregation updates to organize stats and counts (handling multi-computer merges)
     print("\nOrganizing and recalculating metrics in MySQL (combining data from all workers)...")
@@ -255,7 +283,7 @@ def main():
                 for j in range(0, len(new_boards), chunk_size):
                     chunk = new_boards[j:j + chunk_size]
                     placeholders = ", ".join(["%s"] * len(chunk))
-                    mysql_cursor.execute(f"""
+                    execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE boards b 
                         LEFT JOIN (
                             SELECT board_id, COUNT(*) as cnt 
@@ -266,7 +294,6 @@ def main():
                         SET b.pin_count = COALESCE(p_counts.cnt, 0)
                         WHERE b.id IN ({placeholders})
                     """, chunk + chunk)
-                    mysql_conn.commit()
 
             if new_pinners:
                 print(f"  - Calculating pinner board counts for {len(new_pinners)} pinners...")
@@ -274,7 +301,7 @@ def main():
                 for j in range(0, len(new_pinners), chunk_size):
                     chunk = new_pinners[j:j + chunk_size]
                     placeholders = ", ".join(["%s"] * len(chunk))
-                    mysql_cursor.execute(f"""
+                    execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE pinners p
                         LEFT JOIN (
                             SELECT owner_username, COUNT(*) as cnt
@@ -285,14 +312,13 @@ def main():
                         SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
-                    mysql_conn.commit()
 
                 print(f"  - Calculating pinner pin counts for {len(new_pinners)} pinners...")
                 chunk_size = 1000
                 for j in range(0, len(new_pinners), chunk_size):
                     chunk = new_pinners[j:j + chunk_size]
                     placeholders = ", ".join(["%s"] * len(chunk))
-                    mysql_cursor.execute(f"""
+                    execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE pinners p
                         LEFT JOIN (
                             SELECT pinner_username, COUNT(*) as cnt
@@ -303,14 +329,13 @@ def main():
                         SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
-                    mysql_conn.commit()
 
                 print(f"  - Calculating pinner created vs saved pin counts for {len(new_pinners)} pinners...")
                 chunk_size = 1000
                 for j in range(0, len(new_pinners), chunk_size):
                     chunk = new_pinners[j:j + chunk_size]
                     placeholders = ", ".join(["%s"] * len(chunk))
-                    mysql_cursor.execute(f"""
+                    execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE pinners p
                         LEFT JOIN (
                             SELECT pinner_username,
@@ -324,11 +349,10 @@ def main():
                             p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
-                    mysql_conn.commit()
         else:
             # Full recalculation fallback
             print("  - Calculating all board pin counts (Full)...")
-            mysql_cursor.execute("""
+            execute_with_retry(mysql_cursor, mysql_conn, """
                 UPDATE boards b 
                 LEFT JOIN (
                     SELECT board_id, COUNT(*) as cnt 
@@ -337,10 +361,9 @@ def main():
                 ) p_counts ON b.id = p_counts.board_id
                 SET b.pin_count = COALESCE(p_counts.cnt, 0)
             """)
-            mysql_conn.commit()
 
             print("  - Calculating all pinner board counts (Full)...")
-            mysql_cursor.execute("""
+            execute_with_retry(mysql_cursor, mysql_conn, """
                 UPDATE pinners p
                 LEFT JOIN (
                     SELECT owner_username, COUNT(*) as cnt
@@ -349,10 +372,9 @@ def main():
                 ) b_counts ON p.username = b_counts.owner_username
                 SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
             """)
-            mysql_conn.commit()
 
             print("  - Calculating all pinner pin counts (Full)...")
-            mysql_cursor.execute("""
+            execute_with_retry(mysql_cursor, mysql_conn, """
                 UPDATE pinners p
                 LEFT JOIN (
                     SELECT pinner_username, COUNT(*) as cnt
@@ -361,10 +383,9 @@ def main():
                 ) p_counts ON p.username = p_counts.pinner_username
                 SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
             """)
-            mysql_conn.commit()
 
             print("  - Calculating all pinner created vs saved pin counts (Full)...")
-            mysql_cursor.execute("""
+            execute_with_retry(mysql_cursor, mysql_conn, """
                 UPDATE pinners p
                 LEFT JOIN (
                     SELECT pinner_username,
@@ -376,7 +397,6 @@ def main():
                 SET p.scraped_created_pins_count = COALESCE(p_counts.created_cnt, 0),
                     p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
             """)
-            mysql_conn.commit()
             
         print("  Metric calculations updated successfully.")
         
