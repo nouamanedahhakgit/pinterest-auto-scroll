@@ -44,8 +44,11 @@ def run_websites_sync(db_path):
     """Sync all pinners with non-empty website_url to Google Sheets websites tab."""
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
+    # Fetch all details of the pinner
     pinners = [dict(r) for r in con.execute(
-        "SELECT username, website_url FROM pinners "
+        "SELECT username, full_name, website_url, follower_count, profile_reach, "
+        "pin_count, board_count, scraped_boards_count, scraped_pins_count, "
+        "scraped_created_pins_count, scraped_saved_pins_count FROM pinners "
         "WHERE website_url IS NOT NULL AND website_url <> ''"
     )]
     con.close()
@@ -64,7 +67,24 @@ def run_websites_sync(db_path):
     if not sa_exists and not oauth_exists and not webapp:
         raise RuntimeError("No Google Sheets auth found. Configure google_sheets_webapp.json or service account.")
 
-    rows_to_sync = [[p["username"], p["website_url"], "not yet"] for p in pinners]
+    # Format the rows to sync: [id, name, website, scrapped, followers, reach, total_pins, total_boards, scraped_boards, scraped_pins, created_pins, saved_pins]
+    rows_to_sync = [
+        [
+            p["username"],
+            p["full_name"] or "",
+            p["website_url"],
+            "not yet",
+            p["follower_count"] or 0,
+            p["profile_reach"] or 0,
+            p["pin_count"] or 0,
+            p["board_count"] or 0,
+            p["scraped_boards_count"] or 0,
+            p["scraped_pins_count"] or 0,
+            p["scraped_created_pins_count"] or 0,
+            p["scraped_saved_pins_count"] or 0
+        ]
+        for p in pinners
+    ]
 
     # --- Mode 1: gspread API ---
     if sa_exists or oauth_exists:
@@ -74,11 +94,12 @@ def run_websites_sync(db_path):
         sh = gc.open_by_key(gsc.SPREADSHEET_ID)
         
         # Check / create 'websites' sheet
+        headers = ["id", "name", "website", "scrapped", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"]
         try:
             ws = sh.worksheet("websites")
         except Exception:
-            ws = sh.add_worksheet(title="websites", rows="100", cols="3")
-            ws.update("A1:C1", [["id", "website", "scrapped"]], value_input_option="RAW")
+            ws = sh.add_worksheet(title="websites", rows="100", cols=str(len(headers)))
+            ws.update("A1:L1", [headers], value_input_option="RAW")
             
         # Get existing IDs from column A
         existing_ids = set()

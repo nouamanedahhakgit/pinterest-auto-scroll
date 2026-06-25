@@ -135,9 +135,10 @@ function writeColumn(sheet, data) {
 
 function syncWebsites(ss, rows) {
   let wsSheet = ss.getSheetByName("websites");
+  const headers = ["id", "name", "website", "scrapped", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"];
   if (!wsSheet) {
     wsSheet = ss.insertSheet("websites");
-    wsSheet.appendRow(["id", "website", "scrapped"]);
+    wsSheet.appendRow(headers);
   }
   
   const last = wsSheet.getLastRow();
@@ -156,12 +157,12 @@ function syncWebsites(ss, rows) {
   rows.forEach(function(row) {
     const pinnerId = String(row[0]).trim();
     if (pinnerId && !existingIds[pinnerId.toLowerCase()]) {
-      newRows.push([pinnerId, row[1] || "", row[2] || "not yet"]);
+      newRows.push(row);
     }
   });
   
   if (newRows.length > 0) {
-    wsSheet.getRange(last + 1, 1, newRows.length, 3).setValues(newRows);
+    wsSheet.getRange(last + 1, 1, newRows.length, headers.length).setValues(newRows);
     SpreadsheetApp.flush();
   }
   return jsonOut({ ok: true, action: "sync_websites", count: newRows.length });
