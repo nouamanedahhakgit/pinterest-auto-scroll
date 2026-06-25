@@ -137,20 +137,20 @@ def main():
             mysql_cursor.execute(create_sql)
             mysql_conn.commit()
 
-        # Create indexes for performance if they don't exist
-        if table == "boards":
-            try:
-                mysql_cursor.execute("CREATE INDEX idx_boards_owner ON boards(owner_username)")
-                mysql_conn.commit()
-            except Exception:
-                pass
-        elif table == "pins":
-            for idx_name, col_name in [("idx_pins_pinner", "pinner_username"), ("idx_pins_board", "board_id")]:
+            # Create indexes for performance if they don't exist
+            if table == "boards":
                 try:
-                    mysql_cursor.execute(f"CREATE INDEX {idx_name} ON pins({col_name})")
+                    mysql_cursor.execute("CREATE INDEX idx_boards_owner ON boards(owner_username)")
                     mysql_conn.commit()
                 except Exception:
                     pass
+            elif table == "pins":
+                for idx_name, col_name in [("idx_pins_pinner", "pinner_username"), ("idx_pins_board", "board_id")]:
+                    try:
+                        mysql_cursor.execute(f"CREATE INDEX {idx_name} ON pins({col_name})")
+                        mysql_conn.commit()
+                    except Exception:
+                        pass
 
         # 2. Fetch data from SQLite
         sqlite_cursor.execute(f"SELECT * FROM `{table}`")
