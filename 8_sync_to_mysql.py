@@ -269,7 +269,7 @@ def main():
                     mysql_conn.rollback()
                     is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
                     if is_lock_timeout and attempt < retries:
-                        print(f"  ⚠️ Lock wait timeout on `{table}` batch. Retrying in 5 seconds (attempt {attempt}/{retries})...")
+                        print(f"  ⚠️ Lock wait timeout on `{table}` batch (Error: {err}). Retrying in 5 seconds (attempt {attempt}/{retries})...")
                         time.sleep(5)
                     else:
                         print(f"  Error syncing batch in `{table}`: {err}")
