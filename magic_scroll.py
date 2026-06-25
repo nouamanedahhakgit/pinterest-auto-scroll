@@ -286,8 +286,39 @@ def main():
         for kw in kws:
             scroll_keyword(driver, kw, base_tab, MINUTES, cycle=cycle)
 
+        # Get count before build
+        db_pins_before = 0
+        db_path = os.path.join(BASE, "sortpin.db")
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                con = sqlite3.connect(db_path)
+                db_pins_before = con.execute("SELECT COUNT(*) FROM pins").fetchone()[0]
+                con.close()
+            except Exception:
+                pass
+
         # save scraped data BEFORE clearing the extension
         run_step("build database", BUILD_ARGS)
+
+        # Get count after build
+        db_pins_after = 0
+        db_created_after = 0
+        db_saved_after = 0
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                con = sqlite3.connect(db_path)
+                db_pins_after = con.execute("SELECT COUNT(*) FROM pins").fetchone()[0]
+                db_created_after = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='created'").fetchone()[0]
+                db_saved_after = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='saved'").fetchone()[0]
+                con.close()
+            except Exception:
+                pass
+
+        new_pins = db_pins_after - db_pins_before
+        print(f"  [Magic Status] Total Pins in DB: {db_pins_after} (created: {db_created_after}, saved: {db_saved_after})")
+        print(f"                 New Pins scraped this cycle: {new_pins}")
 
         # mark done on the sheet
         try:
@@ -297,7 +328,11 @@ def main():
             print(f"  ⚠ could not mark Done — {e}")
 
         log_event(event="cycle_done", cycle=cycle, keywords=kws,
-                  seconds=int(time.time() - cyc_start))
+                  seconds=int(time.time() - cyc_start),
+                  total_pins=db_pins_after,
+                  created_pins=db_created_after,
+                  saved_pins=db_saved_after,
+                  new_pins=new_pins)
 
         # clear SortPin (archives a backup first); this closes Brave
         run_step("clear SortPin", ["6_clear_sortpin.py", "--yes"])

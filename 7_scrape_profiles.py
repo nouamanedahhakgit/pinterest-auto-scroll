@@ -14,9 +14,9 @@ records finished boards in profiles_progress.json and skips them next time.
 Runs alongside magic_scroll / on many computers (each does different pinners).
 
 Run:
-  python 7_scrape_profiles.py                 # process 20 pinners, 10 min cap/board
+  python 7_scrape_profiles.py                 # process 20 pinners, 5 min cap/board
   python 7_scrape_profiles.py --limit 50      # process 50 pinners this run
-  python 7_scrape_profiles.py --max-min 5     # cap each board at 5 minutes
+  python 7_scrape_profiles.py --minutes 10    # cap each board at 10 minutes
   python 7_scrape_profiles.py --disk          # build DB from disk when saving
 """
 
@@ -24,7 +24,6 @@ import os, sys, time, socket, subprocess, json, sqlite3, re
 
 BASE       = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(BASE, "sortpin.db")
-PROG_PATH  = os.path.join(BASE, "profiles_progress.json")
 CDP_PORT   = 9222
 BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 PY         = sys.executable
@@ -42,36 +41,52 @@ def _opt_int(flag, default):
             except ValueError: pass
     return default
 
+def _minutes_opt():
+    args = sys.argv[1:]
+    for i, x in enumerate(args):
+        if x in ("--minutes", "--max-min") and i + 1 < len(args):
+            try: return int(args[i + 1])
+            except ValueError: pass
+    return 5  # default 5 minutes
+
 LIMIT    = _opt_int("--limit", 20)
-MAX_MIN  = _opt_int("--max-min", 10)
-BUILD_ARGS = ["4_build_database.py"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
+MAX_MIN  = _minutes_opt()
+BUILD_ARGS = ["4_build_database.py", "--no-clear"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
 
-# ── progress ──────────────────────────────────────────────────────────────────
-def load_prog():
-    if os.path.exists(PROG_PATH):
-        try:
-            with open(PROG_PATH, encoding="utf-8") as f:
-                d = json.load(f)
-            return set(d.get("boards", [])), set(d.get("pinners", []))
-        except Exception:
-            pass
-    return set(), set()
 
-def save_prog(boards_done, pinners_done):
-    with open(PROG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"boards": sorted(boards_done), "pinners": sorted(pinners_done)}, f)
 
 # ── read pinners + their boards from the DB ───────────────────────────────────
 def load_targets():
     if not os.path.exists(DB_PATH):
         print("  sortpin.db not found — run step 4 first."); sys.exit(1)
     con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
+    
+    # Check if 'status' column exists in pinners table, add it if not
+    cursor = con.cursor()
+    try:
+        cursor.execute("SELECT status FROM pinners LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            con.execute("ALTER TABLE pinners ADD COLUMN status TEXT DEFAULT 'not yet'")
+            con.commit()
+        except Exception:
+            pass
+            
+    # Check if 'status' column exists in boards table, add it if not
+    try:
+        cursor.execute("SELECT status FROM boards LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            con.execute("ALTER TABLE boards ADD COLUMN status TEXT DEFAULT 'not yet'")
+            con.commit()
+        except Exception:
+            pass
+
     pinners = [dict(r) for r in con.execute(
-        "SELECT username, full_name, follower_count FROM pinners "
-        "WHERE username IN (SELECT DISTINCT owner_username FROM boards WHERE owner_username IS NOT NULL) "
+        "SELECT username, full_name, follower_count, status FROM pinners "
         "ORDER BY follower_count DESC")]
     boards_by = {}
-    for r in con.execute("SELECT id, url, owner_username, name FROM boards "
+    for r in con.execute("SELECT id, url, owner_username, name, status FROM boards "
                          "WHERE url IS NOT NULL AND url<>''"):
         boards_by.setdefault(r["owner_username"], []).append(dict(r))
     con.close()
@@ -173,13 +188,29 @@ def run_step(label, args):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"\n{'='*62}\n  STEP 7 — deep-scrape profiles → boards → pins\n"
-          f"  {LIMIT} pinners this run · {MAX_MIN} min cap/board\n{'='*62}")
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
+
     pinners, boards_by = load_targets()
-    boards_done, pinners_done = load_prog()
-    todo = [p for p in pinners if p["username"] not in pinners_done][:LIMIT]
+    
+    total_pinners = len(pinners)
+    done_count = sum(1 for p in pinners if p.get("status") == "done")
+    running_count = sum(1 for p in pinners if p.get("status") == "running")
+    not_yet_count = total_pinners - done_count - running_count
+    pct = (done_count / total_pinners * 100) if total_pinners else 0.0
+
+    print(f"\n{'='*62}\n  STEP 7 — deep-scrape profiles → boards → pins\n"
+          f"  {LIMIT} pinners this run · {MAX_MIN} min cap/board\n"
+          f"  Progress: {done_count}/{total_pinners} completed successfully ({pct:.1f}%) · "
+          f"{running_count} running/interrupted · {not_yet_count} not yet processed\n{'='*62}")
+
+    todo = [p for p in pinners if p.get("status") != "done"][:LIMIT]
     if not todo:
-        print("  Nothing left — all known pinners processed. (delete profiles_progress.json to redo)\n")
+        print("  Nothing left — all known pinners processed.\n")
         return
     if not ensure_brave():
         print("  Could not start Brave."); sys.exit(1)
@@ -187,30 +218,101 @@ def main():
     processed = 0
     try:
         for p in todo:
-            u = p["username"]; brds = boards_by.get(u, [])
-            print(f"\n▶ @{u}  ({p.get('full_name') or ''}) — {len(brds)} boards")
-            # 1) profile (captures boards + stats)
-            open_tab(driver, f"https://www.pinterest.com/{u}/")
-            time.sleep(5); click_start(driver); time.sleep(PROFILE_SECS)
+            u = p["username"]
+            print(f"\n▶ @{u}  ({p.get('full_name') or ''}) — loading profile...")
+            
+            # Set pinner status to 'running'
+            con = sqlite3.connect(DB_PATH)
+            con.execute("UPDATE pinners SET status='running' WHERE username=?", (u,))
+            con.commit()
+            con.close()
+            
+            # 1a) SAVED tab profile (captures boards + stats)
+            print("    → loading saved profile (_saved/)...")
+            open_tab(driver, f"https://www.pinterest.com/{u}/_saved/")
+            time.sleep(5); click_start(driver)
+            print("      scrolling saved boards (capturing all boards)...")
+            why_saved = scroll_till_finish(driver, 120)
             close_tabs(driver, base)
+            
+            # Run step 4 to import newly captured boards and pinner info
+            print("    → updating profile boards...")
+            run_step("import profile boards", BUILD_ARGS)
+
+            # 1b) CREATED tab profile (captures created pins like magic)
+            print("    → loading created profile (_created/)...")
+            open_tab(driver, f"https://www.pinterest.com/{u}/_created/")
+            time.sleep(5); click_start(driver)
+            print("      scrolling created pins (like magic)...")
+            why_profile = scroll_till_finish(driver, MAX_MIN * 60)
+            close_tabs(driver, base)
+            print(f"      → finished created pins ({why_profile})")
+
+            # Run step 4 to import newly captured profile pins
+            print("    → updating profile pins...")
+            run_step("import profile pins", BUILD_ARGS)
+            
+            # Fetch all boards currently in the DB for this pinner (pre-existing + newly discovered)
+            con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
+            brds = [dict(r) for r in con.execute(
+                "SELECT id, url, owner_username, name, status FROM boards "
+                "WHERE owner_username = ? AND url IS NOT NULL AND url<>''", (u,))]
+            con.close()
+            
+            print(f"    found {len(brds)} boards to process")
+
             # 2) each board till the end
             for b in brds:
-                if b["id"] in boards_done:
+                if b.get("status") == "done":
                     continue
+                
                 print(f"    • board '{(b.get('name') or '')[:34]}' …", end="", flush=True)
-                open_tab(driver, b["url"]); time.sleep(5)
+                
+                # Set board status to 'running'
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE boards SET status='running' WHERE id=?", (b["id"],))
+                con.commit()
+                con.close()
+                
+                board_url = b["url"]
+                if board_url.startswith("/"):
+                    board_url = "https://www.pinterest.com" + board_url
+                elif not board_url.startswith("http"):
+                    board_url = "https://www.pinterest.com/" + board_url
+                
+                open_tab(driver, board_url); time.sleep(5)
                 click_start(driver)
                 why = scroll_till_finish(driver, MAX_MIN * 60)
                 close_tabs(driver, base)
-                boards_done.add(b["id"]); save_prog(boards_done, pinners_done)
+                
+                # Set board status to 'done'
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE boards SET status='done' WHERE id=?", (b["id"],))
+                con.commit()
+                con.close()
+                
                 print(f" {why}")
-            pinners_done.add(u); save_prog(boards_done, pinners_done)
+            
+            # Check if all boards for this pinner are done
+            con = sqlite3.connect(DB_PATH)
+            cursor = con.cursor()
+            cursor.execute("SELECT COUNT(*) FROM boards WHERE owner_username=? AND status<>'done'", (u,))
+            not_done_count = cursor.fetchone()[0]
+            if not_done_count == 0:
+                con.execute("UPDATE pinners SET status='done' WHERE username=?", (u,))
+                print(f"  Processed pinner @{u} completely.")
+            else:
+                con.execute("UPDATE pinners SET status='not yet' WHERE username=?", (u,))
+                print(f"  Pinner @{u} has remaining boards.")
+            con.commit()
+            con.close()
+            
             processed += 1
             if processed % SAVE_EVERY == 0:
                 run_step("save to database", BUILD_ARGS)
-        run_step("final save to database", BUILD_ARGS)
+        final_args = ["4_build_database.py"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
+        run_step("final save & clear extension", final_args)
     finally:
-        save_prog(boards_done, pinners_done)
         print(f"\n  Done — processed {processed} pinner(s) this run. "
               f"Re-run to continue the rest.\n")
 

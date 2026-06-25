@@ -2,27 +2,26 @@
 STEP 5 — Statistics + visual browser for the SortPin database
 =============================================================
 Reads the flat data built by step 4 (sortpin_data.json), prints a statistics
-summary, then builds a self-contained HTML viewer and opens it.
+summary, and starts a live database server.
 
-The viewer has three tabs you can browse independently:
+The viewer has five tabs you can browse independently:
     • PINNERS  — search/sort people; click one to see their boards + pins
     • BOARDS   — search/sort boards;  click one to see its pins + owner
     • PINS     — search/sort every pin; click to open it on Pinterest
-
-It is ONE offline HTML file (data embedded) — works on any computer, no server.
+    • JOBS     — see scraper run times, keyword stats, and details
+    • CONTENT LAB — see created vs saved analysis, keywords, tags, domains, and top pins
 
 Run:
-  python 5_view_data.py            # stats + open the viewer
-  python 5_view_data.py --no-open  # just build the HTML
+  python 5_view_data.py            # default: start live database server + open browser
+  python 5_view_data.py --no-open  # start server without opening browser
 """
 
-import os, sys, json, sqlite3, webbrowser
+import os, sys, json, sqlite3, webbrowser, urllib.parse, http.server, socketserver
 from datetime import datetime
 
 BASE      = os.path.dirname(os.path.abspath(__file__))
 DB_PATH   = os.path.join(BASE, "sortpin.db")
 JSON_PATH = os.path.join(BASE, "sortpin_data.json")
-HTML_PATH = os.path.join(BASE, "sortpin_viewer.html")
 LOG_PATH  = os.path.join(BASE, "magic_log.jsonl")   # written by magic_scroll.py
 
 def read_logs(limit=500):
@@ -64,7 +63,11 @@ def load_from_db(db_path):
             "website_url": p.get("website_url", ""), "domain_url": p.get("domain_url", ""),
             "contact_email": p.get("contact_email", ""), "follower_count": p.get("follower_count", 0),
             "pin_count": p.get("pin_count", 0), "board_count": p.get("board_count", 0),
-            "profile_reach": p.get("profile_reach", 0), "nb": nb.get(u, 0), "np": np_.get(u, 0),
+            "profile_reach": p.get("profile_reach", 0), 
+            "nb": p.get("scraped_boards_count") if p.get("scraped_boards_count") is not None else nb.get(u, 0), 
+            "np": p.get("scraped_pins_count") if p.get("scraped_pins_count") is not None else np_.get(u, 0),
+            "np_created": p.get("scraped_created_pins_count") if p.get("scraped_created_pins_count") is not None else sum(1 for x in pins if x.get("pinner_username") == u and x.get("pin_type") == "created"),
+            "np_saved": p.get("scraped_saved_pins_count") if p.get("scraped_saved_pins_count") is not None else sum(1 for x in pins if x.get("pinner_username") == u and x.get("pin_type") == "saved")
         })
     pout.sort(key=lambda x: (x["np"], x["follower_count"]), reverse=True)
     boards.sort(key=lambda b: b.get("pin_count", 0), reverse=True)
@@ -77,12 +80,16 @@ def load():
     # database first (organised, single source of truth); JSON only as fallback
     if os.path.exists(DB_PATH):
         print(f"  Reading from {os.path.basename(DB_PATH)} (SQLite database)...")
-        return load_from_db(DB_PATH)
-    if os.path.exists(JSON_PATH):
+        data = load_from_db(DB_PATH)
+    elif os.path.exists(JSON_PATH):
         with open(JSON_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    print(f"\n  ⚠  No database found — run step 4 first.\n")
-    sys.exit(1)
+            data = json.load(f)
+    else:
+        print(f"\n  ⚠  No database found — run step 4 first.\n")
+        sys.exit(1)
+    
+    data["jobs"] = read_logs()
+    return data
 
 # ── terminal statistics ───────────────────────────────────────────────────────
 def print_stats(d):
@@ -98,10 +105,13 @@ def print_stats(d):
         pct = (v / t * 100) if t else 0
         return f"  {label:<14}{v:>7}  [{'█'*int(pct/4)}{'░'*(25-int(pct/4))}] {pct:4.0f}%"
 
+    n_created = sum(1 for p in pins if p.get("pin_type") == "created")
+    n_saved = sum(1 for p in pins if p.get("pin_type") == "saved")
+
     print(f"\n{'='*62}\n  SortPin data — statistics   ({d.get('generated_at','')})\n{'='*62}")
     print(f"  Pinners : {s['pinners']:>7}")
     print(f"  Boards  : {s['boards']:>7}")
-    print(f"  Pins    : {s['pins']:>7}")
+    print(f"  Pins    : {s['pins']:>7} (created: {n_created}, saved: {n_saved})")
     print(f"{'-'*62}")
     print(bar("with email",   n_email, s["pinners"]))
     print(bar("with website", n_site,  s["pinners"]))
@@ -122,211 +132,7 @@ def print_stats(d):
               f"@{(b.get('owner_username') or '')[:16]}")
     print(f"{'='*62}\n")
 
-# ── HTML viewer ───────────────────────────────────────────────────────────────
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SortPin Explorer</title>
-<style>
-  :root{--bg:#0f1115;--panel:#171a21;--panel2:#1f232c;--line:#2a2f3a;
-        --txt:#e7e9ee;--muted:#9aa3b2;--accent:#e60023;--accent2:#3b82f6;}
-  *{box-sizing:border-box}
-  body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt)}
-  header{padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--line);
-         display:flex;align-items:center;gap:14px;flex-wrap:wrap;position:sticky;top:0;z-index:10}
-  header h1{font-size:16px;margin:0}header h1 b{color:var(--accent)}
-  .tabs{display:flex;gap:6px;margin-left:8px}
-  .tab{padding:6px 14px;border:1px solid var(--line);border-radius:20px;cursor:pointer;color:var(--muted);font-size:13px}
-  .tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
-  .tab b{font-size:11px;opacity:.8}
-  .controls{padding:10px 18px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);background:var(--panel)}
-  .controls input,.controls select{padding:8px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);font-size:13px}
-  .controls input{flex:1;min-width:200px}
-  .count{color:var(--muted);font-size:12px}
-  .wrap{padding:16px 18px}
-  .crumb{color:var(--muted);font-size:13px;margin-bottom:14px}
-  .crumb a{color:var(--accent2);cursor:pointer}
-  /* lists */
-  .rows{display:flex;flex-direction:column;gap:1px}
-  .row{display:flex;gap:12px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:10px;cursor:pointer;align-items:center}
-  .row:hover{border-color:var(--accent2)}
-  .av{width:44px;height:44px;border-radius:50%;background:var(--panel2);object-fit:cover;flex:none}
-  .row .nm{font-weight:600}.row .sub{color:var(--muted);font-size:12px}
-  .row .mini{color:var(--muted);font-size:12px;margin-top:2px}.row .mini b{color:var(--txt)}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer}
-  .card:hover{border-color:var(--accent2)}
-  .card img{width:100%;height:150px;object-fit:cover;background:var(--panel2);display:block}
-  .card .bd{padding:9px 11px}.card .t{font-weight:600;font-size:13px;max-height:38px;overflow:hidden}
-  .card .m{color:var(--muted);font-size:11px;margin-top:5px;display:flex;justify-content:space-between}
-  .card a{color:var(--accent2);text-decoration:none}
-  .phead{display:flex;gap:16px;align-items:center;margin-bottom:8px}
-  .phead img{width:64px;height:64px;border-radius:50%;background:var(--panel2)}
-  .phead h2{margin:0;font-size:20px}.phead .muted{color:var(--muted);font-size:13px}
-  .kv{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 18px;font-size:12px;color:var(--muted)}
-  .kv b{color:var(--txt)}.kv a{color:var(--accent2);text-decoration:none}
-  .sectit{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:18px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
-  .empty{color:var(--muted);padding:40px;text-align:center}
-</style></head>
-<body>
-<header>
-  <h1><b>SortPin</b> Explorer</h1>
-  <div class="tabs">
-    <div class="tab on" data-tab="pinners">Pinners <b id="c_pinners"></b></div>
-    <div class="tab" data-tab="boards">Boards <b id="c_boards"></b></div>
-    <div class="tab" data-tab="pins">Pins <b id="c_pins"></b></div>
-  </div>
-  <span class="count" id="gen"></span>
-</header>
-<div class="controls">
-  <input id="q" placeholder="Search…">
-  <select id="sort"></select>
-  <span class="count" id="showing"></span>
-</div>
-<div class="wrap" id="main"></div>
-
-<script id="data" type="application/json">__DATA__</script>
-<script>
-const DB = JSON.parse(document.getElementById('data').textContent);
-const PIN = DB.pinners, BRD = DB.boards, PNS = DB.pins;
-const LIMIT = 400;
-
-// ---- indexes for relationships ----
-const pinnerBy = {}; PIN.forEach(p => pinnerBy[p.username] = p);
-const boardById = {}; BRD.forEach(b => boardById[b.id] = b);
-const boardsByOwner = {}; BRD.forEach(b => (boardsByOwner[b.owner_username] ||= []).push(b));
-const pinsByPinner = {}; PNS.forEach(p => (pinsByPinner[p.pinner_username] ||= []).push(p));
-const pinsByBoard  = {}; PNS.forEach(p => { if(p.board_id) (pinsByBoard[p.board_id] ||= []).push(p); });
-
-document.getElementById('c_pinners').textContent = DB.stats.pinners.toLocaleString();
-document.getElementById('c_boards').textContent  = DB.stats.boards.toLocaleString();
-document.getElementById('c_pins').textContent    = DB.stats.pins.toLocaleString();
-document.getElementById('gen').textContent       = 'built ' + (DB.generated_at||'');
-
-const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const num = n => (n||0).toLocaleString();
-const img = (u,cls,h) => u ? `<img class="${cls}" loading="lazy" src="${esc(u)}" onerror="this.style.visibility='hidden'">`
-                           : `<div class="${cls}" style="${h?('height:'+h):''}"></div>`;
-
-let tab = 'pinners';
-const SORTS = {
-  pinners: [['np','pins scraped'],['nb','boards scraped'],['follower_count','followers'],['profile_reach','reach'],['pin_count','total pins']],
-  boards:  [['pin_count','pins on Pinterest'],['follower_count','followers']],
-  pins:    [['repin_count','repins'],['saves','saves']],
-};
-
-function setTab(t){
-  tab=t;
-  [...document.querySelectorAll('.tab')].forEach(e=>e.classList.toggle('on',e.dataset.tab===t));
-  const sel=document.getElementById('sort'); sel.innerHTML='';
-  SORTS[t].forEach(([k,lab])=>{const o=document.createElement('option');o.value=k;o.textContent='Sort: '+lab;sel.appendChild(o);});
-  document.getElementById('q').value='';
-  render();
-}
-
-function matches(o, q, fields){ return !q || fields.some(f=>(o[f]||'').toString().toLowerCase().includes(q)); }
-
-function render(){
-  const q=document.getElementById('q').value.trim().toLowerCase();
-  const key=document.getElementById('sort').value;
-  const main=document.getElementById('main');
-  let src, html, total;
-  if(tab==='pinners'){
-    let rows=PIN.filter(p=>matches(p,q,['full_name','username','contact_email','website_url','domain_url']));
-    total=rows.length; rows=rows.sort((a,b)=>(b[key]||0)-(a[key]||0)).slice(0,LIMIT);
-    html='<div class="rows">'+rows.map(p=>`
-      <div class="row" onclick="showPinner('${esc(p.username)}')">
-        ${img(p.image_url,'av')}
-        <div style="flex:1;min-width:0">
-          <div class="nm">${esc(p.full_name||p.username)}</div>
-          <div class="sub">@${esc(p.username)}${p.contact_email?' · '+esc(p.contact_email):''}${p.website_url?' · '+esc(p.domain_url||p.website_url):''}</div>
-          <div class="mini"><b>${num(p.follower_count)}</b> followers · <b>${p.nb}</b> boards · <b>${p.np}</b> pins</div>
-        </div></div>`).join('')+'</div>';
-  } else if(tab==='boards'){
-    let rows=BRD.filter(b=>matches(b,q,['name','description','owner_username','category']));
-    total=rows.length; rows=rows.sort((a,b)=>(b[key]||0)-(a[key]||0)).slice(0,LIMIT);
-    html='<div class="grid">'+rows.map(b=>`
-      <div class="card" onclick="showBoard('${esc(b.id)}')">
-        ${img(b.image_cover_url,'',150)}
-        <div class="bd"><div class="t">${esc(b.name||'(untitled)')}</div>
-          <div class="m"><span>${num(b.pin_count)} pins</span><span>@${esc(b.owner_username||'')}</span></div></div>
-      </div>`).join('')+'</div>';
-  } else {
-    let rows=PNS.filter(p=>matches(p,q,['title','description','board_name','pinner_username']));
-    total=rows.length; rows=rows.sort((a,b)=>(b[key]||0)-(a[key]||0)).slice(0,LIMIT);
-    html='<div class="grid">'+rows.map(pinCard).join('')+'</div>';
-  }
-  document.getElementById('showing').textContent =
-    `${Math.min(total,LIMIT).toLocaleString()} of ${total.toLocaleString()}` + (total>LIMIT?' (refine search)':'');
-  main.innerHTML = total? html : '<div class="empty">Nothing matches.</div>';
-}
-
-function pinCard(p){
-  return `<div class="card">
-    ${p.pin_url?`<a href="${esc(p.pin_url)}" target="_blank">${img(p.image,'',150)}</a>`:img(p.image,'',150)}
-    <div class="bd"><div class="t">${esc(p.title||p.description||'(no title)')}</div>
-      <div class="m"><span>♥ ${num(p.repin_count||p.saves)}</span>
-        ${p.pinner_username?`<a onclick="showPinner('${esc(p.pinner_username)}')">@${esc(p.pinner_username)}</a>`:''}</div></div></div>`;
-}
-
-function showPinner(u){
-  const p=pinnerBy[u]; if(!p){return;}
-  const boards=(boardsByOwner[u]||[]).slice().sort((a,b)=>(b.pin_count||0)-(a.pin_count||0));
-  const pins=(pinsByPinner[u]||[]);
-  document.getElementById('main').innerHTML=`
-    <div class="crumb"><a onclick="setTab('pinners')">Pinners</a> › ${esc(p.full_name||p.username)}</div>
-    <div class="phead">${img(p.image_url,'av').replace('class="av"','class="av" style="width:64px;height:64px"')}
-      <div><h2>${esc(p.full_name||p.username)}</h2><div class="muted">@${esc(p.username)}</div></div></div>
-    <div class="kv">
-      <span><b>${num(p.follower_count)}</b> followers</span><span><b>${num(p.pin_count)}</b> pins (profile)</span>
-      <span><b>${num(p.board_count)}</b> boards (profile)</span><span><b>${num(p.profile_reach)}</b> reach</span>
-      ${p.website_url?`<span>🌐 <a href="${esc(p.website_url)}" target="_blank">${esc(p.domain_url||p.website_url)}</a></span>`:''}
-      ${p.contact_email?`<span>✉ <a href="mailto:${esc(p.contact_email)}">${esc(p.contact_email)}</a></span>`:''}</div>
-    <div class="sectit">Boards (${boards.length})</div>
-    ${boards.length?`<div class="grid">${boards.map(b=>`
-       <div class="card" onclick="showBoard('${esc(b.id)}')">${img(b.image_cover_url,'',150)}
-         <div class="bd"><div class="t">${esc(b.name||'(untitled)')}</div>
-           <div class="m"><span>${num(b.pin_count)} pins</span><span>${(pinsByBoard[b.id]||[]).length} scraped</span></div></div></div>`).join('')}</div>`
-      :'<div class="empty">No boards scraped.</div>'}
-    <div class="sectit">Pins (${pins.length})</div>
-    ${pins.length?`<div class="grid">${pins.slice(0,LIMIT).map(pinCard).join('')}</div>`:'<div class="empty">No pins scraped for this pinner.</div>'}`;
-}
-
-function showBoard(id){
-  const b=boardById[id]; if(!b){return;}
-  const pins=(pinsByBoard[id]||[]);
-  const owner=pinnerBy[b.owner_username];
-  document.getElementById('main').innerHTML=`
-    <div class="crumb"><a onclick="setTab('boards')">Boards</a> ›
-      ${owner?`<a onclick="showPinner('${esc(b.owner_username)}')">@${esc(b.owner_username)}</a> › `:''}${esc(b.name)}</div>
-    <div class="phead">${img(b.image_cover_url,'av').replace('class="av"','class="av" style="width:64px;height:64px;border-radius:10px"')}
-      <div><h2>${esc(b.name)}</h2>
-        <div class="muted">${num(b.pin_count)} pins on Pinterest · ${num(b.follower_count)} followers · ${pins.length} scraped</div>
-        ${b.url?`<div><a href="${esc(b.url)}" target="_blank" style="color:var(--accent2)">open board ↗</a></div>`:''}</div></div>
-    ${b.description?`<div class="kv"><span>${esc(b.description)}</span></div>`:''}
-    <div class="sectit">Pins scraped (${pins.length})</div>
-    ${pins.length?`<div class="grid">${pins.slice(0,LIMIT).map(pinCard).join('')}</div>`:'<div class="empty">No individual pins scraped for this board.</div>'}`;
-}
-
-[...document.querySelectorAll('.tab')].forEach(e=>e.onclick=()=>setTab(e.dataset.tab));
-document.getElementById('q').oninput=render;
-document.getElementById('sort').onchange=render;
-setTab('pinners');
-</script>
-</body></html>"""
-
-def build_html(d):
-    payload = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
-    with open(HTML_PATH, "w", encoding="utf-8") as f:
-        f.write(HTML_TEMPLATE.replace("__DATA__", payload))
-    return HTML_PATH
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  LIVE SERVER  —  python 5_view_data.py --server
-#  Serves directly from sortpin.db (live), with card views, a raw TABLE view of
-#  every column, and a pin-detail view showing all fields + image.
-# ══════════════════════════════════════════════════════════════════════════════
-import urllib.parse, http.server, socketserver
+# ── Live Server ───────────────────────────────────────────────────────────────
 
 _SEARCH = {
     "pinners": ["username", "full_name", "contact_email", "website_url", "domain_url"],
@@ -405,6 +211,16 @@ SERVER_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
  .sectit{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:18px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
  .empty{color:var(--muted);padding:40px;text-align:center}
  .pg{display:flex;gap:6px;align-items:center}
+ .badge{padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;margin-right:6px}
+ .badge.created{background:#e60023;color:#fff}
+ .badge.saved{background:#3b82f6;color:#fff}
+ .insight-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:24px}
+ .insight-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+ .insight-card h3{margin:0 0 12px 0;font-size:12px;text-transform:uppercase;color:var(--muted);letter-spacing:0.5px}
+ .stat-val{font-size:24px;font-weight:bold;color:var(--txt)}
+ .tag-cloud{display:flex;flex-wrap:wrap;gap:6px}
+ .tag-badge{background:var(--panel2);border:1px solid var(--line);padding:4px 8px;border-radius:12px;font-size:11px;color:var(--txt)}
+ .tag-badge b{color:var(--accent2)}
 </style></head><body>
 <header>
  <h1><b>SortPin</b> Live <span class="live">● database</span></h1>
@@ -412,6 +228,7 @@ SERVER_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
  <div class="tab" data-t="boards">Boards <b id="c_boards">·</b></div>
  <div class="tab" data-t="pins">Pins <b id="c_pins">·</b></div>
  <div class="tab" data-t="jobs">Jobs ⏱</div>
+ <div class="tab" data-t="insights">Content Lab 💡</div>
 </header>
 <div class="controls">
  <input id="q" placeholder="Search…">
@@ -441,7 +258,15 @@ function setTab(t){state.t=t;state.off=0;state.q='';q.value='';
  const sel=document.getElementById('sort');sel.innerHTML='';
  (SORTS[t]||[]).filter(s=>s[1]!=='—').forEach(([k,l])=>{const o=document.createElement('option');o.value=k;o.textContent='Sort: '+l;sel.appendChild(o);});
  state.sort=sel.value||'';
- if(t==='jobs'){ renderJobs(); } else { load(); }}
+ const ct = document.querySelector('.controls');
+ if(t==='jobs' || t==='insights'){
+   ct.style.display = 'none';
+ } else {
+   ct.style.display = 'flex';
+ }
+ if(t==='jobs'){ renderJobs(); }
+ else if(t==='insights'){ renderInsights(); }
+ else { load(); }}
 
 async function renderJobs(){
  document.getElementById('page').textContent='';
@@ -456,13 +281,140 @@ async function renderJobs(){
  html+='<div class="tblwrap"><table><thead><tr><th>time</th><th>computer</th><th>cycle</th><th>event</th><th>keyword(s)</th><th>min</th><th>pins</th><th>why</th></tr></thead><tbody>';
  html+=ev.map(e=>{
    const kwc=e.keyword || (e.keywords?e.keywords.join(', '):'');
-   const col=e.event==='keyword'?'':' style="color:var(--muted)"';
-   return `<tr${col}><td>${esc(e.ts)}</td><td>${esc(e.computer)}</td><td>${esc(e.cycle)}</td><td>${esc(e.event)}</td><td>${esc(kwc)}</td><td>${e.minutes!=null?esc(e.minutes):''}</td><td>${e.pins!=null?esc(e.pins):''}</td><td>${esc(e.why||'')}</td></tr>`;
+   let col = '';
+   let why = e.why || '';
+   if (e.event === 'keyword') {
+     col = '';
+   } else if (e.event === 'cycle_done') {
+     col = ' style="color:#2ecc71;font-weight:bold"';
+     why = `Total Pins: ${num(e.total_pins || 0)} (Created: ${num(e.created_pins || 0)}, Saved: ${num(e.saved_pins || 0)}) · +${num(e.new_pins || 0)} new`;
+   } else if (e.event === 'db_build') {
+     col = ' style="color:#f39c12;font-weight:bold"';
+     why = `Build stats — Pinners: ${num(e.pinners || 0)}, Boards: ${num(e.boards || 0)}, Pins: ${num(e.pins || 0)} (Cr: ${num(e.created_pins || 0)}, Sv: ${num(e.saved_pins || 0)})`;
+   } else {
+     col = ' style="color:var(--muted)"';
+   }
+   return `<tr${col}><td>${esc(e.ts)}</td><td>${esc(e.computer)}</td><td>${esc(e.cycle || '')}</td><td>${esc(e.event)}</td><td>${esc(kwc)}</td><td>${e.minutes!=null?esc(e.minutes):''}</td><td>${e.pins!=null?esc(e.pins):''}</td><td>${esc(why)}</td></tr>`;
  }).join('');
  html+='</tbody></table></div>';
  m.innerHTML=html;
 }
 setInterval(()=>{ if(state.t==='jobs') renderJobs(); }, 5000);
+
+async function renderInsights(){
+ document.getElementById('page').textContent='';
+ const m=document.getElementById('main');
+ m.innerHTML='<div class="empty">Analyzing database and compiling content insights...</div>';
+ try {
+   const d=await api('/api/insights',{});
+   const s=d.stats;
+   const r=d.content_recipe;
+   
+   let html=`
+   <div class="insight-grid">
+     <div class="insight-card">
+       <h3>Engagement Breakdown</h3>
+       <div class="stat-val">${num(s.total)} <span class="muted" style="font-size:14px">Total Pins</span></div>
+       <div style="margin-top:10px;height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;display:flex">
+         <div style="width:${s.created_pct}%;background:var(--accent)"></div>
+         <div style="width:${100 - s.created_pct}%;background:var(--accent2)"></div>
+       </div>
+       <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px">
+         <span><b style="color:var(--accent)">●</b> Created (Original): <b>${num(s.created)}</b> (${s.created_pct}%)</span>
+         <span><b style="color:var(--accent2)">●</b> Saved (Curated): <b>${num(s.saved)}</b> (${(100 - s.created_pct).toFixed(1)}%)</span>
+       </div>
+     </div>
+     <div class="insight-card">
+       <h3>Viral Blueprint (Successful Created Pins)</h3>
+       <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
+         <div style="display:flex;justify-content:space-between">
+           <span class="muted">Avg Title Length:</span>
+           <span><b>${r.avg_title_len}</b> chars</span>
+         </div>
+         <div style="display:flex;justify-content:space-between">
+           <span class="muted">Avg Description Length:</span>
+           <span><b>${r.avg_desc_len}</b> chars</span>
+         </div>
+         <div style="display:flex;justify-content:space-between">
+           <span class="muted">Pins with External Link:</span>
+           <span><b>${r.link_pct}%</b></span>
+         </div>
+         <div class="muted" style="font-size:11px;margin-top:4px;border-top:1px solid var(--line);padding-top:4px">
+           Calculated from a sample of <b>${r.sample_size}</b> viral original pins.
+         </div>
+       </div>
+     </div>
+   </div>
+   
+   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px;flex-wrap:wrap">
+     <div class="insight-card">
+       <h3>Top Traffic-Driving Websites</h3>
+       <table style="width:100%;margin-top:8px">
+         <thead>
+           <tr><th>Domain</th><th style="text-align:right">Created Pin Count</th></tr>
+         </thead>
+         <tbody>
+           ${d.top_domains.map(([dom, count]) => `
+             <tr>
+               <td><a href="https://${esc(dom)}" target="_blank">${esc(dom)}</a></td>
+               <td style="text-align:right"><b>${num(count)}</b></td>
+             </tr>
+           `).join('') || '<tr><td colspan="2" class="empty">No domains found</td></tr>'}
+         </tbody>
+       </table>
+     </div>
+     <div class="insight-card">
+       <h3>Top Trending Words & Hashtags</h3>
+       <h4 style="margin:8px 0 6px 0;font-size:12px;color:var(--muted)">KEYWORDS IN VIRAL PINS</h4>
+       <div class="tag-cloud" style="margin-bottom:14px">
+         ${d.top_words.map(([w, c]) => `<span class="tag-badge">${esc(w)} (<b>${c}</b>)</span>`).join('') || '<span class="muted">none</span>'}
+       </div>
+       <h4 style="margin:8px 0 6px 0;font-size:12px;color:var(--muted)">HASHTAGS IN VIRAL PINS</h4>
+       <div class="tag-cloud">
+         ${d.top_hashtags.map(([t, c]) => `<span class="tag-badge" style="border-color:var(--accent)">${esc(t)} (<b>${c}</b>)</span>`).join('') || '<span class="muted">none</span>'}
+       </div>
+     </div>
+   </div>
+   
+   <div class="sectit">Top Performing Original/Created Pins (Learn from Competitors' Best Work)</div>
+   <div class="grid" style="margin-bottom:24px">
+     ${d.top_created.map(p => `
+       <div class="card" data-type="pins" data-id="${esc(p.id)}">
+         ${imgCell(p)}
+         <div class="bd">
+           <div class="t">${esc(p.title || p.description || '(no title)')}</div>
+           <div class="m" style="margin-top:6px;display:flex;align-items:center;justify-content:space-between">
+             <span><span class="badge created">Created</span>♥ ${num(p.repin_count || p.saves)}</span>
+             <span class="muted">@${esc(p.pinner_username || '')}</span>
+           </div>
+         </div>
+       </div>
+     `).join('') || '<div class="empty">No high-performing created pins found</div>'}
+   </div>
+   
+   <div class="sectit">Top Performing Curated/Saved Pins (Top Curations)</div>
+   <div class="grid">
+     ${d.top_saved.map(p => `
+       <div class="card" data-type="pins" data-id="${esc(p.id)}">
+         ${imgCell(p)}
+         <div class="bd">
+           <div class="t">${esc(p.title || p.description || '(no title)')}</div>
+           <div class="m" style="margin-top:6px;display:flex;align-items:center;justify-content:space-between">
+             <span><span class="badge saved">Saved</span>♥ ${num(p.repin_count || p.saves)}</span>
+             <span class="muted">@${esc(p.pinner_username || '')}</span>
+           </div>
+         </div>
+       </div>
+     `).join('') || '<div class="empty">No high-performing curated pins found</div>'}
+   </div>
+   `;
+   
+   m.innerHTML=html;
+   bindMini(m);
+ } catch(e){
+   m.innerHTML=`<div class="empty" style="color:var(--accent)">Error generating insights: ${esc(e.message||e)}</div>`;
+ }
+}
 
 function imgCell(p){return p.image?`<img loading="lazy" src="${esc(p.image)}" onerror="this.style.visibility='hidden'">`:`<div style="height:160px"></div>`;}
 
@@ -483,10 +435,19 @@ async function load(){
  }
 }
 function pk(){return state.t==='pinners'?'username':'id';}
+
 function card(row){
- if(state.t==='pins')return `<div class="card" data-type="pins" data-id="${esc(row.id)}">${imgCell(row)}<div class="bd"><div class="t">${esc(row.title||row.description||'(no title)')}</div><div class="m"><span>♥ ${num(row.repin_count||row.saves)}</span><span>@${esc(row.pinner_username||'')}</span></div></div></div>`;
+ if(state.t==='pins') {
+   const badge = row.pin_type === 'created' 
+     ? '<span style="background:#e60023;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;margin-right:6px">Created</span>' 
+     : '<span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;margin-right:6px">Saved</span>';
+   return `<div class="card" data-type="pins" data-id="${esc(row.id)}">${imgCell(row)}<div class="bd"><div class="t">${esc(row.title||row.description||'(no title)')}</div><div class="m" style="margin-top:6px;display:flex;align-items:center;justify-content:space-between"><span>${badge}♥ ${num(row.repin_count||row.saves)}</span><span class="muted">@${esc(row.pinner_username||'')}</span></div></div></div>`;
+ }
  if(state.t==='boards')return `<div class="card" data-type="boards" data-id="${esc(row.id)}">${row.image_cover_url?`<img loading="lazy" src="${esc(row.image_cover_url)}" onerror="this.style.visibility='hidden'">`:'<div style="height:160px"></div>'}<div class="bd"><div class="t">${esc(row.name||'(untitled)')}</div><div class="m"><span>${num(row.pin_count)} pins</span><span>@${esc(row.owner_username||'')}</span></div></div></div>`;
- return `<div class="card" data-type="pinner" data-id="${esc(row.username)}"><div class="bd"><div class="t">${esc(row.full_name||row.username)}</div><div class="m"><span>${num(row.follower_count)} foll</span><span>@${esc(row.username)}</span></div><div class="muted" style="margin-top:4px">${esc(row.contact_email||row.website_url||'')}</div></div></div>`;
+ 
+ const cr = row.scraped_created_pins_count !== undefined ? row.scraped_created_pins_count : (row.np_created || 0);
+ const sv = row.scraped_saved_pins_count !== undefined ? row.scraped_saved_pins_count : (row.np_saved || 0);
+ return `<div class="card" data-type="pinner" data-id="${esc(row.username)}"><div class="bd"><div class="t">${esc(row.full_name||row.username)}</div><div class="m"><span>${num(row.follower_count)} foll</span><span>@${esc(row.username)}</span></div><div class="m" style="margin-top:4px;font-size:11px"><span>Created: <b>${num(cr)}</b></span><span>Saved: <b>${num(sv)}</b></span></div><div class="muted" style="margin-top:4px">${esc(row.contact_email||row.website_url||'')}</div></div></div>`;
 }
 function kvTable(obj){return '<div class="kvs">'+Object.keys(obj).map(k=>{let v=obj[k];let vh=esc(v);
  if(typeof v==='string'&&/^https?:\/\//.test(v))vh=`<a href="${esc(v)}" target="_blank">${esc(v)}</a>`;
@@ -506,14 +467,24 @@ async function detail(type,id){
    bindMini(m);
  } else { // pinners
    const ch=await api('/api/children',{type:'pinner',id});
+   const pins = ch.pins || [];
+   const createdPins = pins.filter(p => p.pin_type === 'created');
+   const savedPins = pins.filter(p => p.pin_type === 'saved');
+   
    m.innerHTML=head+kvTable(row)+
      `<div class="sectit">Boards (${(ch.boards||[]).length})</div><div class="grid">${(ch.boards||[]).map(b=>boardMini(b)).join('')||'<div class=empty>none</div>'}</div>`+
-     `<div class="sectit">Pins (${(ch.pins||[]).length})</div><div class="grid">${(ch.pins||[]).map(p=>pinMini(p)).join('')||'<div class=empty>none</div>'}</div>`;
+     `<div class="sectit">Created Pins (${createdPins.length}) — Original Content</div><div class="grid">${createdPins.map(p=>pinMini(p)).join('')||'<div class=empty>none</div>'}</div>`+
+     `<div class="sectit">Saved Pins (${savedPins.length}) — Curated Content</div><div class="grid">${savedPins.map(p=>pinMini(p)).join('')||'<div class=empty>none</div>'}</div>`;
    bindMini(m);
  }
 }
 function pkOf(t){return t==='pinners'?'username':'id';}
-function pinMini(p){return `<div class="card" data-type="pins" data-id="${esc(p.id)}">${imgCell(p)}<div class="bd"><div class="t">${esc(p.title||p.description||'(no title)')}</div><div class="m"><span>♥ ${num(p.repin_count||p.saves)}</span></div></div></div>`;}
+function pinMini(p){
+  const badge = p.pin_type === 'created' 
+    ? '<span style="background:#e60023;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;margin-right:6px">Created</span>' 
+    : '<span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;margin-right:6px">Saved</span>';
+  return `<div class="card" data-type="pins" data-id="${esc(p.id)}">${imgCell(p)}<div class="bd"><div class="t">${esc(p.title||p.description||'(no title)')}</div><div class="m" style="margin-top:6px;display:flex;align-items:center"><span>${badge}♥ ${num(p.repin_count||p.saves)}</span></div></div></div>`;
+}
 function boardMini(b){return `<div class="card" data-type="boards" data-id="${esc(b.id)}">${b.image_cover_url?`<img loading="lazy" src="${esc(b.image_cover_url)}" onerror="this.style.visibility='hidden'">`:'<div style="height:160px"></div>'}<div class="bd"><div class="t">${esc(b.name||'(untitled)')}</div><div class="m"><span>${num(b.pin_count)} pins</span></div></div></div>`;}
 function bindMini(m){[...m.querySelectorAll('[data-id]')].forEach(el=>el.onclick=()=>detail(el.dataset.type,el.dataset.id));}
 
@@ -558,6 +529,109 @@ def make_handler(db_path):
                     out = api_children(con, g("type"), g("id"))
                 elif u.path == "/api/logs":
                     out = {"events": read_logs(int(g("limit", "500") or 500))}
+                elif u.path == "/api/insights":
+                    # 1. Total and type counts
+                    tot_pins = con.execute("SELECT COUNT(*) FROM pins").fetchone()[0]
+                    created_pins = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='created'").fetchone()[0]
+                    saved_pins = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='saved'").fetchone()[0]
+                    
+                    # 2. Top performing original/created pins
+                    top_created = [dict(r) for r in con.execute(
+                        "SELECT id, title, description, pin_url, image, repin_count, saves, comment_count, pinner_username "
+                        "FROM pins WHERE pin_type='created' AND (repin_count > 0 OR saves > 0) "
+                        "ORDER BY (repin_count + saves) DESC LIMIT 15"
+                    )]
+                    
+                    # 3. Top performing saved/curated pins
+                    top_saved = [dict(r) for r in con.execute(
+                        "SELECT id, title, description, pin_url, image, repin_count, saves, comment_count, pinner_username "
+                        "FROM pins WHERE pin_type='saved' AND (repin_count > 0 OR saves > 0) "
+                        "ORDER BY (repin_count + saves) DESC LIMIT 15"
+                    )]
+
+                    # 4. Top domains for created pins
+                    domain_counts = {}
+                    for r in con.execute("SELECT link FROM pins WHERE pin_type='created' AND link IS NOT NULL AND link <> ''"):
+                        dom = extract_domain(r[0])
+                        if dom:
+                            domain_counts[dom] = domain_counts.get(dom, 0) + 1
+                    top_domains = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+                    # 5. Extract words and hashtags from top pins (repin_count + saves >= 5)
+                    word_counts = {}
+                    hashtag_counts = {}
+                    
+                    stop_words = {
+                        "and", "the", "a", "of", "to", "for", "in", "is", "on", "with", "this", "your", "you", 
+                        "that", "it", "are", "by", "as", "at", "an", "be", "from", "or", "how", "why", "what", 
+                        "who", "which", "where", "when", "about", "our", "their", "my", "me", "we", "us", "i", 
+                        "can", "will", "do", "get", "make", "made", "up", "out", "so", "but", "not",
+                        "easy", "best", "simple", "recipe", "recipes", "quick", "ideas", "home", "diy"
+                    }
+                    
+                    # Fetch titles and descriptions for top pins
+                    top_texts = con.execute(
+                        "SELECT title, description FROM pins "
+                        "WHERE pin_type='created' AND (repin_count + saves) >= 5"
+                    ).fetchall()
+                    
+                    import re as pyre
+                    for title, desc in top_texts:
+                        text = f"{(title or '')} {(desc or '')}".lower()
+                        # Extract hashtags
+                        tags = pyre.findall(r"#\w+", text)
+                        for t in tags:
+                            hashtag_counts[t] = hashtag_counts.get(t, 0) + 1
+                        
+                        # Extract words
+                        words = pyre.findall(r"\b\w{3,15}\b", text)
+                        for w in words:
+                            if w not in stop_words and not w.isdigit():
+                                word_counts[w] = word_counts.get(w, 0) + 1
+                                
+                    top_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+                    top_hashtags = sorted(hashtag_counts.items(), key=lambda x: x[1], reverse=True)[:15]
+
+                    # 6. Formatting stats (lengths) of high-performing pins
+                    high_perf = con.execute(
+                        "SELECT title, description, link FROM pins "
+                        "WHERE pin_type='created' AND (repin_count + saves) >= 5"
+                    ).fetchall()
+                    
+                    avg_title_len = 0
+                    avg_desc_len = 0
+                    has_link_count = 0
+                    
+                    if high_perf:
+                        total_title_len = sum(len(r[0] or '') for r in high_perf)
+                        total_desc_len = sum(len(r[1] or '') for r in high_perf)
+                        has_link_count = sum(1 for r in high_perf if r[2])
+                        
+                        avg_title_len = round(total_title_len / len(high_perf))
+                        avg_desc_len = round(total_desc_len / len(high_perf))
+                        link_pct = round((has_link_count / len(high_perf)) * 100)
+                    else:
+                        link_pct = 0
+
+                    out = {
+                        "stats": {
+                            "total": tot_pins,
+                            "created": created_pins,
+                            "saved": saved_pins,
+                            "created_pct": round((created_pins / tot_pins * 100) if tot_pins else 0, 1)
+                        },
+                        "top_created": top_created,
+                        "top_saved": top_saved,
+                        "top_domains": top_domains,
+                        "top_words": top_words,
+                        "top_hashtags": top_hashtags,
+                        "content_recipe": {
+                            "avg_title_len": avg_title_len,
+                            "avg_desc_len": avg_desc_len,
+                            "link_pct": link_pct,
+                            "sample_size": len(high_perf)
+                        }
+                    }
                 else:
                     out = {"error": "not found"}
                 self._send(json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
@@ -581,7 +655,7 @@ def serve(db_path, port=8000):
         print("  Could not bind a local port."); sys.exit(1)
     url = f"http://127.0.0.1:{p}/"
     print(f"\n  🌐 Live database server running at:  {url}")
-    print(f"     Reads {os.path.basename(db_path)} live · tabs: Pinners | Boards | Pins · "
+    print(f"     Reads {os.path.basename(db_path)} live · tabs: Pinners | Boards | Pins | Jobs | Content Lab · "
           f"Cards/Table views · click any pin for full detail")
     print(f"     Press Ctrl+C to stop.\n")
     if "--no-open" not in sys.argv[1:]:
@@ -592,21 +666,15 @@ def serve(db_path, port=8000):
         print("\n  Server stopped.\n")
 
 def main():
-    if "--server" in sys.argv[1:]:
-        print_stats(load())          # quick summary, then go live
-        serve(DB_PATH)
-        return
-    d = load()
-    print_stats(d)
-    path = build_html(d)
-    print(f"  🖥  Static viewer built: {os.path.basename(path)}  (tabs: Pinners | Boards | Pins)")
-    print(f"     TIP: for a LIVE database view with raw tables + full pin detail, run:")
-    print(f"          python 5_view_data.py --server")
-    if "--no-open" not in sys.argv[1:]:
-        webbrowser.open("file://" + path.replace("\\", "/"))
-        print(f"     Opening in your browser…\n")
-    else:
-        print(f"     Open it manually: {path}\n")
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
+
+    print_stats(load())          # quick summary, then go live
+    serve(DB_PATH)
 
 if __name__ == "__main__":
     main()

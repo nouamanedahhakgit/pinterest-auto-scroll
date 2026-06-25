@@ -13,22 +13,26 @@ OUTPUTS (written next to this script):
   • sortpin_data.json   → same data, nested Pinner → Boards → Pins (for the viewer)
 
 DATA SOURCES (tried in this order):
-  1. LIVE from the SortPin extension in Brave (best-effort, needs Brave + CDP).
+  1. DISK (Default) — reads raw IndexedDB files directly from Brave's profiles AND
+     its backups under _SORTPIN_ARCHIVE/ (no browser needed, extremely fast).
+     After successful extraction, it automatically archives a backup and clears (deletes)
+     the live extension data so the extension starts empty next time Brave starts.
+  2. LIVE from the extension via browser (CDP):
        python 4_build_database.py --live
-  2. The extension's CSV exports placed in this folder (the reliable path):
-       SortPin.com_all_leads_*.csv
-       SortPin.com_all_boards_*.csv
-       SortPin.com_all_pins_*.csv
-     (In the extension popup: Pins / Boards / Pinners → Export — drop the 3
-      CSVs into this folder, then run `python 4_build_database.py`.)
+  3. CSV files only (no disk/extension read):
+       python 4_build_database.py --csv
 
 Run:
-  python 4_build_database.py            # build from the newest CSV exports here
-  python 4_build_database.py --live     # try the live extension first, else CSV
+  python 4_build_database.py            # default: read disk profiles + archives, build DB, archive & clear live
+  python 4_build_database.py --live     # open Brave using Selenium/CDP to pull data
+  python 4_build_database.py --csv      # build only from CSV files in this folder
 """
 
 import os, sys, csv, json, re, glob, sqlite3, socket, subprocess, time
 from datetime import datetime
+import collections.abc, typing
+if sys.version_info < (3, 10):
+    collections.abc.Callable = typing.Callable
 
 csv.field_size_limit(10_000_000)              # SortPin rows have huge fields
 
@@ -166,8 +170,69 @@ def normalize(leads, boards, pins):
         for f in ("saves", "repin_count", "comment_count", "like_count", "share_count"):
             if f in rec:
                 rec[f] = _int(rec.get(f))
+                
+        # Determine pin_type: 'created' vs 'saved'
+        is_repin = pn.get("is_repin")
+        nc = pn.get("native_creator")
+        nc_username = ""
+        if isinstance(nc, dict):
+            nc_username = nc.get("username") or ""
+        elif isinstance(nc, str) and nc.strip():
+            # If native_creator is a JSON string or dict string in CSV, extract username
+            if nc.strip().startswith("{"):
+                try:
+                    # Clean single quotes to valid JSON quotes
+                    cleaned_nc = nc.replace("'", '"')
+                    # Make sure true/false/null are cleaned
+                    cleaned_nc = re.sub(r'\bTrue\b', 'true', cleaned_nc)
+                    cleaned_nc = re.sub(r'\bFalse\b', 'false', cleaned_nc)
+                    cleaned_nc = re.sub(r'\bNone\b', 'null', cleaned_nc)
+                    nc_dict = json.loads(cleaned_nc)
+                    nc_username = nc_dict.get("username") or ""
+                except Exception:
+                    # Fallback to regex parse
+                    m = re.search(r'"username":\s*"([^"]+)"', nc) or re.search(r"'username':\s*'([^']+)'", nc)
+                    if m:
+                        nc_username = m.group(1)
+            else:
+                nc_username = nc.strip()
+                
+        # If is_repin is explicitly set to True/1, or if native creator username is different than board pinner
+        is_repin_val = False
+        if is_repin in (True, 1, "True", "1"):
+            is_repin_val = True
+        elif nc_username and pinner and nc_username.lower() != pinner.lower():
+            is_repin_val = True
+            
+        rec["pin_type"] = "saved" if is_repin_val else "created"
         pins_by_id[pid] = rec
     out_pins = list(pins_by_id.values())
+
+    # 4) Calculate board/pin counts for each pinner based on what's in this DB
+    pinner_pins = {}
+    pinner_created = {}
+    pinner_saved = {}
+    for pn in out_pins:
+        puser = pn.get("pinner_username")
+        if puser:
+            pinner_pins[puser] = pinner_pins.get(puser, 0) + 1
+            pt = pn.get("pin_type") or "created"
+            if pt == "created":
+                pinner_created[puser] = pinner_created.get(puser, 0) + 1
+            else:
+                pinner_saved[puser] = pinner_saved.get(puser, 0) + 1
+
+    pinner_boards = {}
+    for bd in out_boards:
+        owner = bd.get("owner_username")
+        if owner:
+            pinner_boards[owner] = pinner_boards.get(owner, 0) + 1
+
+    for username, p in pinners.items():
+        p["scraped_pins_count"] = pinner_pins.get(username, 0)
+        p["scraped_created_pins_count"] = pinner_created.get(username, 0)
+        p["scraped_saved_pins_count"] = pinner_saved.get(username, 0)
+        p["scraped_boards_count"] = pinner_boards.get(username, 0)
 
     return {"pinners": list(pinners.values()),
             "boards":  out_boards,
@@ -212,12 +277,40 @@ def _numeric_cols(cols, pk, rows):
     return num
 
 def write_sqlite(data):
+    # 1) Preserve existing status values from DB before removing/recreating it
+    existing_statuses = {"pinners": {}, "boards": {}}
+    if os.path.exists(DB_PATH):
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cursor = con.cursor()
+            try:
+                cursor.execute("SELECT username, status FROM pinners")
+                for row in cursor.fetchall():
+                    if row[1]:
+                        existing_statuses["pinners"][row[0]] = row[1]
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("SELECT id, status FROM boards")
+                for row in cursor.fetchall():
+                    if row[1]:
+                        existing_statuses["boards"][row[0]] = row[1]
+            except sqlite3.OperationalError:
+                pass
+            con.close()
+        except Exception:
+            pass
+
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     con = sqlite3.connect(DB_PATH)
     for table, pk in _TABLE_PK.items():
         rows = data[table]
         cols = _columns_for(pk, rows)
+        # Ensure 'status' column is present for pinners and boards
+        if table in ("pinners", "boards") and "status" not in cols:
+            cols.append("status")
+            
         num = _numeric_cols(cols, pk, rows)
         defs = ", ".join(
             f'"{c}" {"INTEGER" if c in num else "TEXT"}' + (" PRIMARY KEY" if c == pk else "")
@@ -225,6 +318,9 @@ def write_sqlite(data):
         con.execute(f'CREATE TABLE "{table}" ({defs})')
         ph = ", ".join("?" * len(cols))
         def cellval(r, c):
+            if c == "status":
+                row_pk = r.get(pk)
+                return r.get("status") or existing_statuses[table].get(row_pk) or "not yet"
             v = r.get(c)
             if c in num:
                 return _int(v)
@@ -309,7 +405,10 @@ def write_json(data):
             "domain_url": p.get("domain_url", ""), "contact_email": p.get("contact_email", ""),
             "follower_count": p.get("follower_count", 0), "pin_count": p.get("pin_count", 0),
             "board_count": p.get("board_count", 0), "profile_reach": p.get("profile_reach", 0),
-            "nb": n_boards.get(u, 0), "np": n_pins.get(u, 0),
+            "nb": p.get("scraped_boards_count", 0), 
+            "np": p.get("scraped_pins_count", 0),
+            "np_created": p.get("scraped_created_pins_count", 0),
+            "np_saved": p.get("scraped_saved_pins_count", 0),
         })
     pinners.sort(key=lambda x: (x["np"], x["follower_count"]), reverse=True)
 
@@ -682,6 +781,13 @@ def _flatten_raw(kind, o):
         pid = str(o.get("id") or "")
         puser = _sub(pinner, "username")
         rc = o.get("reaction_counts")
+        
+        nc = o.get("native_creator")
+        is_repin = o.get("is_repin")
+        if is_repin is None:
+            nc_user = nc.get("username") if isinstance(nc, dict) else ""
+            is_repin = bool(nc_user and puser and nc_user.lower() != puser.lower())
+            
         return {
             "id": pid,
             "pin_url": f"https://www.pinterest.com/pin/{pid}" if pid else "",
@@ -696,7 +802,7 @@ def _flatten_raw(kind, o):
             "comment_count": o.get("comment_count") or 0,
             "like_count": 0,
             "share_count": o.get("share_count") or 0,
-            "reaction_counts": (json.dumps(rc) if isinstance(rc, (dict, list)) else (rc or "")),
+            "reaction_counts": (json.dumps(rc, default=str) if isinstance(rc, (dict, list)) else (rc or "")),
             "created_at": o.get("created_at") or o.get("createdAt") or "",
             "updated_at": o.get("updated_at") or o.get("updatedAt") or "",
             # board (denormalised)
@@ -714,6 +820,9 @@ def _flatten_raw(kind, o):
             "pinner_board_count": _sub(pinner, "board_count") or 0,
             "pinner_follower_count": _sub(pinner, "follower_count") or 0,
             "pinner_following_count": _sub(pinner, "following_count") or 0,
+            # repin & creator fields
+            "is_repin": 1 if is_repin else 0,
+            "native_creator": json.dumps(nc, default=str) if isinstance(nc, dict) else (nc or ""),
         }
     if kind == "boards":
         owner = o.get("owner") or {}
@@ -777,23 +886,41 @@ def _disk_rows_df(folder):
     skip the records it can't parse. (ccl_chromium_reader handles more — prefer it.)"""
     import pathlib, os as _os, contextlib
     from dfindexeddb.indexeddb.chromium import record as _cr
-    rows = []
-    with open(_os.devnull, "w") as devnull, \
-         contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+    
+    # dfindexeddb expects a sibling .blob folder to exist even if load_blobs=False.
+    # Create a temporary one if missing to prevent initialization failure.
+    blob_dir = str(folder).replace(".indexeddb.leveldb", ".indexeddb.blob")
+    created_blob = False
+    if not _os.path.exists(blob_dir):
         try:
-            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(use_manifest=True, load_blobs=False)
+            _os.makedirs(blob_dir, exist_ok=True)
+            created_blob = True
         except Exception:
-            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
-        while True:                               # buffer inside the silence
+            pass
+            
+    rows = []
+    try:
+        with open(_os.devnull, "w") as devnull, \
+             contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
             try:
-                rec = next(it)
-            except StopIteration:
-                break
+                it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(use_manifest=True, load_blobs=False)
             except Exception:
-                continue                          # skip a record it can't decode
-            v = getattr(rec, "value", None)
-            if isinstance(v, dict):
-                rows.append(v)
+                it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
+            while True:                               # buffer inside the silence
+                try:
+                    rec = next(it)
+                except StopIteration:
+                    break
+                except Exception:
+                    continue                          # skip a record it can't decode
+                v = getattr(rec, "value", None)
+                if isinstance(v, dict):
+                    rows.append(v)
+    finally:
+        if created_blob:
+            try: _os.rmdir(blob_dir)
+            except Exception: pass
+            
     for v in rows:                                # yield after — caller output not muted
         yield v
 
@@ -819,18 +946,28 @@ def try_disk_extension():
             print("        python -m pip install ccl_chromium_reader")
             return None
 
-    from_archive = ("--archive" in sys.argv[1:]) or ("archive" in sys.argv[1:])
-    if from_archive:
-        dirs = _archive_leveldb_dirs()
-        print(f"  (disk) reading from _SORTPIN_ARCHIVE backups — {len(dirs)} folder(s)")
-        if not dirs:
-            print("  (disk) no archived IndexedDB folders found in _SORTPIN_ARCHIVE/")
-            return None
-    else:
-        dirs = _idb_leveldb_dirs()
-        if not dirs:
-            print("  (disk) no SortPin IndexedDB folder found under Brave profiles")
-            return None
+    args = sys.argv[1:]
+    read_archive = ("--archive" in args) or ("archive" in args)
+    read_live = ("--disk" in args)
+
+    # Default to both live Brave profiles & archives if neither is explicitly specified
+    if not read_archive and not read_live:
+        read_live = True
+        read_archive = True
+
+    dirs = []
+    if read_archive:
+        archive_dirs = _archive_leveldb_dirs()
+        print(f"  (disk) reading from _SORTPIN_ARCHIVE backups — {len(archive_dirs)} folder(s)")
+        dirs.extend(archive_dirs)
+    if read_live:
+        live_dirs = _idb_leveldb_dirs()
+        print(f"  (disk) reading from Brave profiles — {len(live_dirs)} folder(s)")
+        dirs.extend(live_dirs)
+
+    if not dirs:
+        print("  (disk) no IndexedDB folders found in requested locations")
+        return None
 
     buckets = {"leads": [], "boards": [], "pins": []}
 
@@ -885,24 +1022,119 @@ def load_from_csv():
     print(f"  (all CSV exports in this folder are merged & de-duplicated)")
     return leads, boards, pins
 
+# ── live extension cleanup ───────────────────────────────────────────────────
+def brave_running():
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq brave.exe"],
+                             capture_output=True, text=True)
+        return "brave.exe" in (out.stdout or "")
+    except Exception:
+        return False
+
+def close_brave():
+    subprocess.run(["taskkill", "/F", "/IM", "brave.exe"], capture_output=True)
+    time.sleep(2)
+
+def archive_and_clear_extension_data():
+    """Backup/archive the current live IndexedDB/blob folders, then delete/clear them
+    from Brave's directory so it starts fresh next time Brave opens."""
+    import shutil
+    ud = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                      "BraveSoftware", "Brave-Browser", "User Data")
+    if not os.path.isdir(ud):
+        return
+
+    targets = []
+    for prof in sorted(glob.glob(os.path.join(ud, "*"))):
+        if not os.path.isdir(prof):
+            continue
+        idb = os.path.join(prof, "IndexedDB")
+        for suffix in ("leveldb", "blob"):
+            p = os.path.join(idb, f"chrome-extension_{EXT_ID}_0.indexeddb.{suffix}")
+            if os.path.exists(p):
+                targets.append(p)
+
+    if not targets:
+        print("  (clear) No live SortPin extension data folders to clear.")
+        return
+
+    # Close Brave if running, as files are locked
+    if brave_running():
+        print("  (clear) Brave is running and files are locked. Closing Brave...")
+        close_brave()
+
+    # 1) Archive
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    archive_root = os.path.join(BASE, "_SORTPIN_ARCHIVE", stamp)
+    print(f"  (clear) Archiving backup of live extension data to _SORTPIN_ARCHIVE/{stamp}/ ...")
+    
+    archived = 0
+    for t in targets:
+        try:
+            prof_name = os.path.basename(os.path.dirname(os.path.dirname(t)))
+            dest = os.path.join(archive_root, prof_name, os.path.basename(t))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if os.path.isdir(t):
+                shutil.copytree(t, dest)
+            else:
+                shutil.copy2(t, dest)
+            archived += 1
+        except Exception as e:
+            print(f"  (clear) ⚠ could not archive {t}: {e}")
+
+    if archived:
+        print(f"  (clear) ✅ Backed up {archived} folder(s)/file(s) → _SORTPIN_ARCHIVE/{stamp}/")
+
+    # 2) Clear (Delete)
+    deleted, failed = [], []
+    for t in targets:
+        try:
+            if os.path.isdir(t):
+                shutil.rmtree(t)
+            else:
+                os.remove(t)
+            deleted.append(t)
+        except Exception as e:
+            failed.append((t, str(e)))
+
+    if deleted:
+        print(f"  (clear) ✅ Cleared/deleted {len(deleted)} live extension folder(s)/file(s) from Brave.")
+    if failed:
+        print("  (clear) ⚠ Some files could not be deleted:")
+        for t, e in failed:
+            print(f"     {t}\n     {e}")
+        print("  (clear) Make sure Brave is fully closed and try again.")
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
     print(f"\n{'='*60}\n  STEP 4 — Build local relational SortPin database\n{'='*60}")
-    # LIVE-from-extension is the default. Use --csv to skip it and read the
-    # CSV exports only.  (--live also works and is the same as the default.)
+    # Default is disk + archive mode.
+    # --csv = only build from local CSV files.
+    # --live = open Brave with CDP to pull live data.
     csv_only = "--csv" in sys.argv[1:]
+    live_mode = "--live" in sys.argv[1:]
+    disk_mode = not csv_only and not live_mode
 
     # 1) Pull the current extension data → save a timestamped CSV snapshot
     #    (preserves it on disk so it survives clearing in step 6 + git-syncs).
-    #    --disk = read IndexedDB files directly (no browser), CDP as fallback.
-    #    default = live read via the running Brave (CDP).
     args = sys.argv[1:]
-    disk_mode = ("--disk" in args) or ("--archive" in args) or ("archive" in args)
     if not csv_only:
         live = None
         if disk_mode:
-            src = "_SORTPIN_ARCHIVE backups" if (("--archive" in args) or ("archive" in args)) \
-                  else "IndexedDB files"
+            has_archive = ("--archive" in args) or ("archive" in args)
+            has_disk = ("--disk" in args)
+            if (has_archive and has_disk) or (not has_archive and not has_disk):
+                src = "Brave profiles & _SORTPIN_ARCHIVE backups"
+            elif has_archive:
+                src = "_SORTPIN_ARCHIVE backups"
+            else:
+                src = "IndexedDB files"
             print(f"  Reading SortPin data from disk ({src}, no browser)...")
             live = try_disk_extension()
             if not live:
@@ -916,6 +1148,11 @@ def main():
             live = try_live_extension()
         if live:
             save_snapshot(*live)
+            is_archive_only = (("archive" in args or "--archive" in args) and not ("--disk" in args))
+            no_clear = ("--no-clear" in args)
+            if not is_archive_only and not no_clear:
+                print("\n  Automatically archiving and clearing live Brave extension data...")
+                archive_and_clear_extension_data()
 
     # 2) Always build the DB from ALL CSVs in the folder (the new snapshot +
     #    every past snapshot/export), merged & de-duplicated. This way the
@@ -935,14 +1172,66 @@ def main():
     write_json(data)
     write_mysql_dump(data)
 
+    created_count = sum(1 for p in data["pins"] if p.get("pin_type") == "created")
+    saved_count = sum(1 for p in data["pins"] if p.get("pin_type") == "saved")
+
+    # Log to magic_log.jsonl
+    def log_magic_event(**ev):
+        log_path = os.path.join(BASE, "magic_log.jsonl")
+        ev["ts"] = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+        import platform
+        ev["computer"] = platform.node()
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    log_magic_event(
+        event="db_build",
+        pinners=len(data["pinners"]),
+        boards=len(data["boards"]),
+        pins=len(data["pins"]),
+        created_pins=created_count,
+        saved_pins=saved_count
+    )
+
     print(f"\n  ✅ Built local database:")
     print(f"     • pinners : {len(data['pinners']):>6}")
     print(f"     • boards  : {len(data['boards']):>6}")
-    print(f"     • pins    : {len(data['pins']):>6}")
+    print(f"     • pins    : {len(data['pins']):>6} (created: {created_count}, saved: {saved_count})")
     print(f"\n     → {os.path.basename(DB_PATH)}   (SQLite, relational)")
     print(f"     → {os.path.basename(JSON_PATH)}   (pinners/boards/pins, for the viewer)")
     print(f"     → IMPORTANT_DATABASE/sortpin_mysql.sql   (import into MySQL)")
     print(f"\n  Next:  python 5_view_data.py   (stats + browse the data)\n")
+
+    # Automatically run the MySQL sync script if it exists and password is set
+    sync_script = os.path.join(BASE, "8_sync_to_mysql.py")
+    if os.path.exists(sync_script):
+        env_path = os.path.join(BASE, ".env")
+        if os.path.exists(env_path):
+            has_pw = False
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    for line in f:
+                        if "MYSQL_PASSWORD" in line and "=" in line:
+                            parts = line.split("=", 1)
+                            if len(parts) > 1:
+                                pw = parts[1].strip()
+                                if pw and pw != "YOUR_PASSWORD_HERE":
+                                    has_pw = True
+            except Exception:
+                pass
+            
+            if has_pw:
+                print("  🔄 Automatically syncing local database to Cloud MySQL...")
+                try:
+                    import subprocess
+                    subprocess.run([sys.executable, sync_script], cwd=BASE)
+                except Exception as e:
+                    print(f"  ⚠️  Auto-sync failed: {e}")
+            else:
+                print("  ℹ️  Cloud MySQL sync skipped (password not configured in .env).")
 
 if __name__ == "__main__":
     main()
