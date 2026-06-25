@@ -242,8 +242,8 @@ def main():
         if update_clause:
             upsert_sql += f" ON DUPLICATE KEY UPDATE {update_clause}"
 
-        # 4. Insert data in batches of 500 rows to optimize round-trips
-        batch_size = 500
+        # 4. Insert data in batches of 100 rows to optimize round-trips
+        batch_size = 100
         total_inserted = 0
         
         for i in range(0, len(rows), batch_size):
