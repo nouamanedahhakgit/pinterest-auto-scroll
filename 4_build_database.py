@@ -684,7 +684,7 @@ def save_snapshot(leads, boards, pins):
     """Write the live-pulled rows to timestamped CSVs in SortPin's naming so the
     data is preserved on disk, git-syncs across computers, and is re-merged by
     later runs even after the extension is cleared (step 6)."""
-    if "--no-csv" in sys.argv[1:]:
+    if "--write-csv" not in sys.argv[1:]:
         return []
     ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
     written = []
