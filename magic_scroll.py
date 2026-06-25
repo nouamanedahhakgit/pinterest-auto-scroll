@@ -54,6 +54,11 @@ MINUTES   = _minutes()
 BATCH     = _batch()
 BUILD_ARGS = ["4_build_database.py"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
 
+# pagination-end detection: stop a keyword early when no new pins load
+STALL_SECS  = 40           # "no more pins" when page height stops growing this long
+SAMPLE_SECS = 6            # how often to check the page height
+_HEIGHT_JS  = "return document.documentElement.scrollHeight || document.body.scrollHeight || 0;"
+
 # ── Google Sheet (web app: claim / mark) ──────────────────────────────────────
 def load_sheet_client():
     try:
@@ -186,13 +191,33 @@ def close_pinterest_tabs(driver, base_tab):
     except Exception:
         pass
 
+def wait_pins(driver, max_secs):
+    """Like step 2: keep scrolling, but STOP EARLY when the page stops loading
+    new pins (height hasn't grown for STALL_SECS). `max_secs` is just a cap so a
+    fast/endless page still moves on eventually. Returns why it stopped."""
+    end_at = time.time() + max_secs
+    last_h, last_grow, next_sample = 0, time.time(), time.time() + SAMPLE_SECS
+    while time.time() < end_at:
+        now = time.time()
+        if now >= next_sample:
+            next_sample = now + SAMPLE_SECS
+            try: h = int(driver.execute_script(_HEIGHT_JS) or 0)
+            except Exception: h = last_h
+            if h > last_h + 50:                 # new pins loaded → keep going
+                last_h, last_grow = h, now
+            elif last_h > 0 and now - last_grow >= STALL_SECS:
+                return "no more pins"           # exhausted → next keyword
+        time.sleep(1)
+    return "time cap"
+
 def scroll_keyword(driver, kw, base_tab, minutes):
-    print(f"    ▶ '{kw}' — {minutes:g} min")
+    print(f"    ▶ '{kw}' — up to {minutes:g} min")
     open_keyword_tab(driver, kw)
     time.sleep(6)
     print("      " + ("SortPin scrolling" if click_start(driver)
                       else "⚠ could not start SortPin (continuing)"))
-    time.sleep(int(minutes * 60))
+    why = wait_pins(driver, int(minutes * 60))  # ends early when no new pins
+    print(f"      → moving on ({why})")
     close_pinterest_tabs(driver, base_tab)
 
 # ── run the existing steps as subprocesses ────────────────────────────────────

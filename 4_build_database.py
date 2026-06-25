@@ -111,20 +111,20 @@ def normalize(leads, boards, pins):
         p = ensure_pinner(l.get("username"), l.get("full_name"))
         if not p:
             continue
-        p["full_name"]      = _clean(l.get("full_name")) or p["full_name"]
-        p["website_url"]    = _clean(l.get("website_url"))
-        p["domain_url"]     = _clean(l.get("domain_url"))
-        p["contact_email"]  = _clean(l.get("contact_email"))
-        p["contact_phone"]  = _clean(l.get("contact_phone"))
-        p["board_count"]    = _int(l.get("board_count"))
-        p["follower_count"] = _int(l.get("follower_count"))
-        p["following_count"]= _int(l.get("following_count"))
-        p["pin_count"]      = _int(l.get("pin_count"))
-        p["profile_reach"]  = _int(l.get("profile_reach"))
-        p["profile_views"]  = _int(l.get("profile_views"))
-        p["last_pin_at"]    = _clean(l.get("lastPinAt"))
-        if not p["image_url"]:
-            p["image_url"]  = _clean(l.get("image_medium_url")) or _clean(l.get("image_small_url"))
+        for k, v in l.items():                  # KEEP every lead field
+            if k == "username":
+                continue
+            if v not in (None, ""):
+                p[k] = v
+        # canonical fields the viewer/sort rely on
+        p["full_name"]      = _clean(l.get("full_name")) or p.get("full_name", "")
+        p["contact_email"]  = _clean(l.get("contact_email")) or p.get("contact_email", "")
+        p["last_pin_at"]    = _clean(l.get("lastPinAt") or l.get("last_pin_at") or p.get("last_pin_at", ""))
+        for f in ("board_count", "follower_count", "following_count", "pin_count",
+                  "profile_reach", "profile_views"):
+            p[f] = _int(l.get(f) if l.get(f) not in (None, "") else p.get(f))
+        if not p.get("image_url"):
+            p["image_url"] = _clean(l.get("image_medium_url")) or _clean(l.get("image_small_url"))
 
     # 2) Boards (link to pinner via owner_username) — dedup by board id
     board_by_url = {}
@@ -135,20 +135,13 @@ def normalize(leads, boards, pins):
         if p and not p["image_url"]:
             p["image_url"] = _clean(b.get("owner_image_medium_url")) or \
                              _clean(b.get("owner_image_small_url"))
-        rec = {
-            "id":              _clean(b.get("id")),
-            "name":            _clean(b.get("name")),
-            "description":     _clean(b.get("description")),
-            "url":             _clean(b.get("url")),
-            "image_cover_url": _clean(b.get("image_cover_url")),
-            "follower_count":  _int(b.get("follower_count")),
-            "section_count":   _int(b.get("section_count")),
-            "pin_count":       _int(b.get("pin_count")),
-            "category":        _clean(b.get("category")),
-            "privacy":         _clean(b.get("privacy")),
-            "modified_at":     _clean(b.get("modifiedAt")),
-            "owner_username":  owner or None,   # None (not "") so FK isn't enforced
-        }
+        rec = dict(b)                           # KEEP every field from the source
+        rec["id"]             = _clean(b.get("id"))
+        rec["owner_username"] = owner or None
+        rec["modified_at"]    = _clean(b.get("modifiedAt") or b.get("modified_at"))
+        for f in ("follower_count", "section_count", "pin_count", "collaborator_count"):
+            if f in rec:
+                rec[f] = _int(rec.get(f))
         if not rec["id"]:
             continue
         boards_by_id[rec["id"]] = rec          # dedup: newest export wins
@@ -165,103 +158,88 @@ def normalize(leads, boards, pins):
         if not pid:
             continue
         burl = _clean(pn.get("board_url"))
-        pins_by_id[pid] = {
-            "id":             pid,
-            "title":          _clean(pn.get("title")),
-            "description":    _clean(pn.get("description")),
-            "link":           _clean(pn.get("link")),
-            "pin_url":        _clean(pn.get("pin_url")),
-            "image":          _clean(pn.get("image")),
-            "saves":          _int(pn.get("saves")),
-            "repin_count":    _int(pn.get("repin_count")),
-            "comment_count":  _int(pn.get("comment_count")),
-            "like_count":     _int(pn.get("like_count")),
-            "created_at":     _clean(pn.get("created_at")),
-            "board_url":      burl,
-            "board_id":       board_by_url.get(burl) or None,   # None → FK not enforced
-            "board_name":     _clean(pn.get("board_name")),
-            "pinner_username":pinner or None,
-        }
+        rec = dict(pn)                          # KEEP every field from the source
+        rec["id"]              = pid
+        rec["board_url"]       = burl
+        rec["board_id"]        = board_by_url.get(burl) or None
+        rec["pinner_username"] = pinner or None
+        for f in ("saves", "repin_count", "comment_count", "like_count", "share_count"):
+            if f in rec:
+                rec[f] = _int(rec.get(f))
+        pins_by_id[pid] = rec
     out_pins = list(pins_by_id.values())
 
     return {"pinners": list(pinners.values()),
             "boards":  out_boards,
             "pins":    out_pins}
 
-# ── write SQLite (true relational, with foreign keys + indexes) ───────────────
+# ── dynamic schema: keep EVERY field; build columns from the data itself ──────
+_TABLE_PK = {"pinners": "username", "boards": "id", "pins": "id"}
+
+def _force_text(col):
+    """Columns that must stay TEXT even if they look numeric (ids, keys, urls…)."""
+    low = col.lower()
+    return (col in ("id", "username", "board_id", "owner_username", "pinner_username")
+            or "username" in low or low.endswith("_url") or low.endswith("_at")
+            or low in ("pin_url", "link", "image", "images", "video", "videos",
+                       "dominant_color", "reaction_counts", "node_id", "phone", "contact_phone"))
+
+def _columns_for(pk, rows):
+    cols = [pk]
+    for r in rows:
+        for k in r.keys():
+            if k not in cols:
+                cols.append(k)
+    return cols
+
+def _numeric_cols(cols, pk, rows):
+    num = set()
+    for c in cols:
+        if c == pk or _force_text(c):
+            continue
+        seen = False
+        ok = True
+        for r in rows:
+            v = r.get(c)
+            if v in (None, ""):
+                continue
+            try:
+                int(float(v)); seen = True
+            except (ValueError, TypeError):
+                ok = False; break
+        if ok and seen:
+            num.add(c)
+    return num
+
 def write_sqlite(data):
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA foreign_keys = ON;")
-    con.executescript("""
-        CREATE TABLE pinners (
-            username TEXT PRIMARY KEY, full_name TEXT, website_url TEXT,
-            domain_url TEXT, contact_email TEXT, contact_phone TEXT, image_url TEXT,
-            board_count INTEGER, follower_count INTEGER, following_count INTEGER,
-            pin_count INTEGER, profile_reach INTEGER, profile_views INTEGER,
-            last_pin_at TEXT
-        );
-        CREATE TABLE boards (
-            id TEXT PRIMARY KEY, name TEXT, description TEXT, url TEXT,
-            image_cover_url TEXT, follower_count INTEGER, section_count INTEGER,
-            pin_count INTEGER, category TEXT, privacy TEXT, modified_at TEXT,
-            owner_username TEXT,
-            FOREIGN KEY (owner_username) REFERENCES pinners(username)
-        );
-        CREATE TABLE pins (
-            id TEXT PRIMARY KEY, title TEXT, description TEXT, link TEXT,
-            pin_url TEXT, image TEXT, saves INTEGER, repin_count INTEGER,
-            comment_count INTEGER, like_count INTEGER, created_at TEXT,
-            board_url TEXT, board_id TEXT, board_name TEXT, pinner_username TEXT,
-            FOREIGN KEY (board_id) REFERENCES boards(id),
-            FOREIGN KEY (pinner_username) REFERENCES pinners(username)
-        );
-    """)
-    con.executemany(
-        "INSERT OR REPLACE INTO pinners VALUES "
-        "(:username,:full_name,:website_url,:domain_url,:contact_email,"
-        ":contact_phone,:image_url,:board_count,:follower_count,:following_count,"
-        ":pin_count,:profile_reach,:profile_views,:last_pin_at)", data["pinners"])
-    con.executemany(
-        "INSERT OR REPLACE INTO boards VALUES "
-        "(:id,:name,:description,:url,:image_cover_url,:follower_count,"
-        ":section_count,:pin_count,:category,:privacy,:modified_at,:owner_username)",
-        data["boards"])
-    con.executemany(
-        "INSERT OR REPLACE INTO pins VALUES "
-        "(:id,:title,:description,:link,:pin_url,:image,:saves,:repin_count,"
-        ":comment_count,:like_count,:created_at,:board_url,:board_id,:board_name,"
-        ":pinner_username)", data["pins"])
-    con.executescript("""
-        CREATE INDEX idx_boards_owner ON boards(owner_username);
-        CREATE INDEX idx_pins_pinner  ON pins(pinner_username);
-        CREATE INDEX idx_pins_board   ON pins(board_id);
-    """)
+    for table, pk in _TABLE_PK.items():
+        rows = data[table]
+        cols = _columns_for(pk, rows)
+        num = _numeric_cols(cols, pk, rows)
+        defs = ", ".join(
+            f'"{c}" {"INTEGER" if c in num else "TEXT"}' + (" PRIMARY KEY" if c == pk else "")
+            for c in cols)
+        con.execute(f'CREATE TABLE "{table}" ({defs})')
+        ph = ", ".join("?" * len(cols))
+        def cellval(r, c):
+            v = r.get(c)
+            if c in num:
+                return _int(v)
+            return None if v is None else str(v)
+        con.executemany(f'INSERT OR REPLACE INTO "{table}" VALUES ({ph})',
+                        [[cellval(r, c) for c in cols] for r in rows])
+    for sql in ("CREATE INDEX IF NOT EXISTS idx_boards_owner ON boards(owner_username)",
+                "CREATE INDEX IF NOT EXISTS idx_pins_pinner  ON pins(pinner_username)",
+                "CREATE INDEX IF NOT EXISTS idx_pins_board   ON pins(board_id)"):
+        try: con.execute(sql)
+        except Exception: pass            # column may be absent if a table is empty
     con.commit()
     con.close()
 
-# ── write a MySQL-importable .sql dump (no live connection needed) ────────────
-# Column specs: (name, mysql_type, is_int).  Mirror the SQLite schema.
-_MYSQL_COLS = {
-    "pinners": [("username","VARCHAR(190)",0),("full_name","TEXT",0),("website_url","TEXT",0),
-        ("domain_url","TEXT",0),("contact_email","VARCHAR(255)",0),("contact_phone","VARCHAR(64)",0),
-        ("image_url","TEXT",0),("board_count","BIGINT",1),("follower_count","BIGINT",1),
-        ("following_count","BIGINT",1),("pin_count","BIGINT",1),("profile_reach","BIGINT",1),
-        ("profile_views","BIGINT",1),("last_pin_at","VARCHAR(64)",0)],
-    "boards": [("id","VARCHAR(64)",0),("name","TEXT",0),("description","TEXT",0),("url","TEXT",0),
-        ("image_cover_url","TEXT",0),("follower_count","BIGINT",1),("section_count","BIGINT",1),
-        ("pin_count","BIGINT",1),("category","VARCHAR(190)",0),("privacy","VARCHAR(64)",0),
-        ("modified_at","VARCHAR(64)",0),("owner_username","VARCHAR(190)",0)],
-    "pins": [("id","VARCHAR(64)",0),("title","TEXT",0),("description","TEXT",0),("link","TEXT",0),
-        ("pin_url","TEXT",0),("image","TEXT",0),("saves","BIGINT",1),("repin_count","BIGINT",1),
-        ("comment_count","BIGINT",1),("like_count","BIGINT",1),("created_at","VARCHAR(64)",0),
-        ("board_url","TEXT",0),("board_id","VARCHAR(64)",0),("board_name","TEXT",0),
-        ("pinner_username","VARCHAR(190)",0)],
-}
-# map normalized dict keys → column names (DB uses last_pin_at / modified_at)
-_KEYMAP = {"last_pin_at": "last_pin_at", "modified_at": "modified_at"}
-
+# ── write a MySQL-importable .sql dump (dynamic columns, no live connection) ──
 def _sql_val(v, is_int):
     if v is None or v == "":
         return "0" if is_int else "''"
@@ -271,41 +249,38 @@ def _sql_val(v, is_int):
     s = str(v).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
     return "'" + s + "'"
 
-def _row_get(row, col):
-    # normalized rows use last_pin_at/modified_at already; boards use 'modified_at'? they use 'modified_at'
-    return row.get(col, row.get(col.replace("modified_at", "modified_at"), ""))
-
 def write_mysql_dump(data):
     os.makedirs(DB_DIR, exist_ok=True)
     with open(MYSQL_PATH, "w", encoding="utf-8") as f:
         f.write("-- SortPin scraped data — import into MySQL:\n")
-        f.write("--   mysql -u USER -p DBNAME < sortpin_mysql.sql   (or use phpMyAdmin → Import)\n")
+        f.write("--   mysql -u USER -p DBNAME < sortpin_mysql.sql   (or phpMyAdmin → Import)\n")
         f.write(f"-- generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n")
         for table in ("pins", "boards", "pinners"):
             f.write(f"DROP TABLE IF EXISTS `{table}`;\n")
-        for table in ("pinners", "boards", "pins"):
-            cols = _MYSQL_COLS[table]
-            defs = ",\n  ".join(f"`{c}` {t}" for c, t, _ in cols)
-            pk = cols[0][0]
+        meta = {}
+        for table, pk in _TABLE_PK.items():
+            rows = data[table]
+            cols = _columns_for(pk, rows)
+            num = _numeric_cols(cols, pk, rows)
+            meta[table] = (cols, num, rows)
+            defs = ",\n  ".join(
+                f"`{c}` " + ("BIGINT" if c in num else
+                             ("VARCHAR(190)" if c == pk else "LONGTEXT"))
+                for c in cols)
             f.write(f"\nCREATE TABLE `{table}` (\n  {defs},\n  PRIMARY KEY (`{pk}`)\n"
                     f") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n")
         f.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
         for table in ("pinners", "boards", "pins"):
-            cols = _MYSQL_COLS[table]
-            rows = data[table]
+            cols, num, rows = meta[table]
             if not rows:
                 continue
-            collist = ", ".join(f"`{c}`" for c, _, _ in cols)
+            collist = ", ".join(f"`{c}`" for c in cols)
             f.write(f"\n-- {len(rows)} {table}\n")
-            BATCH = 400
-            for i in range(0, len(rows), BATCH):
-                chunk = rows[i:i+BATCH]
+            for i in range(0, len(rows), 400):
                 f.write(f"INSERT INTO `{table}` ({collist}) VALUES\n")
-                vals = []
-                for r in chunk:
-                    cells = ", ".join(_sql_val(r.get(c), is_int) for c, _, is_int in cols)
-                    vals.append(f"({cells})")
+                vals = ["(" + ", ".join(_sql_val(r.get(c), c in num) for c in cols) + ")"
+                        for r in rows[i:i+400]]
                 f.write(",\n".join(vals) + ";\n")
     # also keep a copy of the SQLite db next to it
     try:
@@ -644,6 +619,18 @@ def _idb_leveldb_dirs():
             out.append(p)
     return out
 
+def _archive_leveldb_dirs():
+    """Every SortPin IndexedDB folder backed up by step 6 under _SORTPIN_ARCHIVE/
+    (all timestamps → all historical data, merged & de-duplicated by the build)."""
+    archive = os.path.join(BASE, "_SORTPIN_ARCHIVE")
+    out = []
+    if os.path.isdir(archive):
+        for root, dirs, _files in os.walk(archive):
+            for d in dirs:
+                if d == f"chrome-extension_{EXT_ID}_0.indexeddb.leveldb":
+                    out.append(os.path.join(root, d))
+    return out
+
 def _trim_row(o):
     """Keep scalar fields + small nested ones; drop big blobs (images maps…)."""
     if not isinstance(o, dict):
@@ -693,6 +680,8 @@ def _flatten_raw(kind, o):
         pinner = o.get("pinner") or o.get("native_creator") or o.get("origin_pinner") or {}
         board  = o.get("board") or o.get("pinned_to_board") or {}
         pid = str(o.get("id") or "")
+        puser = _sub(pinner, "username")
+        rc = o.get("reaction_counts")
         return {
             "id": pid,
             "pin_url": f"https://www.pinterest.com/pin/{pid}" if pid else "",
@@ -700,14 +689,31 @@ def _flatten_raw(kind, o):
             "description": o.get("description") or "",
             "link": o.get("link") or o.get("mobile_link") or "",
             "image": _best_image(o),
+            "images": o.get("image_signature") or "",
+            "video": 1 if o.get("is_video") else 0,
             "saves": o.get("saves") or o.get("repin_count") or 0,
             "repin_count": o.get("repin_count") or 0,
             "comment_count": o.get("comment_count") or 0,
             "like_count": 0,
+            "share_count": o.get("share_count") or 0,
+            "reaction_counts": (json.dumps(rc) if isinstance(rc, (dict, list)) else (rc or "")),
             "created_at": o.get("created_at") or o.get("createdAt") or "",
+            "updated_at": o.get("updated_at") or o.get("updatedAt") or "",
+            # board (denormalised)
             "board_url": _sub(board, "url"),
             "board_name": _sub(board, "name"),
-            "pinner_username": _sub(pinner, "username"),
+            "board_pin_count": _sub(board, "pin_count") or 0,
+            "board_follower_count": _sub(board, "follower_count") or 0,
+            "board_privacy": _sub(board, "privacy"),
+            "board_category": _sub(board, "category"),
+            # pinner (denormalised)
+            "pinner_username": puser,
+            "pinner_name": _sub(pinner, "full_name"),
+            "pinner_url": f"https://www.pinterest.com/{puser}/" if puser else "",
+            "pinner_pin_count": _sub(pinner, "pin_count") or 0,
+            "pinner_board_count": _sub(pinner, "board_count") or 0,
+            "pinner_follower_count": _sub(pinner, "follower_count") or 0,
+            "pinner_following_count": _sub(pinner, "following_count") or 0,
         }
     if kind == "boards":
         owner = o.get("owner") or {}
@@ -766,17 +772,30 @@ def _disk_rows_ccl(folder):
                     yield v
 
 def _disk_rows_df(folder):
-    """Read records via dfindexeddb (needs python-snappy/zstd, may need a compiler)."""
-    import pathlib
+    """Read records via dfindexeddb. It can't decode some newer Pinterest records
+    ('Unsupported header') and floods those errors — we silence its output and
+    skip the records it can't parse. (ccl_chromium_reader handles more — prefer it.)"""
+    import pathlib, os as _os, contextlib
     from dfindexeddb.indexeddb.chromium import record as _cr
-    try:
-        it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(use_manifest=True, load_blobs=False)
-    except Exception:
-        it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
-    for rec in it:
-        v = getattr(rec, "value", None)
-        if isinstance(v, dict):
-            yield v
+    rows = []
+    with open(_os.devnull, "w") as devnull, \
+         contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+        try:
+            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(use_manifest=True, load_blobs=False)
+        except Exception:
+            it = _cr.FolderReader(pathlib.Path(folder)).GetRecords(load_blobs=False)
+        while True:                               # buffer inside the silence
+            try:
+                rec = next(it)
+            except StopIteration:
+                break
+            except Exception:
+                continue                          # skip a record it can't decode
+            v = getattr(rec, "value", None)
+            if isinstance(v, dict):
+                rows.append(v)
+    for v in rows:                                # yield after — caller output not muted
+        yield v
 
 def try_disk_extension():
     """Read SortPin's data straight from Brave's IndexedDB files on disk — no
@@ -800,10 +819,18 @@ def try_disk_extension():
             print("        python -m pip install ccl_chromium_reader")
             return None
 
-    dirs = _idb_leveldb_dirs()
-    if not dirs:
-        print("  (disk) no SortPin IndexedDB folder found under Brave profiles")
-        return None
+    from_archive = ("--archive" in sys.argv[1:]) or ("archive" in sys.argv[1:])
+    if from_archive:
+        dirs = _archive_leveldb_dirs()
+        print(f"  (disk) reading from _SORTPIN_ARCHIVE backups — {len(dirs)} folder(s)")
+        if not dirs:
+            print("  (disk) no archived IndexedDB folders found in _SORTPIN_ARCHIVE/")
+            return None
+    else:
+        dirs = _idb_leveldb_dirs()
+        if not dirs:
+            print("  (disk) no SortPin IndexedDB folder found under Brave profiles")
+            return None
 
     buckets = {"leads": [], "boards": [], "pins": []}
 
@@ -869,10 +896,14 @@ def main():
     #    (preserves it on disk so it survives clearing in step 6 + git-syncs).
     #    --disk = read IndexedDB files directly (no browser), CDP as fallback.
     #    default = live read via the running Brave (CDP).
+    args = sys.argv[1:]
+    disk_mode = ("--disk" in args) or ("--archive" in args) or ("archive" in args)
     if not csv_only:
         live = None
-        if "--disk" in sys.argv[1:]:
-            print("  Reading SortPin data from disk (IndexedDB files, no browser)...")
+        if disk_mode:
+            src = "_SORTPIN_ARCHIVE backups" if (("--archive" in args) or ("archive" in args)) \
+                  else "IndexedDB files"
+            print(f"  Reading SortPin data from disk ({src}, no browser)...")
             live = try_disk_extension()
             if not live:
                 # disk-only mode: do NOT open the browser (huge data can't load

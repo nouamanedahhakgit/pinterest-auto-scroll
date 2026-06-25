@@ -435,7 +435,7 @@ async function load(){
  if(state.mode==='table'){
    const cols=r.columns;
    m.innerHTML='<div class="tblwrap"><table><thead><tr>'+cols.map(c=>`<th>${esc(c)}</th>`).join('')+'</tr></thead><tbody>'+
-     r.rows.map(row=>`<tr style="cursor:pointer" data-id="${esc(row[pk()])}">`+cols.map(c=>`<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')+'</tr>').join('')+'</tbody></table></div>';
+     r.rows.map(row=>`<tr style="cursor:pointer" data-id="${esc(row[pk()])}">`+cols.map(c=>`<td title="${esc(row[c])}">${cell(row[c])}</td>`).join('')+'</tr>').join('')+'</tbody></table></div>';
    [...m.querySelectorAll('tr[data-id]')].forEach(tr=>tr.onclick=()=>detail(state.t,tr.dataset.id));
  } else {
    m.innerHTML='<div class="grid">'+r.rows.map(card).join('')+'</div>';

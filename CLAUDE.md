@@ -18,6 +18,7 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `4_build_database.py` | Builds a local **relational** DB from SortPin data: Pinner→Boards→Pins. Outputs `sortpin.db` + `sortpin_data.json`. |
 | `5_view_data.py` | Prints statistics + builds/opens `sortpin_viewer.html` to browse Pinner→Boards→Pins. |
 | `6_clear_sortpin.py` | Archives extension data into `_SORTPIN_ARCHIVE/` then clears it from Brave. Run step 4 first to save. |
+| `7_scrape_profiles.py` | **Deep scrape:** for each pinner → open profile → open every board → scroll till end. Resumable (`profiles_progress.json`). |
 | `magic_scroll.py` | **All-in-one multi-computer loop:** claim 5 keywords from sheet (pending) → scroll → build DB → mark Done → clear SortPin → repeat. |
 | `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
 | `sortpin_data.json` | Auto-created (step 4). Flat pinners/boards/pins arrays (feeds the viewer). |
@@ -39,12 +40,15 @@ python 2_pinterest_auto_scroll.py       # interactive prompt
 python 3_sync_to_sheet.py               # push statuses to sheet
 python 4_build_database.py              # LIVE pull from SortPin extension via Brave (CDP)
 python 4_build_database.py --disk       # read IndexedDB files directly, NO browser (pip install ccl_chromium_reader)
+python 4_build_database.py --disk --archive  # rebuild from _SORTPIN_ARCHIVE backups (all cleared history)
 python 4_build_database.py --csv        # skip live; build only from CSV exports in folder
 python 4_build_database.py              # also writes IMPORTANT_DATABASE/sortpin_mysql.sql
 python 5_view_data.py                   # static viewer (reads sortpin.db → Pinners/Boards/Pins tabs)
 python 5_view_data.py --server          # LIVE local server: card+TABLE views, full pin detail, images
 python 6_clear_sortpin.py               # archives backup → _SORTPIN_ARCHIVE/ then clears
 python 6_clear_sortpin.py --yes         # no confirmation prompt
+python 7_scrape_profiles.py             # deep-scrape pinners → boards → pins (20 pinners/run)
+python 7_scrape_profiles.py --limit 50  # process 50 pinners this run (resumable)
 python magic_scroll.py                  # multi-PC: claim→scroll→build→done→clear→repeat (5 min/kw)
 python magic_scroll.py --2m --batch 5   # 2 min per keyword, 5 keywords per cycle
 python magic_scroll.py --disk           # build DB from disk each cycle (needs ccl_chromium_reader)
