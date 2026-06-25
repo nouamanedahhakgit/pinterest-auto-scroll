@@ -40,6 +40,74 @@ def read_logs(limit=500):
         return []
     return out[-limit:][::-1]
 
+def run_websites_sync(db_path):
+    """Sync all pinners with non-empty website_url to Google Sheets websites tab."""
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    pinners = [dict(r) for r in con.execute(
+        "SELECT username, website_url FROM pinners "
+        "WHERE website_url IS NOT NULL AND website_url <> ''"
+    )]
+    con.close()
+
+    if not pinners:
+        return 0
+
+    # Add parent directory to path so we can import google_sheets_client
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import google_sheets_client as gsc
+
+    webapp = gsc.resolve_webapp()
+    sa_exists = os.path.exists(os.path.join(gsc.BASE, gsc.SA_FILE))
+    oauth_exists = os.path.exists(os.path.join(gsc.BASE, gsc.OAUTH_FILE))
+
+    if not sa_exists and not oauth_exists and not webapp:
+        raise RuntimeError("No Google Sheets auth found. Configure google_sheets_webapp.json or service account.")
+
+    rows_to_sync = [[p["username"], p["website_url"], "not yet"] for p in pinners]
+
+    # --- Mode 1: gspread API ---
+    if sa_exists or oauth_exists:
+        gc, auth_mode = gsc.get_gspread_client()
+        if gc is None:
+            raise RuntimeError("Failed to authorize Google Sheets API client.")
+        sh = gc.open_by_key(gsc.SPREADSHEET_ID)
+        
+        # Check / create 'websites' sheet
+        try:
+            ws = sh.worksheet("websites")
+        except Exception:
+            ws = sh.add_worksheet(title="websites", rows="100", cols="3")
+            ws.update("A1:C1", [["id", "website", "scrapped"]], value_input_option="RAW")
+            
+        # Get existing IDs from column A
+        existing_ids = set()
+        col_a = ws.col_values(1)
+        if col_a:
+            for val in col_a[1:]: # skip header
+                if val:
+                    existing_ids.add(val.strip().lower())
+                    
+        # Filter new ones
+        new_rows = []
+        for r in rows_to_sync:
+            pinner_id = r[0]
+            if pinner_id and pinner_id.strip().lower() not in existing_ids:
+                new_rows.append(r)
+                
+        if new_rows:
+            ws.append_rows(new_rows, value_input_option="RAW")
+        return len(new_rows)
+
+    # --- Mode 2: Web App ---
+    else:
+        payload = {
+            "action": "sync_websites",
+            "rows": rows_to_sync
+        }
+        res = gsc.post_webapp(webapp, payload)
+        return res.get("count", 0)
+
 def load_from_db(db_path):
     """Read pinners/boards/pins straight from the SQLite DB and build the flat
     structure the viewer uses (so the viewer is database-driven)."""
@@ -229,6 +297,7 @@ SERVER_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
  <div class="tab" data-t="pins">Pins <b id="c_pins">·</b></div>
  <div class="tab" data-t="jobs">Jobs ⏱</div>
  <div class="tab" data-t="insights">Content Lab 💡</div>
+ <button id="sync_websites_btn" style="margin-left:auto;background:var(--accent2);border-color:var(--accent2);color:#fff;font-weight:bold;border-radius:20px;padding:6px 16px;">Sync Websites to Sheet 📊</button>
 </header>
 <div class="controls">
  <input id="q" placeholder="Search…">
@@ -239,6 +308,25 @@ SERVER_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 </div>
 <div class="wrap" id="main"></div>
 <script>
+document.getElementById('sync_websites_btn').addEventListener('click', async () => {
+  const btn = document.getElementById('sync_websites_btn');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Syncing... ⏳';
+  try {
+    const res = await fetch('/api/sync_websites', { method: 'POST' }).then(r => r.json());
+    if (res.error) {
+      alert('Error: ' + res.error);
+    } else {
+      alert(`Sync completed!\nAdded ${res.count} new websites to the 'websites' sheet.`);
+    }
+  } catch (e) {
+    alert('Sync failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+});
 const api=(p,q)=>fetch(p+'?'+new URLSearchParams(q)).then(r=>r.json());
 const esc=s=>(s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const num=n=>(+n||0).toLocaleString();
@@ -507,6 +595,22 @@ def make_handler(db_path):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b)
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                self.rfile.read(content_length)
+                
+            if u.path == "/api/sync_websites":
+                try:
+                    count = run_websites_sync(db_path)
+                    out = {"ok": True, "count": count}
+                except Exception as e:
+                    out = {"error": str(e)}
+                self._send(json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
+            else:
+                self.send_response(404)
+                self.end_headers()
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(u.query)

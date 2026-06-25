@@ -36,6 +36,9 @@ function doPost(e) {
     if (data.action === "mark") {
       return markKeywords(sheet, data.keywords || [], data.status || "Done");
     }
+    if (data.action === "sync_websites") {
+      return syncWebsites(ss, data.rows || []);
+    }
 
     return writeColumn(sheet, data);
   } catch (err) {
@@ -128,6 +131,40 @@ function writeColumn(sheet, data) {
     column: col,
     count: values.length
   });
+}
+
+function syncWebsites(ss, rows) {
+  let wsSheet = ss.getSheetByName("websites");
+  if (!wsSheet) {
+    wsSheet = ss.insertSheet("websites");
+    wsSheet.appendRow(["id", "website", "scrapped"]);
+  }
+  
+  const last = wsSheet.getLastRow();
+  let existingIds = {};
+  if (last > 1) {
+    const ids = wsSheet.getRange(2, 1, last - 1, 1).getValues();
+    ids.forEach(function(r) {
+      const idVal = String(r[0]).trim();
+      if (idVal) {
+        existingIds[idVal.toLowerCase()] = true;
+      }
+    });
+  }
+  
+  const newRows = [];
+  rows.forEach(function(row) {
+    const pinnerId = String(row[0]).trim();
+    if (pinnerId && !existingIds[pinnerId.toLowerCase()]) {
+      newRows.push([pinnerId, row[1] || "", row[2] || "not yet"]);
+    }
+  });
+  
+  if (newRows.length > 0) {
+    wsSheet.getRange(last + 1, 1, newRows.length, 3).setValues(newRows);
+    SpreadsheetApp.flush();
+  }
+  return jsonOut({ ok: true, action: "sync_websites", count: newRows.length });
 }
 
 function jsonOut(obj) {
