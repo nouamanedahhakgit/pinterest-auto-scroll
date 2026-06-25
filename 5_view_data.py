@@ -75,10 +75,11 @@ def run_websites_sync(db_path):
     if not sa_exists and not oauth_exists and not webapp:
         raise RuntimeError("No Google Sheets auth found. Configure google_sheets_webapp.json or service account.")
 
-    # Format the rows to sync: [id, name, website, scrapped, categories, followers, reach, total_pins, total_boards, scraped_boards, scraped_pins, created_pins, saved_pins]
+    # Format the rows to sync: [id, pinterest_link, name, website, scrapped, categories, followers, reach, total_pins, total_boards, scraped_boards, scraped_pins, created_pins, saved_pins]
     rows_to_sync = [
         [
             p["username"],
+            f"https://www.pinterest.com/{p['username']}/",
             p["full_name"] or "",
             p["website_url"],
             "not yet",
@@ -103,12 +104,12 @@ def run_websites_sync(db_path):
         sh = gc.open_by_key(gsc.SPREADSHEET_ID)
         
         # Check / create 'websites' sheet
-        headers = ["id", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"]
+        headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"]
         try:
             ws = sh.worksheet("websites")
         except Exception:
             ws = sh.add_worksheet(title="websites", rows="100", cols=str(len(headers)))
-            ws.update("A1:M1", [headers], value_input_option="RAW")
+            ws.update("A1:N1", [headers], value_input_option="RAW")
             
         # Get existing IDs from column A
         existing_ids = set()

@@ -135,7 +135,7 @@ function writeColumn(sheet, data) {
 
 function syncWebsites(ss, rows) {
   let wsSheet = ss.getSheetByName("websites");
-  const headers = ["id", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"];
+  const headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"];
   if (!wsSheet) {
     wsSheet = ss.insertSheet("websites");
     wsSheet.appendRow(headers);
