@@ -404,8 +404,16 @@ def load_settings() -> dict:
         k_lower = k.lower()
         if k_lower in DEFAULT_SETTINGS and v:
             data[k_lower] = v
+
+    # 3. Auto-detect provider fallback if default 'local' is used but API keys are provided
+    merged = {**DEFAULT_SETTINGS, **data}
+    if merged.get("quick_scrape_ai_provider") == "local":
+        if merged.get("openrouter_api_key"):
+            merged["quick_scrape_ai_provider"] = "openrouter"
+        elif merged.get("groq_api_key"):
+            merged["quick_scrape_ai_provider"] = "groq"
             
-    return {**DEFAULT_SETTINGS, **data}
+    return merged
 
 def get_ai_client(provider: str, model: str):
     """Return the right AI client for provider ('groq' | 'openrouter')."""
