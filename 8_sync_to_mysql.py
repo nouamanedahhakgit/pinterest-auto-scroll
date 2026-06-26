@@ -211,20 +211,29 @@ def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_i
 
     print(f"  - Read {len(rows)} rows from local SQLite.")
 
-    # Build simple upsert: last writer wins (VALUES(col) without COALESCE).
-    # COALESCE(NULLIF(VALUES(col), ''), col) forces MySQL to read the existing row
-    # before writing, which acquires a shared lock and causes deadlocks when
-    # multiple computers sync concurrently. Plain VALUES(col) only needs an
-    # exclusive lock on the row being written — no shared read lock needed.
+    # ── SQL strategy ──────────────────────────────────────────────────────────
+    # Multi-computer problem: concurrent INSERT...ON DUPLICATE KEY UPDATE creates
+    # InnoDB gap/next-key locks even on brand-new rows, causing timeout storms.
+    #
+    # Fix: use INSERT IGNORE for every table except 'keywords'.
+    #   • INSERT IGNORE on a duplicate does nothing and acquires ZERO row locks.
+    #   • Each computer only inserts its own freshly-scraped rows; existing rows
+    #     from other computers are harmlessly skipped.
+    #   • 'keywords' still needs ON DUPLICATE KEY UPDATE so that status changes
+    #     (e.g. "Done") propagate correctly.
     col_list = ", ".join(f"`{c}`" for c in cols)
     placeholders = ", ".join(["%s"] * len(cols))
-    update_parts = [f"`{c}`=VALUES(`{c}`)"
-                    for c in cols if c != pk]
-    update_clause = ", ".join(update_parts)
 
-    upsert_sql = f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders})"
-    if update_clause:
-        upsert_sql += f" ON DUPLICATE KEY UPDATE {update_clause}"
+    if table == "keywords":
+        # Only update status + last_scraped_at so Done/Pending markers always win
+        upsert_sql = (
+            f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders})"
+            f" ON DUPLICATE KEY UPDATE"
+            f" `status`=VALUES(`status`), `last_scraped_at`=VALUES(`last_scraped_at`)"
+        )
+    else:
+        # INSERT IGNORE: insert only if not already present — no update, no lock
+        upsert_sql = f"INSERT IGNORE INTO `{table}` ({col_list}) VALUES ({placeholders})"
 
     # Insert data in small batches of 25 rows to minimise lock hold time.
     # On persistent lock timeout: SKIP the batch and continue — the rows
@@ -315,6 +324,15 @@ def main():
             print(f"  - Warning: Failed to load {new_ids_file}: {e}")
 
     print("\nStarting Local-to-Cloud Sync...")
+
+    # Jitter: stagger start by a random 0-20 seconds so multiple computers
+    # running magic_scroll simultaneously don't all hit MySQL at the same moment.
+    import random
+    jitter = random.uniform(0, 20)
+    if jitter > 1:
+        print(f"  (jitter delay: {jitter:.1f}s to spread multi-computer load)")
+        time.sleep(jitter)
+
 
     for table, pk in tables_pk.items():
         sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_ids)
