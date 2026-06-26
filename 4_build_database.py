@@ -254,7 +254,13 @@ def normalize(leads, boards, pins):
             "pins":    out_pins}
 
 # ── dynamic schema: keep EVERY field; build columns from the data itself ──────
-_TABLE_PK = {"pinners": "username", "boards": "id", "pins": "id"}
+_TABLE_PK = {
+    "pinners": "username",
+    "boards": "id",
+    "pins": "id",
+    "keywords": "keyword",
+    "pin_keywords": "id"
+}
 
 def _force_text(col):
     """Columns that must stay TEXT even if they look numeric (ids, keys, urls…)."""
@@ -291,9 +297,12 @@ def _numeric_cols(cols, pk, rows):
             num.add(c)
     return num
 
-def write_sqlite(data):
+def write_sqlite(data, keyword=None):
     # 1) Preserve existing status values from DB before removing/recreating it
     existing_statuses = {"pinners": {}, "boards": {}}
+    existing_keywords = {}
+    existing_pin_keywords = []
+
     if os.path.exists(DB_PATH):
         try:
             con = sqlite3.connect(DB_PATH)
@@ -312,9 +321,124 @@ def write_sqlite(data):
                         existing_statuses["boards"][row[0]] = row[1]
             except sqlite3.OperationalError:
                 pass
+            try:
+                cursor.execute("SELECT keyword, status, last_scraped_at FROM keywords")
+                for row in cursor.fetchall():
+                    existing_keywords[row[0].lower().strip()] = {
+                        "keyword": row[0],
+                        "status": row[1],
+                        "last_scraped_at": row[2]
+                    }
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("SELECT id, pin_id, keyword, scraped_at FROM pin_keywords")
+                for row in cursor.fetchall():
+                    existing_pin_keywords.append({
+                        "id": row[0],
+                        "pin_id": row[1],
+                        "keyword": row[2],
+                        "scraped_at": row[3]
+                    })
+            except sqlite3.OperationalError:
+                pass
             con.close()
         except Exception:
             pass
+
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Load keywords list
+    keywords_txt_list = []
+    kw_path = os.path.join(BASE, "keywords.txt")
+    if os.path.exists(kw_path):
+        try:
+            with open(kw_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        keywords_txt_list.append(line)
+        except Exception:
+            pass
+
+    # Fetch latest statuses from Google Sheets
+    sheet_statuses = {}
+    try:
+        import google_sheets_client as gsc
+        webapp = gsc.resolve_webapp()
+        sheet_statuses = gsc.get_existing_sheet_statuses(webapp)
+    except Exception as e:
+        print(f"  (sync) could not fetch statuses from Google Sheets: {e}")
+
+    # Load progress.json statuses
+    progress_statuses = {}
+    prog_path = os.path.join(BASE, "progress.json")
+    if os.path.exists(prog_path):
+        try:
+            with open(prog_path, encoding="utf-8") as f:
+                prog = json.load(f)
+                for k, v in prog.items():
+                    progress_statuses[k.lower().strip()] = v.get("status") or "not_yet"
+        except Exception:
+            pass
+
+    # Merge and build keywords dict
+    keywords_to_write = {}
+    for kw in keywords_txt_list:
+        kw_lower = kw.lower().strip()
+        if not kw_lower:
+            continue
+            
+        status = "Not Yet"
+        if keyword and keyword.lower().strip() == kw_lower:
+            status = "Done"
+        elif kw_lower in sheet_statuses:
+            status = sheet_statuses[kw_lower]
+        elif kw_lower in progress_statuses:
+            ps = progress_statuses[kw_lower]
+            if ps == "done": status = "Done"
+            elif ps == "pending": status = "Pending"
+            else: status = "Not Yet"
+        elif kw_lower in existing_keywords:
+            status = existing_keywords[kw_lower].get("status") or "Not Yet"
+            
+        last_scraped = ""
+        if keyword and keyword.lower().strip() == kw_lower:
+            last_scraped = current_time
+        elif kw_lower in existing_keywords:
+            last_scraped = existing_keywords[kw_lower].get("last_scraped_at") or ""
+            
+        keywords_to_write[kw_lower] = {
+            "keyword": kw,
+            "status": status,
+            "last_scraped_at": last_scraped
+        }
+        
+    if keyword:
+        kw_lower = keyword.lower().strip()
+        if kw_lower and kw_lower not in keywords_to_write:
+            keywords_to_write[kw_lower] = {
+                "keyword": keyword,
+                "status": "Done",
+                "last_scraped_at": current_time
+            }
+
+    # Merge and build pin_keywords list
+    pin_keywords_to_write = list(existing_pin_keywords)
+    if keyword:
+        existing_pairs = {(pk["pin_id"], pk["keyword"].lower().strip()) for pk in existing_pin_keywords}
+        for p in data["pins"]:
+            pid = p.get("id")
+            if pid and (pid, keyword.lower().strip()) not in existing_pairs:
+                pin_keywords_to_write.append({
+                    "id": f"{pid}_{keyword}",
+                    "pin_id": pid,
+                    "keyword": keyword,
+                    "scraped_at": current_time
+                })
+
+    data["keywords"] = list(keywords_to_write.values())
+    data["pin_keywords"] = pin_keywords_to_write
 
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -322,7 +446,6 @@ def write_sqlite(data):
     for table, pk in _TABLE_PK.items():
         rows = data[table]
         cols = _columns_for(pk, rows)
-        # Ensure 'status' column is present for pinners and boards
         if table in ("pinners", "boards") and "status" not in cols:
             cols.append("status")
             
@@ -335,7 +458,9 @@ def write_sqlite(data):
         def cellval(r, c):
             if c == "status":
                 row_pk = r.get(pk)
-                return r.get("status") or existing_statuses[table].get(row_pk) or "not yet"
+                if table in existing_statuses:
+                    return r.get("status") or existing_statuses[table].get(row_pk) or "not yet"
+                return r.get("status") or "Not Yet"
             v = r.get(c)
             if c in num:
                 return _int(v)
@@ -344,9 +469,11 @@ def write_sqlite(data):
                         [[cellval(r, c) for c in cols] for r in rows])
     for sql in ("CREATE INDEX IF NOT EXISTS idx_boards_owner ON boards(owner_username)",
                 "CREATE INDEX IF NOT EXISTS idx_pins_pinner  ON pins(pinner_username)",
-                "CREATE INDEX IF NOT EXISTS idx_pins_board   ON pins(board_id)"):
+                "CREATE INDEX IF NOT EXISTS idx_pins_board   ON pins(board_id)",
+                "CREATE INDEX IF NOT EXISTS idx_pk_pin       ON pin_keywords(pin_id)",
+                "CREATE INDEX IF NOT EXISTS idx_pk_kw        ON pin_keywords(keyword)"):
         try: con.execute(sql)
-        except Exception: pass            # column may be absent if a table is empty
+        except Exception: pass
     con.commit()
     con.close()
 
@@ -1074,12 +1201,9 @@ def load_from_csv():
 
 # ── live extension cleanup ───────────────────────────────────────────────────
 def brave_running():
-    try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq brave.exe"],
-                             capture_output=True, text=True)
-        return "brave.exe" in (out.stdout or "")
-    except Exception:
-        return False
+    # Always return True so we directly call taskkill (which is fast and non-blocking).
+    # This avoids tasklist which can hang indefinitely in sandboxed Windows environments.
+    return True
 
 def close_brave():
     subprocess.run(["taskkill", "/F", "/IM", "brave.exe"], capture_output=True)
@@ -1164,14 +1288,22 @@ def main():
         except AttributeError:
             pass
     print(f"\n{'='*60}\n  STEP 4 — Build local relational SortPin database\n{'='*60}")
+    
+    # Parse keyword argument
+    keyword_arg = None
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--keyword" and i + 1 < len(args):
+            keyword_arg = args[i + 1]
+
     # Default is disk + archive mode.
     # --csv = only build from local CSV files.
     # --live = open Brave with CDP to pull live data.
-    csv_only = "--csv" in sys.argv[1:]
-    live_mode = "--live" in sys.argv[1:]
+    csv_only = "--csv" in args
+    live_mode = "--live" in args
     disk_mode = not csv_only and not live_mode
 
-    no_csv = "--no-csv" in sys.argv[1:]
+    no_csv = "--no-csv" in args
 
     # 1) Pull the current extension data → save a timestamped CSV snapshot
     #    (preserves it on disk so it survives clearing in step 6 + git-syncs).
@@ -1235,7 +1367,37 @@ def main():
     print("\n  Normalizing into Pinner → Boards → Pins ...")
     data = normalize(leads, boards, pins)
     data = _clean_bytes(data)
-    write_sqlite(data)
+    write_sqlite(data, keyword=keyword_arg)
+    
+    # If a keyword was successfully processed, mark it done in progress.json & Google Sheets
+    if keyword_arg:
+        # A. Update progress.json
+        prog_path = os.path.join(BASE, "progress.json")
+        try:
+            progress = {}
+            if os.path.exists(prog_path):
+                with open(prog_path, encoding="utf-8") as f:
+                    progress = json.load(f)
+            progress[keyword_arg] = {
+                "status": "done",
+                "done_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(prog_path, "w", encoding="utf-8") as f:
+                json.dump(progress, f, indent=2, ensure_ascii=False)
+            print(f"  Marked keyword '{keyword_arg}' done in progress.json")
+        except Exception as e:
+            print(f"  Warning: failed to update progress.json: {e}")
+
+        # B. Update Google Sheet
+        try:
+            import google_sheets_client as gsc
+            cfg = gsc.resolve_webapp()
+            if cfg:
+                gsc.post_webapp(cfg, {"action": "mark", "keywords": [keyword_arg], "status": "Done"})
+                print(f"  Google Sheet updated: marked '{keyword_arg}' Done")
+        except Exception as e:
+            print(f"  Warning: failed to update Google Sheet: {e}")
+            
     write_json(data)
     write_mysql_dump(data)
 
@@ -1300,12 +1462,17 @@ def main():
                 new_bids = [bid for bid in set(_clean(b.get("id")) for b in new_boards_src if b.get("id")) if bid]
                 new_pids = [pid for pid in set(pin_id_from_url(p.get("pin_url"), p.get("id")) for p in new_pins_src if p) if pid]
 
+                new_pin_keywords = []
+                if keyword_arg:
+                    new_pin_keywords = [f"{pid}_{keyword_arg}" for pid in new_pids]
+
                 try:
                     with open(os.path.join(BASE, "new_scraped_ids.json"), "w", encoding="utf-8") as f:
                         json.dump({
                             "pinners": new_usernames,
                             "boards": new_bids,
-                            "pins": new_pids
+                            "pins": new_pids,
+                            "pin_keywords": new_pin_keywords
                         }, f, ensure_ascii=False)
                 except Exception as e:
                     print(f"  ⚠️  Failed to save new_scraped_ids.json: {e}")

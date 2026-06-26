@@ -195,6 +195,26 @@ def run_websites_sync(db_path):
         cat = r[1]
         pinner_categories.setdefault(p_user, set()).add(cat)
         
+    # Fetch site types from scraped_websites if table exists
+    from urllib.parse import urlparse
+    def _extract_domain(url):
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc or parsed.path
+            if domain.startswith("www."):
+                domain = domain[4:]
+            return domain.split(":")[0].lower().strip()
+        except Exception:
+            return ""
+
+    site_types = {}
+    try:
+        for r in con.execute("SELECT domain, site_type FROM scraped_websites WHERE domain IS NOT NULL"):
+            if r[0] and r[1]:
+                site_types[r[0].lower().strip()] = r[1]
+    except Exception:
+        pass
+
     con.close()
 
     if not pinners:
@@ -211,7 +231,7 @@ def run_websites_sync(db_path):
     if not sa_exists and not oauth_exists and not webapp:
         raise RuntimeError("No Google Sheets auth found. Configure google_sheets_webapp.json or service account.")
 
-    # Format the rows to sync: [id, pinterest_link, name, website, scrapped, categories, followers, reach, total_pins, total_boards, scraped_boards, scraped_pins, created_pins, saved_pins]
+    # Format the rows to sync: [id, pinterest_link, name, website, scrapped, categories, followers, reach, total_pins, total_boards, scraped_boards, scraped_pins, created_pins, saved_pins, site_type]
     rows_to_sync = [
         [
             p["username"],
@@ -227,7 +247,8 @@ def run_websites_sync(db_path):
             p["scraped_boards_count"] or 0,
             p["scraped_pins_count"] or 0,
             p["scraped_created_pins_count"] or 0,
-            p["scraped_saved_pins_count"] or 0
+            p["scraped_saved_pins_count"] or 0,
+            site_types.get(_extract_domain(p["website_url"]), "Blog")
         ]
         for p in pinners
     ]
@@ -240,7 +261,7 @@ def run_websites_sync(db_path):
         sh = gc.open_by_key(gsc.SPREADSHEET_ID)
         
         # Check / create 'websites' sheet
-        headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"]
+        headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins", "site_type"]
         try:
             ws = sh.worksheet("websites")
             # If the sheet is empty or lacks the correct header, clear and write headers
@@ -248,10 +269,10 @@ def run_websites_sync(db_path):
             first_cell = first_row[0].strip().lower() if (first_row and len(first_row) > 0 and first_row[0]) else ""
             if first_cell != "id":
                 ws.clear()
-                ws.update("A1:N1", [headers], value_input_option="RAW")
+                ws.update("A1:O1", [headers], value_input_option="RAW")
         except Exception:
             ws = sh.add_worksheet(title="websites", rows="100", cols=str(len(headers)))
-            ws.update("A1:N1", [headers], value_input_option="RAW")
+            ws.update("A1:O1", [headers], value_input_option="RAW")
             
         # Get existing IDs from column A
         existing_ids = set()
@@ -489,6 +510,7 @@ SERVER_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
  <div class="tab on" data-t="pinners">Pinners <b id="c_pinners">·</b></div>
  <div class="tab" data-t="boards">Boards <b id="c_boards">·</b></div>
  <div class="tab" data-t="pins">Pins <b id="c_pins">·</b></div>
+ <div class="tab" data-t="keywords">Keywords <b id="c_keywords">·</b></div>
  <div class="tab" data-t="jobs">Jobs ⏱</div>
  <div class="tab" data-t="insights">Content Lab 💡</div>
  <button id="sync_websites_btn" style="margin-left:auto;background:var(--accent2);border-color:var(--accent2);color:#fff;font-weight:bold;border-radius:20px;padding:6px 16px;">Sync Websites to Sheet 📊</button>
@@ -533,7 +555,14 @@ const SORTS={pinners:[['follower_count','followers'],['np','—'],['profile_reac
  boards:[['pin_count','pins'],['follower_count','followers']],
  pins:[['repin_count','repins'],['saves','saves'],['comment_count','comments']]};
 
-api('/api/stats',{}).then(s=>{c_pinners.textContent=num(s.pinners);c_boards.textContent=num(s.boards);c_pins.textContent=num(s.pins);});
+api('/api/stats',{}).then(s=>{
+  c_pinners.textContent=num(s.pinners);
+  c_boards.textContent=num(s.boards);
+  c_pins.textContent=num(s.pins);
+  if(s.keywords !== undefined && document.getElementById('c_keywords')) {
+    c_keywords.textContent=num(s.keywords);
+  }
+});
 
 function setTab(t){state.t=t;state.off=0;state.q='';q.value='';
  [...document.querySelectorAll('.tab')].forEach(e=>e.classList.toggle('on',e.dataset.t===t));
@@ -541,14 +570,42 @@ function setTab(t){state.t=t;state.off=0;state.q='';q.value='';
  (SORTS[t]||[]).filter(s=>s[1]!=='—').forEach(([k,l])=>{const o=document.createElement('option');o.value=k;o.textContent='Sort: '+l;sel.appendChild(o);});
  state.sort=sel.value||'';
  const ct = document.querySelector('.controls');
- if(t==='jobs' || t==='insights'){
+ if(t==='jobs' || t==='insights' || t==='keywords'){
    ct.style.display = 'none';
  } else {
    ct.style.display = 'flex';
  }
  if(t==='jobs'){ renderJobs(); }
  else if(t==='insights'){ renderInsights(); }
+ else if(t==='keywords'){ renderKeywords(); }
  else { load(); }}
+
+async function renderKeywords(){
+ document.getElementById('page').textContent='';
+ const m=document.getElementById('main');
+ m.innerHTML='<div class="empty">Loading keyword statistics...</div>';
+ try {
+   const d=await api('/api/keywords',{});
+   const rows = d.rows || [];
+   if(!rows.length){
+     m.innerHTML='<div class="empty">No keywords found in the database.</div>';
+     return;
+   }
+   let html='<div class="muted" style="margin-bottom:10px">Keyword statistics and status sync</div>';
+   html+='<div class="tblwrap"><table><thead><tr><th>Keyword</th><th>Status</th><th>Last Scraped At</th><th>Pins Scraped</th></tr></thead><tbody>';
+   html+=rows.map(r=>{
+     let badge = '';
+     if(r.status === 'Done') badge = '<span style="background:#2ecc71;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold">Done</span>';
+     else if(r.status === 'Pending') badge = '<span style="background:#f39c12;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold">Pending</span>';
+     else badge = '<span style="background:#95a5a6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold">Not Yet</span>';
+     return `<tr><td><b>${esc(r.keyword)}</b></td><td>${badge}</td><td>${esc(r.last_scraped_at || '')}</td><td><b>${num(r.pins_count)}</b></td></tr>`;
+   }).join('');
+   html+='</tbody></table></div>';
+   m.innerHTML=html;
+ } catch(e){
+   m.innerHTML=`<div class="empty" style="color:var(--accent)">Error loading keywords: ${esc(e.message||e)}</div>`;
+ }
+}
 
 async function renderJobs(){
  document.getElementById('page').textContent='';
@@ -814,8 +871,25 @@ def make_handler(db_path):
             con = get_db_connection(db_path)
             try:
                 if u.path == "/api/stats":
-                    out = {t: con.execute(f"SELECT COUNT(*) FROM `{t}`").fetchone()[0]
-                           for t in ("pinners", "boards", "pins")}
+                    out = {}
+                    for t in ("pinners", "boards", "pins", "keywords"):
+                        try:
+                            out[t] = con.execute(f"SELECT COUNT(*) FROM `{t}`").fetchone()[0]
+                        except Exception:
+                            out[t] = 0
+                elif u.path == "/api/keywords":
+                    rows = []
+                    try:
+                        rows = con.execute("""
+                            SELECT k.keyword, k.status, k.last_scraped_at, COUNT(pk.pin_id) as pins_count
+                            FROM keywords k
+                            LEFT JOIN pin_keywords pk ON k.keyword = pk.keyword
+                            GROUP BY k.keyword
+                            ORDER BY pins_count DESC, k.keyword ASC
+                        """).fetchall()
+                    except Exception as e:
+                        print(f"Error fetching keyword stats: {e}")
+                    out = {"rows": [dict(r) for r in rows]}
                 elif u.path == "/api/list":
                     t = g("type", "pins")
                     out = (api_list(con, t, g("q"), g("sort"), g("dir", "desc"),

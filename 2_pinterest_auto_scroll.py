@@ -495,6 +495,16 @@ def main():
 
             # ── Result ────────────────────────────────────────────────────
             if result in ("done", "next", "exhausted"):
+                # Close current Selenium session safely before database builder closes Brave
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                
+                # Run database build for this keyword immediately
+                print(f"\n     Running database build and sync for keyword '{kw}'...")
+                subprocess.run([sys.executable, "4_build_database.py", "--no-csv", "--keyword", kw], cwd=BASE)
+                
                 mark_done(progress, kw)
                 done_count += 1
                 label = {"done":      "⏰ Time up",
@@ -502,6 +512,18 @@ def main():
                          "exhausted": "📄 Page end — no more pins"}[result]
                 print(f"\n  ✅ {label}: \"{kw}\"  [{done_count}/{len(all_kws)} done]")
                 pos += 1
+                
+                # If there are more keywords, relaunch Brave & connect Selenium
+                if pos < len(remaining) and s["running"]:
+                    print("\n     Relaunching Brave and reconnecting Selenium for next keyword...")
+                    launch_brave()
+                    time.sleep(2)
+                    try:
+                        driver = connect_selenium()
+                        base_tab = driver.current_window_handle
+                    except Exception as e:
+                        print(f"\n  ERROR reconnecting to Brave: {e}")
+                        break
             elif result == "skip":
                 print(f"\n  ⏭  Skipped (Not Yet): \"{kw}\"")
                 pos += 1

@@ -207,3 +207,29 @@ def choose_backend(webapp):
     if webapp:
         return "webapp"
     return None
+
+
+def get_existing_sheet_statuses(webapp):
+    # Try webapp first
+    if webapp:
+        try:
+            data = post_webapp(webapp, {"action": "get_keywords"})
+            if data.get("ok"):
+                return {item["keyword"].lower(): item["status"] for item in data.get("keywords", []) if item.get("keyword")}
+        except Exception:
+            pass
+            
+    # Try gspread API fallback
+    try:
+        gc, _ = get_gspread_client()
+        if gc:
+            sh = gc.open_by_key(SPREADSHEET_ID)
+            ws = sh.sheet1
+            # Fetch all values
+            vals = ws.get_all_values()
+            if len(vals) > 1:
+                return {row[0].lower().strip(): row[3].strip() for row in vals[1:] if len(row) >= 4 and row[0]}
+    except Exception:
+        pass
+        
+    return {}

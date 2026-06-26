@@ -24,6 +24,7 @@ from google_sheets_client import (
     post_webapp,
     probe_webapp,
     resolve_webapp,
+    get_existing_sheet_statuses,
 )
 
 KEYWORDS_FILE = "keywords.txt"
@@ -64,10 +65,15 @@ def make_trends_url(kw):
     return "https://trends.pinterest.com/search?country=US&query=" + kw.replace(" ", "+")
 
 
-def build_rows(keywords, progress):
+
+def build_rows(keywords, progress, sheet_statuses):
     rows = []
     for kw in keywords:
-        st = STATUS_DONE if progress.get(kw, {}).get("status") == "done" else STATUS_NOT_YET
+        kw_lower = kw.lower()
+        if kw_lower in sheet_statuses:
+            st = sheet_statuses[kw_lower]
+        else:
+            st = STATUS_DONE if progress.get(kw, {}).get("status") == "done" else STATUS_NOT_YET
         rows.append([kw, make_pinterest_url(kw), make_trends_url(kw), st])
     return rows
 
@@ -164,7 +170,12 @@ def main():
 
     keywords = load_keywords()
     progress = load_progress()
-    rows = build_rows(keywords, progress)
+    
+    webapp = resolve_webapp()
+    print("Fetching existing keyword statuses from Google Sheets...")
+    sheet_statuses = get_existing_sheet_statuses(webapp)
+    
+    rows = build_rows(keywords, progress, sheet_statuses)
     total = len(rows)
 
     print(f"\n{'═'*55}")

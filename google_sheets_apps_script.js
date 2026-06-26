@@ -48,6 +48,9 @@ function doPost(e) {
     if (data.action === "claim_websites") {
       return claimWebsites(ss, data.count || 5);
     }
+    if (data.action === "get_keywords") {
+      return getKeywords(sheet);
+    }
 
     return writeColumn(sheet, data);
   } catch (err) {
@@ -175,6 +178,23 @@ function setupKeywords(sheet, rows) {
     sheet.getRange("A1:D" + all.length).setValues(all);
   }
   return jsonOut({ ok: true, action: "setup", count: rows.length });
+}
+
+function getKeywords(sheet) {
+  const last = sheet.getLastRow();
+  if (last < 2) return jsonOut({ ok: true, action: "get_keywords", keywords: [] });
+  const vals = sheet.getRange(2, 1, last - 1, 4).getValues();
+  const list = [];
+  for (let i = 0; i < vals.length; i++) {
+    const kw = (vals[i][0] || "").toString().trim();
+    if (kw) {
+      list.push({
+        keyword: kw,
+        status: (vals[i][3] || "").toString().trim()
+      });
+    }
+  }
+  return jsonOut({ ok: true, action: "get_keywords", keywords: list });
 }
 
 function writeColumn(sheet, data) {

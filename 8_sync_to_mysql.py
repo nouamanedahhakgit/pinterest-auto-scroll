@@ -276,7 +276,9 @@ def main():
     tables_pk = {
         "pinners": "username",
         "boards": "id",
-        "pins": "id"
+        "pins": "id",
+        "keywords": "keyword",
+        "pin_keywords": "id"
     }
 
     # Load new scraped IDs if present (emitted by 4_build_database.py)
@@ -289,7 +291,8 @@ def main():
             p_cnt = len(new_scraped_ids.get("pinners", []))
             b_cnt = len(new_scraped_ids.get("boards", []))
             pin_cnt = len(new_scraped_ids.get("pins", []))
-            print(f"  - Loaded incremental sync filter: {p_cnt} pinners, {b_cnt} boards, {pin_cnt} pins.")
+            pk_cnt = len(new_scraped_ids.get("pin_keywords", []))
+            print(f"  - Loaded incremental sync filter: {p_cnt} pinners, {b_cnt} boards, {pin_cnt} pins, {pk_cnt} pin-keywords.")
         except Exception as e:
             print(f"  - Warning: Failed to load {new_ids_file}: {e}")
 
