@@ -211,47 +211,33 @@ def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_i
 
     print(f"  - Read {len(rows)} rows from local SQLite.")
 
-    # 3. Build UPSERT query for MySQL
-    col_list = ", ".join(f"`{c}`" for c in cols)
-    placeholders = ", ".join(["%s"] * len(cols))
-
-    update_parts = []
-    for c in cols:
-        if c == pk:
-            continue
-        is_numeric = False
-        for col_info in columns_info:
-            if col_info[1] == c and col_info[2] == "INTEGER":
-                is_numeric = True
-                break
-        if is_numeric:
-            update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), 0), `{c}`)")
-        else:
-            update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), ''), `{c}`)")
-
+    # Build simple upsert: last writer wins (VALUES(col) without COALESCE).
+    # COALESCE(NULLIF(VALUES(col), ''), col) forces MySQL to read the existing row
+    # before writing, which acquires a shared lock and causes deadlocks when
+    # multiple computers sync concurrently. Plain VALUES(col) only needs an
+    # exclusive lock on the row being written — no shared read lock needed.
+    update_parts = [f"`{c}`=VALUES(`{c}`)"
+                    for c in cols if c != pk]
     update_clause = ", ".join(update_parts)
 
     upsert_sql = f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders})"
     if update_clause:
         upsert_sql += f" ON DUPLICATE KEY UPDATE {update_clause}"
 
-    # 4. Insert data in small batches of 25 rows to minimize lock hold time
+    # Insert data in small batches of 25 rows to minimise lock hold time.
+    # On persistent lock timeout: SKIP the batch and continue — the rows
+    # will be synced on the next scrape cycle. This prevents one locked table
+    # from blocking the entire multi-computer workflow.
     batch_size = 25
     total_inserted = 0
+    total_skipped = 0
 
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
+        formatted_batch = [[val for val in r] for r in batch]
 
-        # Map SQLite values (None/NULL handling)
-        formatted_batch = []
-        for r in batch:
-            row_vals = []
-            for val in r:
-                row_vals.append(val)
-            formatted_batch.append(row_vals)
-
-        retries = 5
-        for attempt in range(1, retries + 1):
+        max_lock_retries = 2   # short — skip quickly rather than blocking
+        for attempt in range(1, max_lock_retries + 2):
             try:
                 mysql_cursor.executemany(upsert_sql, formatted_batch)
                 mysql_conn.commit()
@@ -261,13 +247,24 @@ def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_i
                 break
             except Exception as err:
                 mysql_conn.rollback()
-                is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
-                if is_lock_timeout and attempt < retries:
-                    print(f"  ⚠️ Lock wait timeout on `{table}` batch (Error: {err}). Retrying in 10 seconds (attempt {attempt}/{retries})...")
-                    time.sleep(10)
+                is_lock_timeout = ("1205" in str(err) or
+                                   (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205))
+                if is_lock_timeout:
+                    if attempt <= max_lock_retries:
+                        wait = 5 * attempt
+                        print(f"  ⚠️ Lock timeout on `{table}` (attempt {attempt}/{max_lock_retries}), retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        # Give up on this batch — skip it, keep going
+                        total_skipped += len(batch)
+                        print(f"  ⚠️ Skipping locked batch in `{table}` ({len(batch)} rows) — will retry on next sync.")
+                        break
                 else:
                     print(f"  Error syncing batch in `{table}`: {err}")
                     break
+
+    if total_skipped:
+        print(f"  ⚠️ `{table}`: {total_inserted} rows synced, {total_skipped} rows skipped (lock contention — will sync next cycle).")
 
 
 def main():
