@@ -39,6 +39,15 @@ function doPost(e) {
     if (data.action === "sync_websites") {
       return syncWebsites(ss, data.rows || []);
     }
+    if (data.action === "get_websites") {
+      return getWebsites(ss);
+    }
+    if (data.action === "update_website") {
+      return updateWebsite(ss, data.website, data.updates);
+    }
+    if (data.action === "claim_websites") {
+      return claimWebsites(ss, data.count || 5);
+    }
 
     return writeColumn(sheet, data);
   } catch (err) {
@@ -70,6 +79,59 @@ function claimKeywords(sheet, n) {
       SpreadsheetApp.flush();
     }
     return jsonOut({ ok: true, action: "claim", claimed: claimed });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Atomically claim up to n websites whose scrapped status is empty or "Not Yet".
+// Sets their scrapped status to "Running" and returns them.
+function claimWebsites(ss, n) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = ss.getSheetByName("websites");
+    if (!sheet) {
+      return jsonOut({ ok: true, action: "claim_websites", claimed: [] });
+    }
+    const last = sheet.getLastRow();
+    if (last < 2) {
+      return jsonOut({ ok: true, action: "claim_websites", claimed: [] });
+    }
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    let webColIdx = -1;
+    let scrapColIdx = -1;
+    for (let j = 0; j < headers.length; j++) {
+      const h = String(headers[j]).trim().toLowerCase();
+      if (h === "website") webColIdx = j;
+      if (h === "scrapped") scrapColIdx = j;
+    }
+    if (webColIdx === -1 || scrapColIdx === -1) {
+      return jsonOut({ ok: false, error: "website or scrapped column not found" });
+    }
+    const vals = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+    const claimed = [];
+    for (let i = 0; i < vals.length && claimed.length < n; i++) {
+      const webUrl = (vals[i][webColIdx] || "").toString().trim();
+      const scrapStatus = (vals[i][scrapColIdx] || "").toString().trim().toLowerCase();
+      if (webUrl && (scrapStatus === "" || scrapStatus === "not yet")) {
+        vals[i][scrapColIdx] = "Running";
+        const obj = { _row: i + 2 };
+        for (let j = 0; j < headers.length; j++) {
+          const h = String(headers[j]).trim().toLowerCase();
+          if (h) {
+            obj[h] = vals[i][j];
+          }
+        }
+        claimed.push(obj);
+      }
+    }
+    if (claimed.length > 0) {
+      const colVal = vals.map(function(r) { return [r[scrapColIdx]]; });
+      sheet.getRange(2, scrapColIdx + 1, vals.length, 1).setValues(colVal);
+      SpreadsheetApp.flush();
+    }
+    return jsonOut({ ok: true, action: "claim_websites", claimed: claimed });
   } finally {
     lock.releaseLock();
   }
@@ -135,7 +197,7 @@ function writeColumn(sheet, data) {
 
 function syncWebsites(ss, rows) {
   let wsSheet = ss.getSheetByName("websites");
-  const headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins"];
+  const headers = ["id", "pinterest_link", "name", "website", "scrapped", "categories", "followers", "reach", "total_pins", "total_boards", "scraped_boards", "scraped_pins", "created_pins", "saved_pins", "site_type"];
   if (!wsSheet) {
     wsSheet = ss.insertSheet("websites");
     wsSheet.appendRow(headers);
@@ -183,6 +245,103 @@ function syncWebsites(ss, rows) {
     SpreadsheetApp.flush();
   }
   return jsonOut({ ok: true, action: "sync_websites", count: newRows.length });
+}
+
+function getWebsites(ss) {
+  let sheet = ss.getSheetByName("websites");
+  if (!sheet) {
+    return jsonOut({ ok: true, websites: [] });
+  }
+  const last = sheet.getLastRow();
+  if (last < 2) {
+    return jsonOut({ ok: true, websites: [] });
+  }
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const values = sheet.getRange(2, 1, last - 1, sheet.getLastColumn()).getValues();
+  const list = [];
+  for (let i = 0; i < values.length; i++) {
+    const obj = { _row: i + 2 };
+    for (let j = 0; j < headers.length; j++) {
+      const h = String(headers[j]).trim().toLowerCase();
+      if (h) {
+        obj[h] = values[i][j];
+      }
+    }
+    list.push(obj);
+  }
+  return jsonOut({ ok: true, websites: list });
+}
+
+function updateWebsite(ss, websiteUrl, updates) {
+  let sheet = ss.getSheetByName("websites");
+  if (!sheet) {
+    return jsonOut({ ok: false, error: "websites sheet not found" });
+  }
+  const last = sheet.getLastRow();
+  if (last < 2) {
+    return jsonOut({ ok: false, error: "no data rows" });
+  }
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const values = sheet.getRange(2, 1, last - 1, sheet.getLastColumn()).getValues();
+  
+  // Find column index for website
+  let webColIdx = -1;
+  for (let j = 0; j < headers.length; j++) {
+    if (String(headers[j]).trim().toLowerCase() === "website") {
+      webColIdx = j;
+      break;
+    }
+  }
+  if (webColIdx === -1) {
+    return jsonOut({ ok: false, error: "website column not found" });
+  }
+  
+  // Clean target URL
+  const target = cleanDomainUrl(websiteUrl);
+  
+  // Search row
+  let rowNum = -1;
+  for (let i = 0; i < values.length; i++) {
+    const val = cleanDomainUrl(values[i][webColIdx]);
+    if (val && val === target) {
+      rowNum = i + 2;
+      break;
+    }
+  }
+  
+  if (rowNum === -1) {
+    return jsonOut({ ok: false, error: "website row not found" });
+  }
+  
+  // Update cells
+  for (const key in updates) {
+    const keyLower = key.trim().toLowerCase();
+    let colIdx = -1;
+    for (let j = 0; j < headers.length; j++) {
+      if (String(headers[j]).trim().toLowerCase() === keyLower) {
+        colIdx = j + 1;
+        break;
+      }
+    }
+    if (colIdx === -1) {
+      // Create new column header dynamically if it doesn't exist
+      const nextCol = sheet.getLastColumn() + 1;
+      sheet.getRange(1, nextCol).setValue(key);
+      headers.push(key);
+      colIdx = nextCol;
+    }
+    sheet.getRange(rowNum, colIdx).setValue(updates[key]);
+  }
+  SpreadsheetApp.flush();
+  return jsonOut({ ok: true, row: rowNum });
+}
+
+function cleanDomainUrl(url) {
+  if (!url) return "";
+  let clean = String(url).trim().toLowerCase();
+  clean = clean.replace(/^(https?:\/\/)?(www\.)?/, "");
+  clean = clean.replace(/\/$/, "");
+  return clean;
 }
 
 function jsonOut(obj) {

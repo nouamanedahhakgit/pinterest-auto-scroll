@@ -10,6 +10,13 @@ sortpin.db
 sortpin_data.json
 IMPORTANT_DATABASE/sortpin.db
 IMPORTANT_DATABASE/sortpin_mysql.sql
+domain_quick_scrape.db
+domain_quick_scrape_data.json
+domain_quick_scrape_viewer.html
+domain_quick_scrape_sites.json
+domain_quick_scrape_api_settings.json
+_DOMAIN_HTML/
+_DOMAIN_QUICK_SCRAPE_API/
 
 # Ignore environment credentials (database passwords)
 .env
@@ -22,3 +29,5 @@ magic_log.jsonl
 # Ignore local CSV snapshots and output folders
 *.csv
 sortpin_output/
+*.json
+

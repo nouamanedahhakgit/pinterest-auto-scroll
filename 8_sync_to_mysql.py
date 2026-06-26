@@ -22,6 +22,7 @@ import sqlite3
 # Load configuration from .env file
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "sortpin.db")
+DQS_DB_PATH = os.path.join(BASE, "domain_quick_scrape.db")  # step 9/10 output
 ENV_PATH = os.path.join(BASE, ".env")
 
 def load_env():
@@ -94,6 +95,162 @@ def execute_with_retry(cursor, conn, sql, params=None, retries=3, delay=5):
             else:
                 raise err
 
+def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_ids):
+    """Syncs one SQLite table to MySQL: creates the table on first run,
+    upserts rows with ON DUPLICATE KEY UPDATE. Used for both sortpin.db's
+    pinners/boards/pins and domain_quick_scrape.db's websites/posts/
+    ad_networks/robots_sitemaps/scan_errors -- same merge-safe logic either
+    way, just with new_scraped_ids=None for the latter (those tables are
+    small, so we always do a full sync instead of incremental filtering)."""
+    sqlite_cursor.execute(f"PRAGMA table_info({table})")
+    columns_info = sqlite_cursor.fetchall()
+
+    if not columns_info:
+        print(f"  Warning: Table '{table}' is empty or does not exist in local SQLite. Skipping.")
+        return
+
+    # 1. Create table in MySQL if it doesn't exist
+    print(f"\nSyncing table '{table}'...")
+    col_defs = []
+    cols = []
+    for col in columns_info:
+        col_name = col[1]
+        col_type = col[2]
+        cols.append(col_name)
+
+        # Map SQLite type to MySQL type
+        if col_type == "INTEGER":
+            mysql_type = "BIGINT"
+        else:
+            # String fields: if primary key, give it a limited VARCHAR length for keys
+            if col_name == pk:
+                mysql_type = "VARCHAR(190)"
+            else:
+                mysql_type = "LONGTEXT"
+
+        col_defs.append(f"`{col_name}` {mysql_type}" + (" PRIMARY KEY" if col_name == pk else ""))
+
+    # Check if table already exists in MySQL
+    mysql_cursor.execute("SHOW TABLES LIKE %s", (table,))
+    table_exists = mysql_cursor.fetchone()
+
+    if not table_exists:
+        print(f"  - Creating table `{table}` in MySQL...")
+        create_sql = f"CREATE TABLE `{table}` (\n  " + ",\n  ".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+        mysql_cursor.execute(create_sql)
+        mysql_conn.commit()
+
+        # Create indexes for performance if they don't exist
+        if table == "boards":
+            try:
+                mysql_cursor.execute("CREATE INDEX idx_boards_owner ON boards(owner_username)")
+                mysql_conn.commit()
+            except Exception:
+                pass
+        elif table == "pins":
+            for idx_name, col_name in [("idx_pins_pinner", "pinner_username"), ("idx_pins_board", "board_id")]:
+                try:
+                    mysql_cursor.execute(f"CREATE INDEX {idx_name} ON pins({col_name})")
+                    mysql_conn.commit()
+                except Exception:
+                    pass
+        elif table == "posts":
+            for idx_name, col_name in [("idx_posts_domain", "domain"), ("idx_posts_downloaded", "downloaded")]:
+                try:
+                    mysql_cursor.execute(f"CREATE INDEX {idx_name} ON posts({col_name})")
+                    mysql_conn.commit()
+                except Exception:
+                    pass
+        elif table in ("ad_networks", "robots_sitemaps", "scan_errors"):
+            try:
+                mysql_cursor.execute(f"CREATE INDEX idx_{table}_domain ON `{table}`(domain)")
+                mysql_conn.commit()
+            except Exception:
+                pass
+
+    # 2. Fetch data from SQLite
+    rows = []
+    if new_scraped_ids and table in new_scraped_ids:
+        target_ids = new_scraped_ids[table]
+        if target_ids:
+            # Chunk to avoid SQLite parameter limit
+            chunk_size = 500
+            for j in range(0, len(target_ids), chunk_size):
+                chunk = target_ids[j:j + chunk_size]
+                placeholders = ", ".join(["?"] * len(chunk))
+                sqlite_cursor.execute(f"SELECT * FROM `{table}` WHERE `{pk}` IN ({placeholders})", chunk)
+                rows.extend(sqlite_cursor.fetchall())
+        else:
+            print(f"  - No new data to sync for `{table}` in this cycle.")
+            return
+    else:
+        sqlite_cursor.execute(f"SELECT * FROM `{table}`")
+        rows = sqlite_cursor.fetchall()
+
+    if not rows:
+        print(f"  - No data to sync for `{table}`.")
+        return
+
+    print(f"  - Read {len(rows)} rows from local SQLite.")
+
+    # 3. Build UPSERT query for MySQL
+    col_list = ", ".join(f"`{c}`" for c in cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+
+    update_parts = []
+    for c in cols:
+        if c == pk:
+            continue
+        is_numeric = False
+        for col_info in columns_info:
+            if col_info[1] == c and col_info[2] == "INTEGER":
+                is_numeric = True
+                break
+        if is_numeric:
+            update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), 0), `{c}`)")
+        else:
+            update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), ''), `{c}`)")
+
+    update_clause = ", ".join(update_parts)
+
+    upsert_sql = f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders})"
+    if update_clause:
+        upsert_sql += f" ON DUPLICATE KEY UPDATE {update_clause}"
+
+    # 4. Insert data in batches of 100 rows to optimize round-trips
+    batch_size = 100
+    total_inserted = 0
+
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+
+        # Map SQLite values (None/NULL handling)
+        formatted_batch = []
+        for r in batch:
+            row_vals = []
+            for val in r:
+                row_vals.append(val)
+            formatted_batch.append(row_vals)
+
+        retries = 3
+        for attempt in range(1, retries + 1):
+            try:
+                mysql_cursor.executemany(upsert_sql, formatted_batch)
+                mysql_conn.commit()
+                total_inserted += len(batch)
+                print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
+                break
+            except Exception as err:
+                mysql_conn.rollback()
+                is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
+                if is_lock_timeout and attempt < retries:
+                    print(f"  ⚠️ Lock wait timeout on `{table}` batch (Error: {err}). Retrying in 5 seconds (attempt {attempt}/{retries})...")
+                    time.sleep(5)
+                else:
+                    print(f"  Error syncing batch in `{table}`: {err}")
+                    break
+
+
 def main():
     import sys
     if sys.platform == "win32":
@@ -139,141 +296,29 @@ def main():
     print("\nStarting Local-to-Cloud Sync...")
 
     for table, pk in tables_pk.items():
-        # Get column definitions from SQLite
-        sqlite_cursor.execute(f"PRAGMA table_info({table})")
-        columns_info = sqlite_cursor.fetchall()
-        
-        if not columns_info:
-            print(f"  Warning: Table '{table}' is empty or does not exist in local SQLite. Skipping.")
-            continue
+        sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_ids)
 
-        # 1. Create table in MySQL if it doesn't exist
-        print(f"\nSyncing table '{table}'...")
-        col_defs = []
-        cols = []
-        for col in columns_info:
-            col_name = col[1]
-            col_type = col[2]
-            cols.append(col_name)
-
-            # Map SQLite type to MySQL type
-            if col_type == "INTEGER":
-                mysql_type = "BIGINT"
-            else:
-                # String fields: if primary key, give it a limited VARCHAR length for keys
-                if col_name == pk:
-                    mysql_type = "VARCHAR(190)"
-                else:
-                    mysql_type = "LONGTEXT"
-
-            col_defs.append(f"`{col_name}` {mysql_type}" + (" PRIMARY KEY" if col_name == pk else ""))
-
-        # Check if table already exists in MySQL
-        mysql_cursor.execute("SHOW TABLES LIKE %s", (table,))
-        table_exists = mysql_cursor.fetchone()
-
-        if not table_exists:
-            print(f"  - Creating table `{table}` in MySQL...")
-            create_sql = f"CREATE TABLE `{table}` (\n  " + ",\n  ".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
-            mysql_cursor.execute(create_sql)
-            mysql_conn.commit()
-
-            # Create indexes for performance if they don't exist
-            if table == "boards":
-                try:
-                    mysql_cursor.execute("CREATE INDEX idx_boards_owner ON boards(owner_username)")
-                    mysql_conn.commit()
-                except Exception:
-                    pass
-            elif table == "pins":
-                for idx_name, col_name in [("idx_pins_pinner", "pinner_username"), ("idx_pins_board", "board_id")]:
-                    try:
-                        mysql_cursor.execute(f"CREATE INDEX {idx_name} ON pins({col_name})")
-                        mysql_conn.commit()
-                    except Exception:
-                        pass
-
-        # 2. Fetch data from SQLite
-        rows = []
-        if new_scraped_ids and table in new_scraped_ids:
-            target_ids = new_scraped_ids[table]
-            if target_ids:
-                # Chunk to avoid SQLite parameter limit
-                chunk_size = 500
-                for j in range(0, len(target_ids), chunk_size):
-                    chunk = target_ids[j:j + chunk_size]
-                    placeholders = ", ".join(["?"] * len(chunk))
-                    sqlite_cursor.execute(f"SELECT * FROM `{table}` WHERE `{pk}` IN ({placeholders})", chunk)
-                    rows.extend(sqlite_cursor.fetchall())
-            else:
-                print(f"  - No new data to sync for `{table}` in this cycle.")
-                continue
-        else:
-            sqlite_cursor.execute(f"SELECT * FROM `{table}`")
-            rows = sqlite_cursor.fetchall()
-
-        if not rows:
-            print(f"  - No data to sync for `{table}`.")
-            continue
-
-        print(f"  - Read {len(rows)} rows from local SQLite.")
-
-        # 3. Build UPSERT query for MySQL
-        col_list = ", ".join(f"`{c}`" for c in cols)
-        placeholders = ", ".join(["%s"] * len(cols))
-        
-        update_parts = []
-        for c in cols:
-            if c == pk:
-                continue
-            is_numeric = False
-            for col_info in columns_info:
-                if col_info[1] == c and col_info[2] == "INTEGER":
-                    is_numeric = True
-                    break
-            if is_numeric:
-                update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), 0), `{c}`)")
-            else:
-                update_parts.append(f"`{c}`=COALESCE(NULLIF(VALUES(`{c}`), ''), `{c}`)")
-                
-        update_clause = ", ".join(update_parts)
-        
-        upsert_sql = f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders})"
-        if update_clause:
-            upsert_sql += f" ON DUPLICATE KEY UPDATE {update_clause}"
-
-        # 4. Insert data in batches of 100 rows to optimize round-trips
-        batch_size = 100
-        total_inserted = 0
-        
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i + batch_size]
-            
-            # Map SQLite values (None/NULL handling)
-            formatted_batch = []
-            for r in batch:
-                row_vals = []
-                for val in r:
-                    row_vals.append(val)
-                formatted_batch.append(row_vals)
-
-            retries = 3
-            for attempt in range(1, retries + 1):
-                try:
-                    mysql_cursor.executemany(upsert_sql, formatted_batch)
-                    mysql_conn.commit()
-                    total_inserted += len(batch)
-                    print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
-                    break
-                except Exception as err:
-                    mysql_conn.rollback()
-                    is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
-                    if is_lock_timeout and attempt < retries:
-                        print(f"  ⚠️ Lock wait timeout on `{table}` batch (Error: {err}). Retrying in 5 seconds (attempt {attempt}/{retries})...")
-                        time.sleep(5)
-                    else:
-                        print(f"  Error syncing batch in `{table}`: {err}")
-                        break
+    # 4b. Sync domain_quick_scrape.db (step 9/10 output) if it exists. These
+    # tables are small (one row per domain/post/ad-network), so we always do
+    # a full sync rather than filtering by new_scraped_ids.
+    if os.path.exists(DQS_DB_PATH):
+        print(f"\nStarting domain_quick_scrape.db sync...")
+        dqs_conn = sqlite3.connect(DQS_DB_PATH)
+        dqs_cursor = dqs_conn.cursor()
+        dqs_tables_pk = {
+            "websites": "domain",
+            "posts": "post_id",
+            "ad_networks": "id",
+            "robots_sitemaps": "id",
+            "scan_errors": "id",
+        }
+        try:
+            for table, pk in dqs_tables_pk.items():
+                sync_table(dqs_cursor, mysql_cursor, mysql_conn, table, pk, None)
+        finally:
+            dqs_conn.close()
+    else:
+        print(f"\n  (Skipping domain_quick_scrape.db sync -- not found yet. Run step 9 first.)")
 
     # 5. Run aggregation updates to organize stats and counts (handling multi-computer merges)
     print("\nOrganizing and recalculating metrics in MySQL (combining data from all workers)...")
