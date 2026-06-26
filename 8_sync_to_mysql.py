@@ -65,10 +65,28 @@ def get_mysql_connection(env):
             charset="utf8mb4",
             collation="utf8mb4_general_ci"
         )
-        # Set session isolation level to READ COMMITTED to disable gap locking and prevent timeouts
         try:
             cursor = con.cursor()
+            # Use READ COMMITTED to prevent gap locking
             cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            # Extend lock wait timeout per session to 120s to survive busy server
+            cursor.execute("SET SESSION innodb_lock_wait_timeout = 120")
+            # Kill any stale SLEEPING connections from the same user that may hold locks
+            killed = 0
+            cursor.execute(
+                "SELECT id FROM information_schema.processlist "
+                "WHERE user = %s AND command = 'Sleep' AND id <> CONNECTION_ID()",
+                (user,)
+            )
+            stale = [row[0] for row in cursor.fetchall()]
+            for conn_id in stale:
+                try:
+                    cursor.execute(f"KILL CONNECTION {conn_id}")
+                    killed += 1
+                except Exception:
+                    pass
+            if killed:
+                print(f"  Killed {killed} stale sleeping MySQL connection(s) to prevent lock contention.")
             cursor.close()
         except Exception:
             pass
@@ -77,7 +95,7 @@ def get_mysql_connection(env):
         print(f"\n  ❌ Failed to connect to MySQL: {e}\n")
         sys.exit(1)
 
-def execute_with_retry(cursor, conn, sql, params=None, retries=3, delay=5):
+def execute_with_retry(cursor, conn, sql, params=None, retries=5, delay=10):
     for attempt in range(1, retries + 1):
         try:
             if params is not None:
@@ -217,8 +235,8 @@ def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_i
     if update_clause:
         upsert_sql += f" ON DUPLICATE KEY UPDATE {update_clause}"
 
-    # 4. Insert data in batches of 100 rows to optimize round-trips
-    batch_size = 100
+    # 4. Insert data in small batches of 25 rows to minimize lock hold time
+    batch_size = 25
     total_inserted = 0
 
     for i in range(0, len(rows), batch_size):
@@ -232,20 +250,21 @@ def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_i
                 row_vals.append(val)
             formatted_batch.append(row_vals)
 
-        retries = 3
+        retries = 5
         for attempt in range(1, retries + 1):
             try:
                 mysql_cursor.executemany(upsert_sql, formatted_batch)
                 mysql_conn.commit()
                 total_inserted += len(batch)
-                print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
+                if total_inserted % 100 == 0 or total_inserted == len(rows):
+                    print(f"  - Synchronized {total_inserted}/{len(rows)} rows...")
                 break
             except Exception as err:
                 mysql_conn.rollback()
                 is_lock_timeout = "1205" in str(err) or (hasattr(err, 'errno') and getattr(err, 'errno', None) == 1205)
                 if is_lock_timeout and attempt < retries:
-                    print(f"  ⚠️ Lock wait timeout on `{table}` batch (Error: {err}). Retrying in 5 seconds (attempt {attempt}/{retries})...")
-                    time.sleep(5)
+                    print(f"  ⚠️ Lock wait timeout on `{table}` batch (Error: {err}). Retrying in 10 seconds (attempt {attempt}/{retries})...")
+                    time.sleep(10)
                 else:
                     print(f"  Error syncing batch in `{table}`: {err}")
                     break
@@ -405,53 +424,71 @@ def main():
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
         else:
-            # Full recalculation fallback
-            print("  - Calculating all board pin counts (Full)...")
-            execute_with_retry(mysql_cursor, mysql_conn, """
-                UPDATE boards b 
-                LEFT JOIN (
-                    SELECT board_id, COUNT(*) as cnt 
-                    FROM pins 
-                    GROUP BY board_id
-                ) p_counts ON b.id = p_counts.board_id
-                SET b.pin_count = COALESCE(p_counts.cnt, 0)
-            """)
+            # Full recalculation — process in chunks of 500 to avoid long lock holds
+            chunk_size = 500
 
-            print("  - Calculating all pinner board counts (Full)...")
-            execute_with_retry(mysql_cursor, mysql_conn, """
-                UPDATE pinners p
-                LEFT JOIN (
-                    SELECT owner_username, COUNT(*) as cnt
-                    FROM boards
-                    GROUP BY owner_username
-                ) b_counts ON p.username = b_counts.owner_username
-                SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
-            """)
+            # Board pin counts
+            print("  - Calculating all board pin counts (chunked)...")
+            mysql_cursor.execute("SELECT id FROM boards")
+            all_board_ids = [row[0] for row in mysql_cursor.fetchall()]
+            for j in range(0, len(all_board_ids), chunk_size):
+                chunk = all_board_ids[j:j + chunk_size]
+                placeholders = ", ".join(["%s"] * len(chunk))
+                execute_with_retry(mysql_cursor, mysql_conn, f"""
+                    UPDATE boards b
+                    LEFT JOIN (
+                        SELECT board_id, COUNT(*) as cnt
+                        FROM pins
+                        WHERE board_id IN ({placeholders})
+                        GROUP BY board_id
+                    ) p_counts ON b.id = p_counts.board_id
+                    SET b.pin_count = COALESCE(p_counts.cnt, 0)
+                    WHERE b.id IN ({placeholders})
+                """, chunk + chunk)
 
-            print("  - Calculating all pinner pin counts (Full)...")
-            execute_with_retry(mysql_cursor, mysql_conn, """
-                UPDATE pinners p
-                LEFT JOIN (
-                    SELECT pinner_username, COUNT(*) as cnt
-                    FROM pins
-                    GROUP BY pinner_username
-                ) p_counts ON p.username = p_counts.pinner_username
-                SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
-            """)
-
-            print("  - Calculating all pinner created vs saved pin counts (Full)...")
-            execute_with_retry(mysql_cursor, mysql_conn, """
-                UPDATE pinners p
-                LEFT JOIN (
-                    SELECT pinner_username,
-                           SUM(CASE WHEN pin_type = 'created' THEN 1 ELSE 0 END) as created_cnt,
-                           SUM(CASE WHEN pin_type = 'saved' THEN 1 ELSE 0 END) as saved_cnt
-                    FROM pins
-                    GROUP BY pinner_username
-                ) p_counts ON p.username = p_counts.pinner_username
-                SET p.scraped_created_pins_count = COALESCE(p_counts.created_cnt, 0),
-                    p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
-            """)
+            # Pinner board + pin counts
+            print("  - Calculating all pinner board/pin counts (chunked)...")
+            mysql_cursor.execute("SELECT username FROM pinners")
+            all_pinners = [row[0] for row in mysql_cursor.fetchall()]
+            for j in range(0, len(all_pinners), chunk_size):
+                chunk = all_pinners[j:j + chunk_size]
+                placeholders = ", ".join(["%s"] * len(chunk))
+                execute_with_retry(mysql_cursor, mysql_conn, f"""
+                    UPDATE pinners p
+                    LEFT JOIN (
+                        SELECT owner_username, COUNT(*) as cnt
+                        FROM boards
+                        WHERE owner_username IN ({placeholders})
+                        GROUP BY owner_username
+                    ) b_counts ON p.username = b_counts.owner_username
+                    SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
+                    WHERE p.username IN ({placeholders})
+                """, chunk + chunk)
+                execute_with_retry(mysql_cursor, mysql_conn, f"""
+                    UPDATE pinners p
+                    LEFT JOIN (
+                        SELECT pinner_username, COUNT(*) as cnt
+                        FROM pins
+                        WHERE pinner_username IN ({placeholders})
+                        GROUP BY pinner_username
+                    ) p_counts ON p.username = p_counts.pinner_username
+                    SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
+                    WHERE p.username IN ({placeholders})
+                """, chunk + chunk)
+                execute_with_retry(mysql_cursor, mysql_conn, f"""
+                    UPDATE pinners p
+                    LEFT JOIN (
+                        SELECT pinner_username,
+                               SUM(CASE WHEN pin_type = 'created' THEN 1 ELSE 0 END) as created_cnt,
+                               SUM(CASE WHEN pin_type = 'saved' THEN 1 ELSE 0 END) as saved_cnt
+                        FROM pins
+                        WHERE pinner_username IN ({placeholders})
+                        GROUP BY pinner_username
+                    ) p_counts ON p.username = p_counts.pinner_username
+                    SET p.scraped_created_pins_count = COALESCE(p_counts.created_cnt, 0),
+                        p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
+                    WHERE p.username IN ({placeholders})
+                """, chunk + chunk)
             
         print("  Metric calculations updated successfully.")
         
