@@ -216,6 +216,8 @@ def sync_table(sqlite_cursor, mysql_cursor, mysql_conn, table, pk, new_scraped_i
     # before writing, which acquires a shared lock and causes deadlocks when
     # multiple computers sync concurrently. Plain VALUES(col) only needs an
     # exclusive lock on the row being written — no shared read lock needed.
+    col_list = ", ".join(f"`{c}`" for c in cols)
+    placeholders = ", ".join(["%s"] * len(cols))
     update_parts = [f"`{c}`=VALUES(`{c}`)"
                     for c in cols if c != pk]
     update_clause = ", ".join(update_parts)
