@@ -487,7 +487,18 @@ STORE_DOMAINS = [
     "linktr.ee",
     "t.co",
     "github.com",
-    "google.com"
+    "google.com",
+    # Streaming / music / media platforms
+    "spotify.com", "open.spotify.com", "soundcloud.com", "deezer.com", "tidal.com",
+    "apple.com", "music.apple.com", "podcasts.apple.com",
+    "netflix.com", "hulu.com", "disneyplus.com", "hbomax.com", "peacocktv.com",
+    "twitch.tv", "vimeo.com", "dailymotion.com",
+    # Other social / community platforms
+    "reddit.com", "tumblr.com", "quora.com", "medium.com", "substack.com",
+    "snapchat.com", "threads.net", "mastodon.social", "bsky.app",
+    "discord.com", "discord.gg", "slack.com", "telegram.org", "t.me",
+    # Arts / education / schools
+    "arts.ac.uk",
 ]
 
 def classify_site_type(domain: str, is_wordpress: bool, post_count: int, tech_stack: str = "") -> str:
@@ -529,6 +540,8 @@ LINK_IN_BIO_DOMAINS = [
     "later.com", "linkinbio.com", "snipfeed.co", "tap.bio", "lnk.bio",
     "milkshake.app", "mysites.io", "palm.me", "shor.by", "stan.store",
     "contact.me", "solo.to", "carrd.co", "about.me", "bento.me",
+    "liinks.co", "hoo.be", "linkpop.com", "flo.ink", "shorby.com",
+    "jemi.so", "withkoji.com", "bit.ly", "rebrand.ly", "short.io",
 ]
 
 def is_marketplace_or_social(domain: str) -> bool:
@@ -543,13 +556,14 @@ def is_marketplace_or_social(domain: str) -> bool:
             return True
     return False
 
-def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
+def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str]:
     """
     Check if the URL is blocked by Cloudflare, Captcha, or access restriction.
-    Returns (is_blocked, reason)
+    Returns (is_blocked, reason, homepage_html)
+    homepage_html is the raw response text on success, empty string on block/error.
     """
     import requests
-    
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -558,7 +572,7 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
         "Cache-Control": "max-age=0",
         "Upgrade-Insecure-Requests": "1"
     }
-    
+
     r = None
     # Try curl_cffi first to bypass Cloudflare/Captcha blocks if installed
     try:
@@ -572,30 +586,30 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
         try:
             r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         except requests.exceptions.Timeout:
-            return True, "Connection Timeout"
+            return True, "Connection Timeout", ""
         except requests.exceptions.RequestException as e:
-            return True, f"Connection Failed: {str(e)}"
-    
+            return True, f"Connection Failed: {str(e)}", ""
+
     try:
         # Check HTTP status codes commonly used for blocking
         if r.status_code in (403, 429, 503):
             text_lower = r.text.lower()
             if "cloudflare" in text_lower:
-                return True, "Cloudflare Block"
+                return True, "Cloudflare Block", ""
             elif "captcha" in text_lower or "recaptcha" in text_lower or "hcaptcha" in text_lower:
-                return True, "Captcha Block"
+                return True, "Captcha Block", ""
             elif "access denied" in text_lower or "permission denied" in text_lower:
-                return True, "Access Denied"
+                return True, "Access Denied", ""
             else:
-                return True, f"HTTP Blocked ({r.status_code})"
-                
+                return True, f"HTTP Blocked ({r.status_code})", ""
+
         # Even on 200, it could show a Cloudflare challenge page or Captcha page
         if r.status_code == 200:
             text_lower = r.text.lower()
             content_len = len(r.text)
             # Real Cloudflare challenge pages are short and have specific markers
             if content_len < 30000 and "cloudflare" in text_lower and ("challenge" in text_lower or "enable javascript" in text_lower or "checking your browser" in text_lower):
-                return True, "Cloudflare Challenge"
+                return True, "Cloudflare Challenge", ""
             # Real captcha CHALLENGE pages are short (<15KB) and have specific
             # blocking phrases. Normal sites often include reCAPTCHA scripts for
             # contact forms or have "captcha" in JS bundle names — those are NOT blocks.
@@ -611,11 +625,41 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
                     "security check",
                 ]
                 if any(phrase in text_lower for phrase in challenge_phrases):
-                    return True, "Captcha Challenge Page"
-                
-        return False, ""
+                    return True, "Captcha Challenge Page", ""
+
+        return False, "", r.text
     except Exception as e:
-        return True, f"Parsing Block Page Failed: {str(e)}"
+        return True, f"Parsing Block Page Failed: {str(e)}", ""
+
+
+# Definitive HTML fingerprints for store platforms — zero false-positives on blogs
+_STORE_HTML_PATTERNS = [
+    ("cdn.shopify.com/s/files",  "Shopify Store"),
+    ("cdn.shopify.com/shopifycloud", "Shopify Store"),
+    ("/cdn/shop/",               "Shopify Store"),
+    ("shopify-section",          "Shopify Store"),
+    ("Shopify.theme",            "Shopify Store"),
+    ("x-shopify-stage",          "Shopify Store"),
+    ("cdn11.bigcommerce.com",    "BigCommerce Store"),
+    ("bigcommerce.com/s/",       "BigCommerce Store"),
+    ("cdn.bigcommerce.com",      "BigCommerce Store"),
+    ("wcsstore/",                "IBM WebSphere Store"),
+    ("magento/theme",            "Magento Store"),
+    ("mage/",                    "Magento Store"),
+]
+
+def _quick_detect_store(domain: str, html: str) -> str | None:
+    """
+    Scan the homepage HTML for definitive store fingerprints.
+    Returns a site_type string like 'Shopify Store' if matched, else None.
+    Only returns non-None when we are 100% certain it is NOT a blog.
+    """
+    if not html:
+        return None
+    for pattern, label in _STORE_HTML_PATTERNS:
+        if pattern in html:
+            return label
+    return None
 
 def extract_domain(url: str) -> str:
     parsed = urlparse(url)
@@ -834,8 +878,8 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
         if use_lock:
             db_write_lock.release()
 
-    # Check for Captcha/Cloudflare blocks
-    is_blocked, block_reason = check_for_blocks(site["url"], log_cb)
+    # Check for Captcha/Cloudflare blocks (also returns homepage HTML for reuse)
+    is_blocked, block_reason, homepage_html = check_for_blocks(site["url"], log_cb)
     if is_blocked:
         log_cb(f"Blocked by security system: {block_reason}")
         result = {
@@ -917,6 +961,68 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                 db_write_lock.release()
             
         return result
+
+    # ── Quick non-blog detection from homepage HTML ────────────────────────────
+    # We already fetched the homepage in check_for_blocks — reuse it.
+    # If the HTML reveals a definitive store platform, skip the full scrape now.
+    quick_store_type = _quick_detect_store(domain, homepage_html)
+    if quick_store_type:
+        log_cb(f"Homepage HTML identified as {quick_store_type} — skipping full scrape")
+        result = {
+            "url": site["url"], "is_wordpress": False, "posts": [],
+            "site_info": {
+                "name": f"{quick_store_type}",
+                "description": f"Detected as {quick_store_type.lower()} from homepage.",
+                "stack": {"cms": quick_store_type}, "stack_summary": quick_store_type
+            }
+        }
+        write_json(os.path.join(RESULTS_DIR, f"{safe_folder(domain)}.json"), result)
+        db = get_db_connection()
+        use_lock = not db.is_mysql
+        if use_lock:
+            db_write_lock.acquire()
+        try:
+            init_bulk_tables(db)
+            cat_name = "General & Other"
+            db.execute(
+                "INSERT INTO scraped_categories (name) VALUES (?) ON DUPLICATE KEY UPDATE name=name" if db.is_mysql else
+                "INSERT OR IGNORE INTO scraped_categories (name) VALUES (?)", [cat_name]
+            )
+            db.commit()
+            cur_cat = db.execute("SELECT id FROM scraped_categories WHERE name = ?", [cat_name])
+            cat_row = cur_cat.fetchone()
+            category_id = cat_row["id"] if cat_row else None
+            now_ts = db_now()
+            db.execute(
+                """
+                INSERT INTO scraped_websites
+                (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'done', 0, ?, ?)
+                ON DUPLICATE KEY UPDATE url=VALUES(url), title=VALUES(title), description=VALUES(description),
+                    cms=VALUES(cms), tech_stack=VALUES(tech_stack), status='done',
+                    post_count=0, last_scraped_at=VALUES(last_scraped_at), site_type=VALUES(site_type)
+                """ if db.is_mysql else
+                """
+                INSERT OR REPLACE INTO scraped_websites
+                (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'done', 0, ?, ?)
+                """,
+                [domain, site["url"], quick_store_type, f"Detected as {quick_store_type.lower()} from homepage.",
+                 quick_store_type, quick_store_type, category_id, now_ts, "Store"]
+            )
+            db.commit()
+            log_cb(f"Syncing quick-detect results to Google Sheets Row...")
+            update_website_in_sheets(site["url"], {
+                "scrapped": "Yes", "name": quick_store_type,
+                "categories": "General & Other", "scraped_pins": 0, "site_type": "Store"
+            })
+            log_cb(f"Database and Google Sheets updated — {quick_store_type}, skipped.")
+        finally:
+            db.close()
+            if use_lock:
+                db_write_lock.release()
+        return result
+    # ──────────────────────────────────────────────────────────────────────────
 
     ai_client = None
     if provider in ("groq", "openrouter"):
