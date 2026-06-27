@@ -503,16 +503,32 @@ STORE_DOMAINS = [
     "discord.com", "discord.gg", "slack.com", "telegram.org", "t.me",
     # Arts / education / schools
     "arts.ac.uk",
+    # Creator shopping / affiliate platforms (NOT blogs)
+    "shopmy.us", "shopltk.com", "ltk.com", "liketoknowit.com", "shopstyle.com",
+    "rewardstyle.com", "rstyle.me", "collage.com", "collshp.com",
+    "benable.com", "direct.me",
+    # Photo / portfolio / visual platforms
+    "vsco.co", "behance.net", "dribbble.com", "flickr.com", "500px.com",
+    "unsplash.com", "pexels.com", "pixabay.com",
+    # URL shorteners (never blogs)
+    "bit.ly", "cutt.ly", "tinyurl.com", "ow.ly", "buff.ly", "rb.gy",
+    "walmrt.us", "amzn.to", "amzn.eu",
+    # Web-app / firestore / hosting (never content sites)
+    "web.app", "firebaseapp.com", "pages.dev", "netlify.app", "vercel.app",
 ]
 
 def classify_site_type(domain: str, is_wordpress: bool, post_count: int, tech_stack: str = "") -> str:
     domain = domain.lower()
 
-    # 1. Social Media check
+    # 1. Social Media / blog-platform check
     social_domains = [
         "pinterest.com", "pinterest.fr", "pinterest.de", "pinterest.co.uk",
         "instagram.com", "facebook.com", "youtube.com", "youtu.be",
-        "twitter.com", "x.com", "tiktok.com", "linktr.ee", "t.co", "github.com", "google.com"
+        "twitter.com", "x.com", "tiktok.com", "linktr.ee", "t.co", "github.com", "google.com",
+        # Blog / community platforms — subdomains ARE user blogs, not stores
+        "tumblr.com", "medium.com", "substack.com", "blogspot.com", "blogger.com",
+        "wordpress.com", "weebly.com", "wixsite.com", "squarespace.com",
+        "reddit.com", "quora.com",
     ]
     for social in social_domains:
         if domain == social or domain.endswith("." + social):
@@ -1530,11 +1546,12 @@ def run_bulk_scrape_job(run_all: bool) -> None:
                     ).fetchall()
                 )
                 db.close()
-                before = len(target_sites)
-                target_sites = [s for s in target_sites if extract_domain(s['url']) not in done_domains]
-                skipped_dupes = before - len(target_sites)
-                if skipped_dupes:
-                    log(f"Skipped {skipped_dupes} already-done domain(s) (duplicate sheet rows).")
+                already_done = [s for s in target_sites if extract_domain(s['url']) in done_domains]
+                target_sites  = [s for s in target_sites if extract_domain(s['url']) not in done_domains]
+                if already_done:
+                    log(f"Skipped {len(already_done)} already-done domain(s) — marking 'Yes' in Sheets.")
+                    for _s in already_done:
+                        _sheets_update_async(_s['url'], {"scrapped": "Yes"})
             except Exception as _ded_err:
                 log(f"Warning: deduplication check failed: {_ded_err}")
 
@@ -1759,6 +1776,83 @@ def reset_running_sites() -> int:
     return total
 
 
+def fix_missing_site_types() -> int:
+    """
+    For every row in scraped_websites with a blank/null site_type,
+    derive the type from the domain pattern alone (no HTTP request needed)
+    and update DB + Google Sheets.
+    """
+    db = get_db_connection()
+    try:
+        init_bulk_tables(db)
+        rows = db.execute(
+            "SELECT domain, url, cms, tech_stack, post_count FROM scraped_websites "
+            "WHERE site_type IS NULL OR site_type = '' OR site_type = 'General Website'"
+        ).fetchall()
+    except Exception as e:
+        print(f"  DB error: {e}")
+        db.close()
+        return 0
+
+    if not rows:
+        print("  All rows already have a site_type — nothing to fix.")
+        db.close()
+        return 0
+
+    print(f"  Found {len(rows)} row(s) with missing/generic site_type. Fixing…\n")
+    fixed = 0
+    sheets_batch = []   # (url, new_type) — only rows that actually changed
+
+    for r in rows:
+        domain    = r['domain']
+        cms       = str(r.get('cms') or '')
+        tech      = str(r.get('tech_stack') or '')
+        posts     = int(r.get('post_count') or 0)
+        is_wp     = 'wordpress' in cms.lower() or 'wordpress' in tech.lower()
+        site_type = classify_site_type(domain, is_wp, posts, tech)
+
+        # Skip rows that would still be "General Website" — no real change
+        if site_type == "General Website":
+            continue
+
+        try:
+            db.execute(
+                "UPDATE scraped_websites SET site_type = ? WHERE domain = ?",
+                [site_type, domain]
+            )
+            url = r.get('url') or f"https://{domain}"
+            sheets_batch.append((url, site_type))
+            print(f"    {domain}  →  {site_type}")
+            fixed += 1
+        except Exception as e:
+            print(f"    ✗ {domain}: {e}")
+
+    db.commit()
+    db.close()
+
+    # Update Sheets in small batches of 5 with a 2-second gap to avoid rate limiting
+    if sheets_batch:
+        print(f"\n  Updating {len(sheets_batch)} Sheets row(s) in small batches…")
+        import time as _time
+        chunk = 5
+        for i in range(0, len(sheets_batch), chunk):
+            group = sheets_batch[i:i + chunk]
+            threads = [
+                _threading.Thread(
+                    target=lambda u=url, t=st: update_website_in_sheets(u, {"site_type": t}),
+                    daemon=True
+                )
+                for url, st in group
+            ]
+            for t in threads: t.start()
+            for t in threads: t.join(timeout=30)
+            if i + chunk < len(sheets_batch):
+                _time.sleep(2)
+
+    print(f"\n  Done — {fixed} site_type(s) updated (skipped 'General Website' — no change).")
+    return fixed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Standalone Local API for Domain Quick Scrape.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1767,6 +1861,8 @@ def main() -> int:
     parser.add_argument("--runjobforall", action="store_true", help="Bulk scan all domains listed in Google Sheets and exit")
     parser.add_argument("--reset-running", action="store_true",
                         help="Reset all 'Running' sites to 'Not Yet' in DB and Google Sheets, then exit")
+    parser.add_argument("--fix-site-types", action="store_true",
+                        help="Backfill missing/generic site_type in DB and Sheets, then exit")
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -1775,6 +1871,12 @@ def main() -> int:
     if args.reset_running:
         print("=== Reset Running Sites ===")
         reset_running_sites()
+        return 0
+
+    # Backfill missing site_type
+    if args.fix_site_types:
+        print("=== Fix Missing site_type ===")
+        fix_missing_site_types()
         return 0
 
     # Run in CLI Mode
