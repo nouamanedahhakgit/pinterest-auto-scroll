@@ -1696,16 +1696,84 @@ def api_bulk_history():
 
 # ─── Main CLI / Server Entry ──────────────────────────────────────────────────
 
+def reset_running_sites() -> int:
+    """
+    Find every site stuck at status='running' in the DB, reset it to 'not_yet'
+    in the DB, and update Google Sheets to 'Not Yet' so it can be reclaimed.
+    Returns the number of sites reset.
+    """
+    db = get_db_connection()
+    try:
+        init_bulk_tables(db)
+        rows = db.execute(
+            "SELECT domain, url FROM scraped_websites WHERE status = 'running'"
+        ).fetchall()
+    except Exception as e:
+        print(f"  DB error reading running sites: {e}")
+        db.close()
+        return 0
+
+    if not rows:
+        print("  No 'Running' sites found in database — nothing to reset.")
+        db.close()
+        return 0
+
+    print(f"  Found {len(rows)} site(s) stuck at 'Running'. Resetting…\n")
+    reset_count = 0
+    sheets_threads = []
+    for r in rows:
+        domain = r['domain']
+        url = r.get('url') or f"https://{domain}"
+        try:
+            db.execute(
+                "UPDATE scraped_websites SET status = 'not_yet' WHERE domain = ?",
+                [domain]
+            )
+            print(f"    ✓ DB reset: {domain}")
+        except Exception as e:
+            print(f"    ✗ DB error for {domain}: {e}")
+            continue
+
+        # Reset Google Sheets row in a thread so we don't wait for each one
+        def _sheet_reset(u=url, d=domain):
+            ok = update_website_in_sheets(u, {"scrapped": "Not Yet"})
+            status = "✓" if ok else "✗ (sheet update failed)"
+            print(f"    {status} Sheets reset: {d}")
+        t = _threading.Thread(target=_sheet_reset, daemon=True)
+        t.start()
+        sheets_threads.append(t)
+        reset_count += 1
+
+    db.commit()
+    db.close()
+
+    # Wait for all sheet updates to finish (max 90 s)
+    print(f"\n  Waiting for Google Sheets updates…")
+    for t in sheets_threads:
+        t.join(timeout=90)
+
+    print(f"\n  Done — {reset_count} site(s) reset to 'Not Yet' in DB and Google Sheets.")
+    return reset_count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Standalone Local API for Domain Quick Scrape.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--run", action="store_true", help="Bulk scan pending domains listed in Google Sheets and exit")
     parser.add_argument("--runjobforall", action="store_true", help="Bulk scan all domains listed in Google Sheets and exit")
+    parser.add_argument("--reset-running", action="store_true",
+                        help="Reset all 'Running' sites to 'Not Yet' in DB and Google Sheets, then exit")
     args = parser.parse_args()
-    
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    
+
+    # Reset stuck Running sites and exit
+    if args.reset_running:
+        print("=== Reset Running Sites ===")
+        reset_running_sites()
+        return 0
+
     # Run in CLI Mode
     if args.run or args.runjobforall:
         print(f"Starting Bulk Scraper CLI Mode (run_all={args.runjobforall})...")
