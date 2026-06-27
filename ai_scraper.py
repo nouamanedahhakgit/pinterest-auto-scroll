@@ -2405,9 +2405,9 @@ def _hc_next_page(soup, current_url: str):
 
 def _html_crawl_categories(base_url: str, progress_cb=None,
                             already_seen: set = None,
-                            max_categories: int = 400,
-                            max_pages_per_cat: int = 25,
-                            max_total: int = 60_000,
+                            max_categories: int = 30,
+                            max_pages_per_cat: int = 3,
+                            max_total: int = 1500,
                             cancel_check=None) -> list:
     """
     Full HTML BFS category crawler.
@@ -2893,10 +2893,15 @@ def discover_posts_sitemap_rss(base_url: str, progress_cb=None) -> dict:
     # ── 2. HTML category BFS crawler (always runs, fills gaps) ────────────────
     if progress_cb:
         progress_cb("🕷 Starting HTML category crawler (nav → categories → articles)…")
+    # Tighter limits if we already found posts in sitemap
+    max_cats = 5 if len(seen_urls) >= 10 else 30
+    max_pages = 2 if len(seen_urls) >= 10 else 3
     html_entries = _html_crawl_categories(
         base_url,
         progress_cb=progress_cb,
         already_seen=set(seen_urls),   # pass a copy so crawler can track its own additions
+        max_categories=max_cats,
+        max_pages_per_cat=max_pages,
     )
     html_added = 0
     for entry in html_entries:
@@ -3128,10 +3133,15 @@ def crawl_site_with_ai(
     # ── 2b. HTML category BFS crawler (always runs — fills gaps left by sitemaps) ─
     if progress_cb:
         progress_cb("🕷 HTML category crawler starting (nav → categories → subcategories → articles)…")
+    # Tighter limits if sitemap was rich
+    max_cats = 5 if (sitemap_rich or len(seen_urls) >= 10) else 30
+    max_pages = 2 if (sitemap_rich or len(seen_urls) >= 10) else 3
     html_entries = _html_crawl_categories(
         base_url,
         progress_cb=progress_cb,
         already_seen=set(seen_urls),
+        max_categories=max_cats,
+        max_pages_per_cat=max_pages,
         cancel_check=cancel_check,
     )
     html_added = 0
