@@ -492,7 +492,7 @@ STORE_DOMAINS = [
 
 def classify_site_type(domain: str, is_wordpress: bool, post_count: int, tech_stack: str = "") -> str:
     domain = domain.lower()
-    
+
     # 1. Social Media check
     social_domains = [
         "pinterest.com", "pinterest.fr", "pinterest.de", "pinterest.co.uk",
@@ -502,37 +502,43 @@ def classify_site_type(domain: str, is_wordpress: bool, post_count: int, tech_st
     for social in social_domains:
         if domain == social or domain.endswith("." + social):
             return "Social Media"
-            
-    # 2. Known store domains
+
+    # 2. Link-in-bio services
+    for lib in LINK_IN_BIO_DOMAINS:
+        if domain == lib or domain.endswith("." + lib):
+            return "Link-in-Bio"
+
+    # 3. Known store domains
     for store in STORE_DOMAINS:
         if domain == store or domain.endswith("." + store):
             return "Store"
-            
-    # 3. Check tech stack
+
+    # 4. Check tech stack
     tech_lower = (tech_stack or "").lower()
     if any(k in tech_lower for k in ["woocommerce", "shopify", "magento", "prestashop", "bigcommerce", "opencart", "squarespace store", "wix store"]):
         return "Store"
-        
-    # 4. Check wordpress / post_count
+
+    # 5. Check wordpress / post_count
     if is_wordpress or post_count > 0:
         return "Blog"
-        
+
     return "General Website"
+
+LINK_IN_BIO_DOMAINS = [
+    "msha.ke", "beacons.ai", "bio.link", "campsite.bio", "koji.to",
+    "later.com", "linkinbio.com", "snipfeed.co", "tap.bio", "lnk.bio",
+    "milkshake.app", "mysites.io", "palm.me", "shor.by", "stan.store",
+    "contact.me", "solo.to", "carrd.co", "about.me", "bento.me",
+]
 
 def is_marketplace_or_social(domain: str) -> bool:
     domain = domain.lower()
-    fast_track_list = [
-        "etsy.com", "etsy.me", "amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de",
-        "amazon.fr", "amazon.it", "amazon.es", "amazon.co.jp", "amazon.in",
-        "ebay.com", "ebay.co.uk", "ebay.ca", "ebay.com.au", "aliexpress.com", "alibaba.com",
-        "pinterest.com", "pinterest.fr", "pinterest.de", "pinterest.co.uk",
-        "instagram.com", "facebook.com", "youtube.com", "youtu.be",
-        "twitter.com", "x.com", "tiktok.com", "linktr.ee", "t.co", "github.com", "google.com",
-        "patreon.com", "subscribestar.com", "gumroad.com", "redbubble.com", "zazzle.com",
-        "teespring.com", "spreadshirt.com", "society6.com", "cafepress.com", "poshmark.com",
-        "depop.com", "mercari.com", "vinted.com"
-    ]
-    for p in fast_track_list:
+    # Check STORE_DOMAINS (covers myshopify.com subdomains, etsy, amazon, etc.)
+    for p in STORE_DOMAINS:
+        if domain == p or domain.endswith("." + p):
+            return True
+    # Check link-in-bio services
+    for p in LINK_IN_BIO_DOMAINS:
         if domain == p or domain.endswith("." + p):
             return True
     return False
