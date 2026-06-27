@@ -248,8 +248,12 @@ def get_db_connection():
 
     import sqlite3
     sqlite_path = os.path.join(BASE, "sortpin.db")
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")       # concurrent readers + writer
+    conn.execute("PRAGMA synchronous=NORMAL")     # safe but faster than FULL
+    conn.execute("PRAGMA cache_size=-65536")      # 64 MB page cache
+    conn.execute("PRAGMA temp_store=MEMORY")
     return DBWrapper(is_mysql=False, conn=conn)
 
 # ─── Table Auto-Initialization ────────────────────────────────────────────────
@@ -757,6 +761,17 @@ def update_website_in_sheets(website_url: str, updates: dict) -> bool:
         print(f"  Error updating website {website_url} in Google Sheets: {e}")
     return False
 
+import threading as _threading
+
+def _sheets_update_async(url: str, updates: dict):
+    """Fire-and-forget Google Sheets update — never blocks the scan worker."""
+    def _do():
+        try:
+            update_website_in_sheets(url, updates)
+        except Exception:
+            pass
+    _threading.Thread(target=_do, daemon=True).start()
+
 # ─── Scraper Core & Post Comparison ───────────────────────────────────────────
 
 def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dict:
@@ -841,14 +856,14 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                 "scraped_pins": 0,
                 "site_type": site_type
             }
-            update_website_in_sheets(site["url"], sheet_updates)
+            _sheets_update_async(site["url"], sheet_updates)
             log_cb(f"Database and Google Sheets updated successfully.")
         finally:
             db.close()
             if use_lock:
                 db_write_lock.release()
         return result
- 
+
     # Immediately set status to 'Running' in Google Sheets and Database for crash recovery
     log_cb(f"Setting site status to 'Running'...")
     update_website_in_sheets(site["url"], {"scrapped": "Running"})
@@ -914,6 +929,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             cat_row = cur_cat.fetchone()
             category_id = cat_row["id"] if cat_row else None
             
+            blocked_site_type = classify_site_type(domain, False, 0)
             # Check if domain exists to preserve other columns
             cur = db.execute("SELECT domain FROM scraped_websites WHERE domain = ?", [domain])
             if cur.fetchone():
@@ -923,7 +939,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                     SET url = ?, title = ?, description = ?, cms = ?, tech_stack = ?, category_id = ?, status = 'blocked', post_count = 0, last_scraped_at = ?, site_type = ?
                     WHERE domain = ?
                     """,
-                    [site["url"], "Blocked Site", f"Access blocked: {block_reason}", "Unknown", "Blocked", category_id, db_now(), "General Website", domain]
+                    [site["url"], "Blocked Site", f"Access blocked: {block_reason}", "Unknown", "Blocked", category_id, db_now(), blocked_site_type, domain]
                 )
             else:
                 db.execute(
@@ -932,7 +948,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                     (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'blocked', 0, ?, ?)
                     """,
-                    [domain, site["url"], "Blocked Site", f"Access blocked: {block_reason}", "Unknown", "Blocked", category_id, db_now(), "General Website"]
+                    [domain, site["url"], "Blocked Site", f"Access blocked: {block_reason}", "Unknown", "Blocked", category_id, db_now(), blocked_site_type]
                 )
             
             db.execute(
@@ -945,15 +961,16 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             )
             db.commit()
             
+            blocked_site_type = classify_site_type(domain, False, 0)
             log_cb(f"Syncing blocked status to Google Sheets Row...")
             sheet_updates = {
                 "scrapped": f"Blocked ({block_reason})",
                 "name": "Blocked Site",
                 "categories": "General & Other",
                 "scraped_pins": 0,
-                "site_type": "General Website"
+                "site_type": blocked_site_type
             }
-            update_website_in_sheets(site["url"], sheet_updates)
+            _sheets_update_async(site["url"], sheet_updates)
             log_cb(f"Database and Google Sheets updated with blocked status.")
         finally:
             db.close()
@@ -1012,7 +1029,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             )
             db.commit()
             log_cb(f"Syncing quick-detect results to Google Sheets Row...")
-            update_website_in_sheets(site["url"], {
+            _sheets_update_async(site["url"], {
                 "scrapped": "Yes", "name": quick_store_type,
                 "categories": "General & Other", "scraped_pins": 0, "site_type": "Store"
             })
@@ -1210,7 +1227,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             "scraped_pins": len(posts_scraped),
             "site_type": site_type
         }
-        update_website_in_sheets(site["url"], sheet_updates)
+        _sheets_update_async(site["url"], sheet_updates)
         log_cb(f"Database and Google Sheets updated successfully. Added {added_count} posts, removed {removed_count} posts.")
         
     finally:
@@ -1307,7 +1324,7 @@ def run_ai_categorization(log_cb: Any) -> None:
                         log_cb(f"  Domain '{domain}' -> classified as '{cat_name}'")
                         
                         full_url = f"https://{domain}"
-                        update_website_in_sheets(full_url, {"categories": cat_name})
+                        _sheets_update_async(full_url, {"categories": cat_name})
                         
             except Exception as e:
                 log_cb(f"  Error processing batch: {e}")
@@ -1401,7 +1418,7 @@ def run_bulk_scrape_job(run_all: bool) -> None:
                 if use_lock:
                     db_write_lock.release()
             try:
-                update_website_in_sheets(site_info["url"], {"scrapped": f"Failed ({str(e)[:50]})"})
+                _sheets_update_async(site_info["url"], {"scrapped": f"Failed ({str(e)[:50]})"})
             except Exception as sheet_err:
                 site_log(f"Warning: Failed to set failed status in sheets: {sheet_err}")
             
@@ -1438,11 +1455,36 @@ def run_bulk_scrape_job(run_all: bool) -> None:
             target_sites = valid_sites
             log(f"Bulk Run: Scanning all {len(target_sites)} websites.")
         else:
-            # Check local/remote DB for crashed/running crawls
-            resumed_sites = []
+            # ── Stale-running cleanup: sites stuck >3 h are crashes, not active scans ──
             db = get_db_connection()
             try:
                 init_bulk_tables(db)
+                stale_q = (
+                    "SELECT domain, url FROM scraped_websites WHERE status = 'running' AND last_scraped_at < DATE_SUB(NOW(), INTERVAL 3 HOUR)"
+                    if db.is_mysql else
+                    "SELECT domain, url FROM scraped_websites WHERE status = 'running' AND datetime(last_scraped_at) < datetime('now', '-3 hours')"
+                )
+                stale_rows = db.execute(stale_q).fetchall()
+                if stale_rows:
+                    stale_domains = [r['domain'] for r in stale_rows]
+                    log(f"Resetting {len(stale_rows)} stale 'Running' site(s) that crashed >3 h ago: {stale_domains}")
+                    for r in stale_rows:
+                        try:
+                            db.execute("UPDATE scraped_websites SET status='failed' WHERE domain=?", [r['domain']])
+                            # Reset Google Sheets row so it can be reclaimed
+                            _sheets_update_async(r.get('url') or f"https://{r['domain']}", {"scrapped": "Not Yet"})
+                        except Exception:
+                            pass
+                    db.commit()
+            except Exception as e:
+                log(f"Warning: Stale-running cleanup failed: {e}")
+            finally:
+                db.close()
+
+            # Check local/remote DB for recently-crashed/running crawls (< 3 h old = genuine resume)
+            resumed_sites = []
+            db = get_db_connection()
+            try:
                 cur = db.execute("SELECT domain, url FROM scraped_websites WHERE status = 'running'")
                 rows = cur.fetchall()
                 for row in rows:
@@ -1478,6 +1520,24 @@ def run_bulk_scrape_job(run_all: bool) -> None:
                     log("No new websites could be claimed from Google Sheets.")
 
             target_sites = resumed_sites + claimed_sites
+
+            # Deduplicate: drop domains already finished in DB (prevents re-scanning on duplicate sheet rows)
+            try:
+                db = get_db_connection()
+                done_domains = set(
+                    r['domain'] for r in db.execute(
+                        "SELECT domain FROM scraped_websites WHERE status IN ('done','blocked')"
+                    ).fetchall()
+                )
+                db.close()
+                before = len(target_sites)
+                target_sites = [s for s in target_sites if extract_domain(s['url']) not in done_domains]
+                skipped_dupes = before - len(target_sites)
+                if skipped_dupes:
+                    log(f"Skipped {skipped_dupes} already-done domain(s) (duplicate sheet rows).")
+            except Exception as _ded_err:
+                log(f"Warning: deduplication check failed: {_ded_err}")
+
             if not target_sites:
                 log("No pending or resumed websites to scan. Bulk job finished.")
                 break

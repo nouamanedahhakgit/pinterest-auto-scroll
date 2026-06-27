@@ -2203,6 +2203,31 @@ def _fetch_sitemap_urls(
 
         _hub_queue: list = []   # category pages to crawl one level deeper
 
+        # ── Parallel HTML sitemap probing: fetch all paths simultaneously ─────
+        # Build list of paths not already attempted via XML sitemap pass
+        _hs_to_probe = [bu + p for p in _HTML_SITEMAP_PATHS if (bu + p) not in seen_cand]
+        for _u in _hs_to_probe:
+            seen_cand.add(_u)
+
+        _hs_responses: dict = {}   # url → response object or None
+        if _hs_to_probe:
+            from concurrent.futures import ThreadPoolExecutor as _HSTP, as_completed as _hs_asc
+
+            def _probe_one(url):
+                try:
+                    return url, _html_fetch(url)
+                except Exception:
+                    return url, None
+
+            with _HSTP(max_workers=min(len(_hs_to_probe), 8)) as _hsex:
+                for _fut in _hs_asc({_hsex.submit(_probe_one, u): u for u in _hs_to_probe}):
+                    try:
+                        _u, _resp = _fut.result()
+                        _hs_responses[_u] = _resp
+                    except Exception:
+                        pass
+
+        # Process responses in original path order (so priority is preserved)
         for _hs_path in _HTML_SITEMAP_PATHS:
             if cancel_check and cancel_check():
                 if progress_cb:
@@ -2212,23 +2237,22 @@ def _fetch_sitemap_urls(
                     )
                 raise ScrapeCancelled(list(post_urls), dict(cat_names))
             _hs_url = bu + _hs_path
-            if _hs_url in seen_cand:
+            _r = _hs_responses.get(_hs_url)
+            if _r is None:
                 continue
-            seen_cand.add(_hs_url)
             try:
-                if progress_cb:
-                    progress_cb(f"📄 Trying HTML sitemap: {_hs_url}")
-                _r = _html_fetch(_hs_url)
                 if _r.status_code != 200 or not _r.text:
                     continue
-                _final_url = _r.url or _hs_url
+                _final_url = getattr(_r, "url", None) or _hs_url
                 _low = _r.text.lower()
                 if "<urlset" in _low or "<sitemapindex" in _low:
                     continue
                 if "<a " not in _low:
                     if progress_cb:
-                        progress_cb(f"📄   → no links (JS-rendered or empty)")
+                        progress_cb(f"📄 {_hs_url}   → no links (JS-rendered or empty)")
                     continue
+                if progress_cb:
+                    progress_cb(f"📄 Trying HTML sitemap: {_hs_url}")
                 _content, _hubs = _extract_links_from_html(_r.text, _final_url)
                 _added = 0
                 for _norm, _entry in _content:
