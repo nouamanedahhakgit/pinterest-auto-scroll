@@ -123,6 +123,21 @@ class DBWrapper:
         self.is_mysql = is_mysql
         self.conn = conn
 
+    def _reconnect(self):
+        """Reconnect MySQL if the connection was lost."""
+        if self.is_mysql:
+            try:
+                self.conn.reconnect(attempts=3, delay=2)
+                try:
+                    cursor = self.conn.cursor()
+                    cursor.execute("SET SESSION net_read_timeout = 600")
+                    cursor.execute("SET SESSION net_write_timeout = 600")
+                    cursor.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     def execute(self, sql, params=None):
         if params is None:
             params = []
@@ -131,9 +146,18 @@ class DBWrapper:
             
         if self.is_mysql:
             sql_translated = sql.replace('?', '%s')
-            cursor = self.conn.cursor(buffered=True)
-            cursor.execute(sql_translated, params)
-            return CursorWrapper(cursor, is_mysql=True)
+            try:
+                cursor = self.conn.cursor(buffered=True)
+                cursor.execute(sql_translated, params)
+                return CursorWrapper(cursor, is_mysql=True)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "lost connection" in err_str or "gone away" in err_str or "2013" in err_str or "2006" in err_str:
+                    self._reconnect()
+                    cursor = self.conn.cursor(buffered=True)
+                    cursor.execute(sql_translated, params)
+                    return CursorWrapper(cursor, is_mysql=True)
+                raise
         else:
             cursor = self.conn.cursor()
             cursor.execute(sql, params)
@@ -144,9 +168,18 @@ class DBWrapper:
             return None
         if self.is_mysql:
             sql_translated = sql.replace('?', '%s')
-            cursor = self.conn.cursor()
-            cursor.executemany(sql_translated, params_list)
-            return CursorWrapper(cursor, is_mysql=True)
+            try:
+                cursor = self.conn.cursor()
+                cursor.executemany(sql_translated, params_list)
+                return CursorWrapper(cursor, is_mysql=True)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "lost connection" in err_str or "gone away" in err_str or "2013" in err_str or "2006" in err_str:
+                    self._reconnect()
+                    cursor = self.conn.cursor()
+                    cursor.executemany(sql_translated, params_list)
+                    return CursorWrapper(cursor, is_mysql=True)
+                raise
         else:
             cursor = self.conn.cursor()
             cursor.executemany(sql, params_list)
@@ -196,11 +229,16 @@ def get_db_connection():
                 password=mysql_password,
                 charset="utf8mb4",
                 collation="utf8mb4_general_ci",
-                autocommit=True
+                autocommit=True,
+                connection_timeout=30,
+                pool_reset_session=False
             )
             try:
                 cursor = conn.cursor()
                 cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                cursor.execute("SET SESSION net_read_timeout = 600")
+                cursor.execute("SET SESSION net_write_timeout = 600")
+                cursor.execute("SET SESSION wait_timeout = 28800")
                 cursor.close()
             except Exception:
                 pass
@@ -956,7 +994,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                 
         # Batch execute updates
         if update_data:
-            chunk_size = 1000
+            chunk_size = 500
             for idx in range(0, len(update_data), chunk_size):
                 db.executemany(
                     """
@@ -970,7 +1008,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                 
         # Batch execute inserts
         if insert_data:
-            chunk_size = 1000
+            chunk_size = 500
             for idx in range(0, len(insert_data), chunk_size):
                 db.executemany(
                     """
@@ -990,7 +1028,7 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                 removed_count += 1
                 
         if removed_data:
-            chunk_size = 1000
+            chunk_size = 500
             for idx in range(0, len(removed_data), chunk_size):
                 db.executemany(
                     "UPDATE scraped_posts SET status = 'removed', last_seen_at = ? WHERE id = ?",
