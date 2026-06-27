@@ -51,6 +51,9 @@ function doPost(e) {
     if (data.action === "reset_running_websites") {
       return resetRunningWebsites(ss);
     }
+    if (data.action === "batch_update_websites") {
+      return batchUpdateWebsites(ss, data.updates || []);
+    }
     if (data.action === "get_keywords") {
       return getKeywords(sheet);
     }
@@ -364,6 +367,61 @@ function updateWebsite(ss, websiteUrl, updates) {
   }
   SpreadsheetApp.flush();
   return jsonOut({ ok: true, row: rowNum });
+}
+
+// Update multiple website rows in one call — avoids per-row rate limiting.
+// data.updates = [{website: url, fields: {scrapped: "Yes", site_type: "Blog", ...}}, ...]
+function batchUpdateWebsites(ss, updates) {
+  if (!updates || updates.length === 0) return jsonOut({ ok: true, updated: 0 });
+  const sheet = ss.getSheetByName("websites");
+  if (!sheet) return jsonOut({ ok: false, error: "websites sheet not found" });
+  const last = sheet.getLastRow();
+  if (last < 2) return jsonOut({ ok: true, updated: 0 });
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const headerMap = {};
+  let webColIdx = -1;
+  for (let j = 0; j < headers.length; j++) {
+    const h = String(headers[j]).trim().toLowerCase();
+    headerMap[h] = j;
+    if (h === "website") webColIdx = j;
+  }
+  if (webColIdx === -1) return jsonOut({ ok: false, error: "website column not found" });
+
+  const vals = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+
+  // Build reverse index: cleaned domain → [row indexes]
+  const urlToRows = {};
+  for (let i = 0; i < vals.length; i++) {
+    const key = cleanDomainUrl(String(vals[i][webColIdx] || ""));
+    if (key) {
+      if (!urlToRows[key]) urlToRows[key] = [];
+      urlToRows[key].push(i);
+    }
+  }
+
+  let updated = 0;
+  for (let u = 0; u < updates.length; u++) {
+    const target = cleanDomainUrl(String(updates[u].website || ""));
+    const fields = updates[u].fields || {};
+    const rowIdxs = urlToRows[target] || [];
+    for (let r = 0; r < rowIdxs.length; r++) {
+      const i = rowIdxs[r];
+      for (const key in fields) {
+        const colIdx = headerMap[key.trim().toLowerCase()];
+        if (colIdx !== undefined) {
+          vals[i][colIdx] = fields[key];
+          updated++;
+        }
+      }
+    }
+  }
+
+  if (updated > 0) {
+    sheet.getRange(2, 1, vals.length, headers.length).setValues(vals);
+    SpreadsheetApp.flush();
+  }
+  return jsonOut({ ok: true, updated: updated });
 }
 
 // Reset ALL rows whose scrapped column starts with "Running" → "Not Yet".

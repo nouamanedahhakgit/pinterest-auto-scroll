@@ -779,6 +779,20 @@ def update_website_in_sheets(website_url: str, updates: dict) -> bool:
 
 import threading as _threading
 
+def _batch_mark_yes_in_sheets(urls: list):
+    """Mark multiple URLs as scrapped='Yes' in one Apps Script call (avoids rate limiting)."""
+    cfg = load_webapp_config()
+    if not cfg or not urls:
+        return
+    updates = [{"website": u, "fields": {"scrapped": "Yes"}} for u in urls]
+    try:
+        r = requests.post(cfg["url"], json={"action": "batch_update_websites",
+                                            "secret": cfg.get("secret", "pinterest-scan-2026"),
+                                            "updates": updates}, timeout=60)
+        r.raise_for_status()
+    except Exception:
+        pass  # non-critical — DB is already authoritative
+
 def _sheets_update_async(url: str, updates: dict):
     """Fire-and-forget Google Sheets update — never blocks the scan worker."""
     def _do():
@@ -1442,6 +1456,7 @@ def run_bulk_scrape_job(run_all: bool) -> None:
             bulk_job["scanned_sites"] += 1
 
     first_iteration = True
+    _empty_batches = 0   # consecutive batches where all claimed sites were already done
     while True:
         with bulk_lock:
             if bulk_job["cancel"]:
@@ -1550,14 +1565,28 @@ def run_bulk_scrape_job(run_all: bool) -> None:
                 target_sites  = [s for s in target_sites if extract_domain(s['url']) not in done_domains]
                 if already_done:
                     log(f"Skipped {len(already_done)} already-done domain(s) — marking 'Yes' in Sheets.")
-                    for _s in already_done:
-                        _sheets_update_async(_s['url'], {"scrapped": "Yes"})
+                    # One batch call instead of N async calls — avoids Sheets rate limiting
+                    _threading.Thread(
+                        target=_batch_mark_yes_in_sheets,
+                        args=([s['url'] for s in already_done],),
+                        daemon=True
+                    ).start()
             except Exception as _ded_err:
                 log(f"Warning: deduplication check failed: {_ded_err}")
 
             if not target_sites:
-                log("No pending or resumed websites to scan. Bulk job finished.")
-                break
+                if not claimed_sites and not resumed_sites:
+                    # Sheet returned nothing at all — truly finished
+                    log("No pending or resumed websites to scan. Bulk job finished.")
+                    break
+                # We claimed sites but all were already done in DB
+                _empty_batches += 1
+                if _empty_batches >= 20:
+                    log("20 consecutive batches with no new sites — sheet appears exhausted. Stopping.")
+                    break
+                log(f"All claimed sites already done (#{_empty_batches}/20) — retrying next batch...")
+                continue
+            _empty_batches = 0  # reset when we actually have work to do
 
             log(f"Bulk Batch: Scanning {len(target_sites)} website(s) ({len(resumed_sites)} resumed, {len(claimed_sites)} newly claimed).")
 
