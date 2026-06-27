@@ -1698,35 +1698,42 @@ def api_bulk_history():
 
 def reset_running_sites() -> int:
     """
-    Two-pass reset:
-      Pass 1 — Scan Google Sheets directly: reset every row whose 'scrapped'
-               column contains 'Running' (catches rows where the DB was already
-               updated to 'failed' but the Sheets write timed out).
-      Pass 2 — Scan DB: reset every row with status IN ('running','failed')
-               that wasn't already covered by pass 1.
-    Both DB and Sheets are updated to 'not_yet' / 'Not Yet'.
+    1. Calls the Apps Script reset_running_websites action — single HTTP call
+       that scans the sheet once and resets all 'Running' rows to 'Not Yet'.
+    2. Resets DB rows with status IN ('running','failed') to 'not_yet'.
     """
-    to_reset: dict = {}   # domain → url
-
-    # ── Pass 1: scan Google Sheets for any row still showing "Running" ─────────
-    print("  Scanning Google Sheets for 'Running' rows…")
-    try:
-        sheet_sites = get_websites_from_sheets()
-        for s in sheet_sites:
-            scrapped = str(s.get("scrapped") or "").strip()
-            if scrapped.lower() == "running" or scrapped.lower().startswith("running"):
-                url = normalize_url(s.get("website") or s.get("url") or "")
-                if url:
-                    dom = extract_domain(url)
+    # ── Step 1: batch-reset Google Sheets via single Apps Script call ──────────
+    print("  Calling Apps Script to batch-reset all 'Running' rows in Google Sheets…")
+    sheets_reset = 0
+    sheet_domains: set = set()
+    cfg = load_webapp_config()
+    if not cfg:
+        print("  Warning: google_sheets_webapp.json not configured — Sheets step skipped.")
+    else:
+        try:
+            r = requests.post(
+                cfg["url"],
+                json={"action": "reset_running_websites",
+                      "secret": cfg.get("secret", "pinterest-scan-2026")},
+                timeout=120
+            )
+            data = r.json()
+            if data.get("ok"):
+                sheets_reset = data.get("reset", 0)
+                for raw_url in (data.get("domains") or []):
+                    dom = extract_domain(normalize_url(raw_url))
                     if dom:
-                        to_reset[dom] = url
-        print(f"  Google Sheets: found {len(to_reset)} 'Running' row(s).")
-    except Exception as e:
-        print(f"  Warning: could not read Google Sheets: {e}")
+                        sheet_domains.add(dom)
+                print(f"  Google Sheets: reset {sheets_reset} 'Running' row(s) to 'Not Yet'.")
+            else:
+                print(f"  Sheets error: {data.get('error')}")
+        except Exception as e:
+            print(f"  Sheets call failed: {e}")
 
-    # ── Pass 2: scan DB for status = 'running' or 'failed' ────────────────────
+    # ── Step 2: reset DB ────────────────────────────────────────────────────────
     print("  Scanning database for 'running'/'failed' rows…")
     db = get_db_connection()
+    db_reset = 0
     try:
         init_bulk_tables(db)
         db_rows = db.execute(
@@ -1734,64 +1741,22 @@ def reset_running_sites() -> int:
         ).fetchall()
         for r in db_rows:
             dom = r['domain']
-            if dom not in to_reset:
-                to_reset[dom] = r.get('url') or f"https://{dom}"
-        print(f"  Database: found {len(db_rows)} 'running'/'failed' row(s).")
-    except Exception as e:
-        print(f"  DB error reading running/failed sites: {e}")
-    finally:
-        db.close()
-
-    if not to_reset:
-        print("  Nothing to reset — all clear.")
-        return 0
-
-    print(f"\n  Resetting {len(to_reset)} site(s)…\n")
-
-    # ── Reset DB ───────────────────────────────────────────────────────────────
-    db = get_db_connection()
-    db_reset = 0
-    try:
-        for dom in to_reset:
             try:
-                db.execute(
-                    "UPDATE scraped_websites SET status='not_yet' WHERE domain=?", [dom]
-                )
+                db.execute("UPDATE scraped_websites SET status='not_yet' WHERE domain=?", [dom])
                 db_reset += 1
                 print(f"    ✓ DB: {dom}")
             except Exception as e:
                 print(f"    ✗ DB error for {dom}: {e}")
         db.commit()
+        print(f"  Database: reset {db_reset} row(s).")
+    except Exception as e:
+        print(f"  DB error: {e}")
     finally:
         db.close()
 
-    # ── Reset Google Sheets (parallel threads, one per row) ───────────────────
-    print(f"\n  Updating Google Sheets ({len(to_reset)} rows) — running in parallel…")
-    threads = []
-    results = {}
-
-    def _sheet_reset(dom, url):
-        ok = update_website_in_sheets(url, {"scrapped": "Not Yet"})
-        results[dom] = ok
-        mark = "✓" if ok else "✗ (failed)"
-        print(f"    {mark} Sheets: {dom}")
-
-    for dom, url in to_reset.items():
-        t = _threading.Thread(target=_sheet_reset, args=(dom, url), daemon=True)
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join(timeout=120)
-
-    sheets_ok = sum(1 for v in results.values() if v)
-    sheets_fail = len(results) - sheets_ok
-
-    print(f"\n  Done.")
-    print(f"    DB reset:     {db_reset}/{len(to_reset)}")
-    print(f"    Sheets reset: {sheets_ok}/{len(to_reset)}" +
-          (f"  ({sheets_fail} failed — check webapp URL)" if sheets_fail else ""))
-    return len(to_reset)
+    total = max(sheets_reset, db_reset)
+    print(f"\n  Done — {sheets_reset} Sheets row(s) + {db_reset} DB row(s) reset to 'Not Yet'.")
+    return total
 
 
 def main() -> int:

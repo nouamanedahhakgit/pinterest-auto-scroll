@@ -48,6 +48,9 @@ function doPost(e) {
     if (data.action === "claim_websites") {
       return claimWebsites(ss, data.count || 5);
     }
+    if (data.action === "reset_running_websites") {
+      return resetRunningWebsites(ss);
+    }
     if (data.action === "get_keywords") {
       return getKeywords(sheet);
     }
@@ -361,6 +364,51 @@ function updateWebsite(ss, websiteUrl, updates) {
   }
   SpreadsheetApp.flush();
   return jsonOut({ ok: true, row: rowNum });
+}
+
+// Reset ALL rows whose scrapped column starts with "Running" → "Not Yet".
+// Single call, single sheet scan — never times out like 278 individual updates.
+function resetRunningWebsites(ss) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = ss.getSheetByName("websites");
+    if (!sheet) return jsonOut({ ok: false, error: "websites sheet not found" });
+    const last = sheet.getLastRow();
+    if (last < 2) return jsonOut({ ok: true, reset: 0, domains: [] });
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    let scrapColIdx = -1;
+    let webColIdx   = -1;
+    for (let j = 0; j < headers.length; j++) {
+      const h = String(headers[j]).trim().toLowerCase();
+      if (h === "scrapped") scrapColIdx = j;
+      if (h === "website")  webColIdx   = j;
+    }
+    if (scrapColIdx === -1) return jsonOut({ ok: false, error: "scrapped column not found" });
+
+    const vals = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+    const resetDomains = [];
+    for (let i = 0; i < vals.length; i++) {
+      const scrap = String(vals[i][scrapColIdx] || "").trim().toLowerCase();
+      if (scrap === "running" || scrap.indexOf("running") === 0) {
+        vals[i][scrapColIdx] = "Not Yet";
+        if (webColIdx >= 0) {
+          resetDomains.push(String(vals[i][webColIdx] || "").trim());
+        }
+      }
+    }
+
+    if (resetDomains.length > 0) {
+      sheet.getRange(2, scrapColIdx + 1, vals.length, 1)
+           .setValues(vals.map(function(r) { return [r[scrapColIdx]]; }));
+      SpreadsheetApp.flush();
+    }
+
+    return jsonOut({ ok: true, reset: resetDomains.length, domains: resetDomains });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function cleanDomainUrl(url) {
