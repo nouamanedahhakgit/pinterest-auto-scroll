@@ -779,6 +779,19 @@ def update_website_in_sheets(website_url: str, updates: dict) -> bool:
 
 import threading as _threading
 
+def _batch_update_sheets_raw(updates: list):
+    """Send a list of {website, fields} updates to Apps Script in one call."""
+    cfg = load_webapp_config()
+    if not cfg or not updates:
+        return
+    try:
+        r = requests.post(cfg["url"], json={"action": "batch_update_websites",
+                                            "secret": cfg.get("secret", "pinterest-scan-2026"),
+                                            "updates": updates}, timeout=60)
+        r.raise_for_status()
+    except Exception:
+        pass
+
 def _batch_mark_yes_in_sheets(urls: list):
     """Mark multiple URLs as scrapped='Yes' in one Apps Script call (avoids rate limiting)."""
     cfg = load_webapp_config()
@@ -1555,20 +1568,27 @@ def run_bulk_scrape_job(run_all: bool) -> None:
             # Deduplicate: drop domains already finished in DB (prevents re-scanning on duplicate sheet rows)
             try:
                 db = get_db_connection()
-                done_domains = set(
-                    r['domain'] for r in db.execute(
-                        "SELECT domain FROM scraped_websites WHERE status IN ('done','blocked')"
-                    ).fetchall()
-                )
+                done_rows = db.execute(
+                    "SELECT domain, site_type FROM scraped_websites WHERE status IN ('done','blocked')"
+                ).fetchall()
                 db.close()
+                done_domain_map = {r['domain']: (r['site_type'] or '') for r in done_rows}
+                done_domains    = set(done_domain_map.keys())
                 already_done = [s for s in target_sites if extract_domain(s['url']) in done_domains]
                 target_sites  = [s for s in target_sites if extract_domain(s['url']) not in done_domains]
                 if already_done:
-                    log(f"Skipped {len(already_done)} already-done domain(s) — marking 'Yes' in Sheets.")
-                    # One batch call instead of N async calls — avoids Sheets rate limiting
+                    log(f"Skipped {len(already_done)} already-done domain(s) — marking 'Yes' + site_type in Sheets.")
+                    # Build updates with site_type from DB so Sheets column is also filled
+                    dedup_updates = []
+                    for _s in already_done:
+                        _dom = extract_domain(_s['url'])
+                        _st  = done_domain_map.get(_dom, '')
+                        _fields = {"scrapped": "Yes"}
+                        if _st:
+                            _fields["site_type"] = _st
+                        dedup_updates.append({"website": _s['url'], "fields": _fields})
                     _threading.Thread(
-                        target=_batch_mark_yes_in_sheets,
-                        args=([s['url'] for s in already_done],),
+                        target=lambda u=dedup_updates: _batch_update_sheets_raw(u),
                         daemon=True
                     ).start()
             except Exception as _ded_err:
@@ -1882,6 +1902,231 @@ def fix_missing_site_types() -> int:
     return fixed
 
 
+def _quick_blog_check(url: str) -> str:
+    """
+    Fetch one homepage and classify using HTML byte patterns only — no AI.
+    Returns: 'Blog' | 'Store' | 'General Website'
+    """
+    try:
+        try:
+            from curl_cffi import requests as _cr
+            resp = _cr.get(url, timeout=12, impersonate="chrome110", allow_redirects=True)
+            html = resp.content
+        except ImportError:
+            resp = requests.get(url, timeout=12, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            }, allow_redirects=True)
+            html = resp.content
+
+        h = html.lower()
+
+        # ── WordPress (strongest blog signal) ──────────────────────────────
+        if any(p in h for p in [b'wp-content/', b'wp-includes/', b'wp-json',
+                                  b'api.w.org', b'wordpress']):
+            return "Blog"
+
+        # ── RSS / Atom feed link ───────────────────────────────────────────
+        if b'application/rss+xml' in h or b'application/atom+xml' in h:
+            return "Blog"
+
+        # ── Schema.org BlogPosting ─────────────────────────────────────────
+        if b'blogposting' in h or b'"@type":"blog"' in h or b'"@type": "blog"' in h:
+            return "Blog"
+
+        # ── Ghost CMS ─────────────────────────────────────────────────────
+        if b'ghost.io' in h or b'content="ghost"' in h:
+            return "Blog"
+
+        # ── Blogger / Blogspot ─────────────────────────────────────────────
+        if b'blogger.com/static' in h or b'blogspot.com' in h:
+            return "Blog"
+
+        # ── Store signals not caught by earlier layers ──────────────────────
+        if any(p in h for p in [b'cdn.shopify.com', b'shopify.theme',
+                                  b'bigcommerce.com', b'woocommerce',
+                                  b'"add-to-cart"', b'add to cart']):
+            return "Store"
+
+        return "General Website"
+    except Exception:
+        return "General Website"
+
+
+def recheck_blogs() -> int:
+    """
+    Fast re-classification of 'General Website' + blank site_type rows.
+    Uses homepage HTML pattern matching (no AI). 15 parallel workers.
+    """
+    import concurrent.futures as _cf
+
+    print("\n=== Re-check Blogs (fast HTML scan — no AI) ===")
+
+    db = get_db_connection()
+    try:
+        init_bulk_tables(db)
+        rows = db.execute(
+            "SELECT domain, url, site_type FROM scraped_websites "
+            "WHERE site_type IS NULL OR site_type = '' OR site_type = 'General Website'"
+        ).fetchall()
+    except Exception as e:
+        print(f"  DB error: {e}")
+        db.close()
+        return 0
+    db.close()
+
+    if not rows:
+        print("  No 'General Website' / blank rows found — all sites already classified.")
+        return 0
+
+    print(f"  {len(rows)} site(s) to re-check. 15 parallel workers, ~5-12s each.\n")
+
+    changed = []
+    lock = _threading.Lock()
+    done_count = [0]
+
+    def check_one(row):
+        domain = (row['domain'] or '').strip()
+        url    = str(row['url'] or f"https://{domain}").strip()
+        if not url or not domain:
+            return
+        new_type = _quick_blog_check(url)
+        with lock:
+            done_count[0] += 1
+            n = done_count[0]
+            total = len(rows)
+            if new_type != "General Website":
+                print(f"  [{n}/{total}] {domain}  →  {new_type}")
+                changed.append((domain, url, new_type))
+            elif n % 25 == 0:
+                print(f"  [{n}/{total}] still scanning…")
+
+    with _cf.ThreadPoolExecutor(max_workers=15) as ex:
+        list(ex.map(check_one, rows))
+
+    print(f"\n  Scan complete — {len(changed)} site(s) reclassified out of {len(rows)} checked.")
+
+    if not changed:
+        print("  Nothing new found — sites are genuinely inconclusive without AI.")
+        return 0
+
+    # ── Update DB ─────────────────────────────────────────────────────────────
+    db = get_db_connection()
+    try:
+        for domain, url, new_type in changed:
+            db.execute("UPDATE scraped_websites SET site_type=? WHERE domain=?",
+                       [new_type, domain])
+        db.commit()
+        print(f"  DB: {len(changed)} row(s) updated.")
+    except Exception as e:
+        print(f"  DB update error: {e}")
+    finally:
+        db.close()
+
+    # ── Batch update Sheets ───────────────────────────────────────────────────
+    updates = [{"website": url, "fields": {"site_type": new_type}}
+               for _, url, new_type in changed]
+    _batch_update_sheets_raw(updates)
+    print(f"  Sheets: batch update sent ({len(updates)} row(s)).")
+
+    # Print summary
+    from collections import Counter
+    counts = Counter(t for _, _, t in changed)
+    print("\n  Summary of reclassified sites:")
+    for t, n in counts.most_common():
+        print(f"    {t}: {n}")
+
+    return len(changed)
+
+
+def mark_stores_done() -> int:
+    """
+    ONE call to Apps Script — it classifies every Sheet row server-side and
+    marks Store/Social/Link-in-Bio rows as scrapped=Yes + site_type in one shot.
+    Also updates DB status=done for those domains.
+    Requires 'mark_non_blog_rows' action deployed in Apps Script.
+    """
+    NON_BLOG = {"Store", "Social Media", "Link-in-Bio"}
+
+    print("\n=== Mark Stores / Social / Link-in-Bio as Done ===")
+
+    # ── Step 1: single server-side call — classification + Sheets write ───────
+    cfg = load_webapp_config()
+    if not cfg:
+        print("  Error: no Apps Script config (google_sheets_webapp.json missing).")
+        return 0
+
+    print(f"  Sending domain lists to Apps Script "
+          f"({len(STORE_DOMAINS)} store + {len(LINK_IN_BIO_DOMAINS)} link-in-bio domains)…")
+    sheets_updated = 0
+    try:
+        r = requests.post(cfg["url"], json={
+            "action": "mark_non_blog_rows",
+            "secret": cfg.get("secret", "pinterest-scan-2026"),
+            "store_domains":    list(STORE_DOMAINS),
+            "link_in_bio_domains": list(LINK_IN_BIO_DOMAINS),
+        }, timeout=300)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("ok") and "total" in data:
+            sheets_updated = data.get("updated", 0)
+            total = data.get("total", "?")
+            print(f"  Sheets: {sheets_updated} row(s) updated out of {total} total.")
+        elif data.get("ok") and "total" not in data:
+            print("  Apps Script returned ok but no 'total' field — OLD version is still deployed.")
+            print("  → Go to Extensions → Apps Script → Deploy → Manage deployments → Edit → New version → Deploy")
+            return 0
+        else:
+            print(f"  Apps Script error: {data.get('error')} — is the latest version deployed?")
+    except Exception as e:
+        print(f"  Apps Script call failed: {e}")
+
+    # ── Step 2: update DB — mark known non-blog domains as done ───────────────
+    db = get_db_connection()
+    db_updated = 0
+    try:
+        init_bulk_tables(db)
+        db_rows = db.execute(
+            "SELECT domain, url, cms, tech_stack, post_count, site_type, status "
+            "FROM scraped_websites WHERE status != 'done'"
+        ).fetchall()
+        for row in db_rows:
+            domain = (row['domain'] or '').lower().strip()
+            if not domain:
+                continue
+            db_type = str(row.get('site_type') or '').strip()
+            cms     = str(row.get('cms') or '')
+            tech    = str(row.get('tech_stack') or '')
+            posts   = int(row.get('post_count') or 0)
+            is_wp   = 'wordpress' in cms.lower() or 'wordpress' in tech.lower()
+
+            if is_marketplace_or_social(domain):
+                site_type = classify_site_type(domain, is_wp, posts, tech)
+                if site_type == "General Website":
+                    site_type = "Store"
+            elif db_type in NON_BLOG:
+                site_type = db_type
+            else:
+                continue
+
+            db.execute(
+                "UPDATE scraped_websites SET status='done', site_type=? WHERE domain=?",
+                [site_type, domain]
+            )
+            db_updated += 1
+
+        if db_updated:
+            db.commit()
+    except Exception as e:
+        print(f"  DB update error: {e}")
+    finally:
+        db.close()
+
+    print(f"  DB: {db_updated} row(s) → status='done'.")
+    print(f"\n  Done — {sheets_updated} Sheets row(s) + {db_updated} DB row(s) updated.")
+    return sheets_updated
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Standalone Local API for Domain Quick Scrape.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1892,6 +2137,10 @@ def main() -> int:
                         help="Reset all 'Running' sites to 'Not Yet' in DB and Google Sheets, then exit")
     parser.add_argument("--fix-site-types", action="store_true",
                         help="Backfill missing/generic site_type in DB and Sheets, then exit")
+    parser.add_argument("--mark-stores", action="store_true",
+                        help="Mark all Store/Social/Link-in-Bio sites as done in DB and Sheets, then exit")
+    parser.add_argument("--recheck-blogs", action="store_true",
+                        help="Fast HTML pattern scan of all General Website rows to find blogs (no AI)")
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -1906,6 +2155,16 @@ def main() -> int:
     if args.fix_site_types:
         print("=== Fix Missing site_type ===")
         fix_missing_site_types()
+        return 0
+
+    # Mark stores/social/link-in-bio as done
+    if args.mark_stores:
+        mark_stores_done()
+        return 0
+
+    # Fast HTML re-check for General Website rows
+    if args.recheck_blogs:
+        recheck_blogs()
         return 0
 
     # Run in CLI Mode

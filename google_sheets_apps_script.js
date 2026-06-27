@@ -14,7 +14,7 @@ const SPREADSHEET_ID = "1ZaIcgG7E2ChZYtUr9UZP78bfO-YNMArlbWZk_71E_VE";
 const SECRET = "pinterest-scan-2026";
 
 function doGet() {
-  return jsonOut({ ok: true, version: 4, message: "Web app ready — websites header check added" });
+  return jsonOut({ ok: true, version: 5, message: "Web app ready — mark_non_blog_rows + batch_update_websites added" });
 }
 
 function doPost(e) {
@@ -53,6 +53,9 @@ function doPost(e) {
     }
     if (data.action === "batch_update_websites") {
       return batchUpdateWebsites(ss, data.updates || []);
+    }
+    if (data.action === "mark_non_blog_rows") {
+      return markNonBlogRows(ss, data.store_domains || [], data.link_in_bio_domains || []);
     }
     if (data.action === "get_keywords") {
       return getKeywords(sheet);
@@ -422,6 +425,98 @@ function batchUpdateWebsites(ss, updates) {
     SpreadsheetApp.flush();
   }
   return jsonOut({ ok: true, updated: updated });
+}
+
+// Classify every website row server-side and mark Store/Social/Link-in-Bio as done.
+// store_domains / link_in_bio_domains come from Python's STORE_DOMAINS / LINK_IN_BIO_DOMAINS.
+// Returns {ok, updated, total} — no large data sent back to Python.
+function markNonBlogRows(ss, storeDomains, linkInBioDomains) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(60000);
+  try {
+    const sheet = ss.getSheetByName("websites");
+    if (!sheet) return jsonOut({ ok: false, error: "websites sheet not found" });
+    const last = sheet.getLastRow();
+    if (last < 2) return jsonOut({ ok: true, updated: 0, total: 0 });
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const vals    = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+
+    let webCol = -1, scrappedCol = -1, siteTypeCol = -1;
+    for (let j = 0; j < headers.length; j++) {
+      const h = String(headers[j]).trim().toLowerCase();
+      if (h === "website")   webCol      = j;
+      if (h === "scrapped")  scrappedCol = j;
+      if (h === "site_type") siteTypeCol = j;
+    }
+    if (webCol === -1) return jsonOut({ ok: false, error: "website column not found" });
+
+    // Build lookup sets for fast O(1) domain checks
+    const storeSet  = new Set(storeDomains.map(function(d) { return d.toLowerCase(); }));
+    const libSet    = new Set(linkInBioDomains.map(function(d) { return d.toLowerCase(); }));
+    const socialSet = new Set([
+      "pinterest.com","instagram.com","facebook.com","youtube.com","youtu.be",
+      "twitter.com","x.com","tiktok.com","vm.tiktok.com","linktr.ee","t.co",
+      "tumblr.com","medium.com","substack.com","blogspot.com","blogger.com",
+      "wordpress.com","wixsite.com","squarespace.com","reddit.com","quora.com",
+      "github.com","google.com","plus.google.com","be.net","behance.net",
+      "vsco.co","dribbble.com","soundcloud.com","spotify.com","open.spotify.com",
+      "amz.run","bit.ly","tinyurl.com","ow.ly","buff.ly","boxd.it"
+    ]);
+
+    function getDomain(url) {
+      try {
+        url = String(url || "").trim();
+        if (!url) return "";
+        if (url.indexOf("//") === -1) url = "https://" + url;
+        var host = url.split("//")[1].split("/")[0].toLowerCase();
+        if (host.indexOf(":") !== -1) host = host.split(":")[0];
+        if (host.startsWith("www.")) host = host.slice(4);
+        return host;
+      } catch(e) { return ""; }
+    }
+
+    function classifyDomain(domain) {
+      if (!domain) return null;
+      for (var it = socialSet.values(), v; !(v = it.next()).done;) {
+        var d = v.value;
+        if (domain === d || domain.endsWith("." + d)) return "Social Media";
+      }
+      for (var it2 = libSet.values(), v2; !(v2 = it2.next()).done;) {
+        var d2 = v2.value;
+        if (domain === d2 || domain.endsWith("." + d2)) return "Link-in-Bio";
+      }
+      for (var it3 = storeSet.values(), v3; !(v3 = it3.next()).done;) {
+        var d3 = v3.value;
+        if (domain === d3 || domain.endsWith("." + d3)) return "Store";
+      }
+      return null;
+    }
+
+    var updated = 0;
+    for (var i = 0; i < vals.length; i++) {
+      var url = String(vals[i][webCol] || "").trim();
+      if (!url) continue;
+      var scrapped = scrappedCol >= 0 ? String(vals[i][scrappedCol] || "").trim().toLowerCase() : "";
+      if (scrapped === "yes" || scrapped === "done") continue;
+
+      var domain   = getDomain(url);
+      var siteType = classifyDomain(domain);
+      if (!siteType) continue;
+
+      if (scrappedCol  >= 0) vals[i][scrappedCol]  = "Yes";
+      if (siteTypeCol  >= 0) vals[i][siteTypeCol]  = siteType;
+      updated++;
+    }
+
+    if (updated > 0) {
+      sheet.getRange(2, 1, vals.length, headers.length).setValues(vals);
+      SpreadsheetApp.flush();
+    }
+    return jsonOut({ ok: true, updated: updated, total: last - 1 });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // Reset ALL rows whose scrapped column starts with "Running" → "Not Yet".
