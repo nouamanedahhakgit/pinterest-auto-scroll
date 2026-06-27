@@ -56,11 +56,24 @@ BUILD_ARGS = ["4_build_database.py", "--no-clear", "--no-csv"] + (["--disk"] if 
 
 
 # ── read pinners + their boards from the DB ───────────────────────────────────
+def _extract_domain(url):
+    if not url:
+        return ""
+    u = url.strip().lower()
+    if not u.startswith("http"):
+        u = "https://" + u
+    try:
+        from urllib.parse import urlparse
+        h = urlparse(u).hostname or ""
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
 def load_targets():
     if not os.path.exists(DB_PATH):
         print("  sortpin.db not found — run step 4 first."); sys.exit(1)
     con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
-    
+
     # Check if 'status' column exists in pinners table, add it if not
     cursor = con.cursor()
     try:
@@ -71,7 +84,7 @@ def load_targets():
             con.commit()
         except Exception:
             pass
-            
+
     # Check if 'status' column exists in boards table, add it if not
     try:
         cursor.execute("SELECT status FROM boards LIMIT 1")
@@ -82,9 +95,36 @@ def load_targets():
         except Exception:
             pass
 
-    pinners = [dict(r) for r in con.execute(
-        "SELECT username, full_name, follower_count, status FROM pinners "
+    # Build domain→site_type map from scraped_websites (if table exists)
+    site_types = {}
+    try:
+        for r in con.execute("SELECT domain, site_type FROM scraped_websites WHERE domain IS NOT NULL"):
+            if r[0] and r[1]:
+                site_types[r[0].lower().strip()] = r[1]
+    except sqlite3.OperationalError:
+        pass  # table doesn't exist yet — no filtering applied
+
+    all_pinners = [dict(r) for r in con.execute(
+        "SELECT username, full_name, follower_count, website_url, status FROM pinners "
         "ORDER BY follower_count DESC")]
+
+    # Filter: only process pinners whose scraped site_type contains "blog"
+    if site_types:
+        filtered, skipped = [], 0
+        for p in all_pinners:
+            domain = _extract_domain(p.get("website_url", ""))
+            st = site_types.get(domain, "")
+            if "blog" in st.lower():
+                filtered.append(p)
+            else:
+                skipped += 1
+        if skipped:
+            print(f"  [site_type filter] skipping {skipped} pinners (not blog) — "
+                  f"{len(filtered)} blog pinners queued")
+        pinners = filtered
+    else:
+        pinners = all_pinners
+
     boards_by = {}
     for r in con.execute("SELECT id, url, owner_username, name, status FROM boards "
                          "WHERE url IS NOT NULL AND url<>''"):
