@@ -16,6 +16,20 @@ try:
 except ImportError:
     curl_cffi_requests = None  # optional: browser TLS fingerprint for strict CDNs (e.g. sitemap shards)
 from bs4 import BeautifulSoup, Comment
+try:
+    import bs4
+    _orig_bs4_init = bs4.BeautifulSoup.__init__
+    def _patched_bs4_init(self, markup="", features=None, *args, **kwargs):
+        try:
+            _orig_bs4_init(self, markup, features, *args, **kwargs)
+        except bs4.FeatureNotFound:
+            fallback = "html.parser"
+            if features == "lxml-xml":
+                fallback = "xml" if "xml" in bs4.builder.builders else "html.parser"
+            _orig_bs4_init(self, markup, fallback, *args, **kwargs)
+    bs4.BeautifulSoup.__init__ = _patched_bs4_init
+except Exception:
+    pass
 from urllib.parse import urlparse, urljoin
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
