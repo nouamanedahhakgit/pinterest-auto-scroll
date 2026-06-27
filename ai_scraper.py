@@ -1848,6 +1848,14 @@ def _fetch_sitemap_urls(
                         f"(ET/BS found 0 — index may be blocked or wrong namespace)"
                     )
             for child_url in child_urls:
+                # Hard cap: 2000+ URLs = product catalog, not a blog — stop wasting time
+                if len(post_urls) >= 2000:
+                    if progress_cb:
+                        progress_cb(
+                            f"📄   ↳ sitemap cap reached ({len(post_urls):,} URLs) — "
+                            f"skipping remaining shards (likely product catalog)"
+                        )
+                    break
                 if cancel_check and cancel_check():
                     if progress_cb:
                         progress_cb(

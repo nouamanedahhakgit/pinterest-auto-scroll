@@ -515,6 +515,54 @@ STORE_DOMAINS = [
     "walmrt.us", "amzn.to", "amzn.eu",
     # Web-app / firestore / hosting (never content sites)
     "web.app", "firebaseapp.com", "pages.dev", "netlify.app", "vercel.app",
+    # ── Major global retail / fashion / sports brands ──────────────────────
+    # Sports & footwear
+    "adidas.com", "nike.com", "puma.com", "reebok.com", "newbalance.com",
+    "underarmour.com", "asics.com", "skechers.com", "vans.com", "converse.com",
+    "timberland.com", "merrell.com", "salomon.com", "columbia.com", "thenorthface.com",
+    "ugg.com", "birkenstock.com", "crocs.com", "clarks.com", "ecco.com",
+    # Fast fashion / apparel
+    "zara.com", "hm.com", "uniqlo.com", "gap.com", "oldnavy.com",
+    "bananarepublic.com", "forever21.com", "fashionnova.com", "shein.com", "temu.com",
+    "asos.com", "boohoo.com", "prettylittlething.com", "misguided.com",
+    "topshop.com", "cos.com", "mango.com", "massimozara.com",
+    "anthropologie.com", "freepeople.com", "urbanoutfitters.com", "bhldn.com",
+    "ae.com", "aerie.com", "aeropostale.com", "hollister.com", "abercrombie.com",
+    # Luxury / designer
+    "gucci.com", "louisvuitton.com", "lv.com", "chanel.com", "hermes.com",
+    "prada.com", "fendi.com", "dior.com", "versace.com", "armani.com",
+    "balenciaga.com", "givenchy.com", "valentino.com", "burberry.com",
+    "alexandermcqueen.com", "bottegaveneta.com", "loewe.com", "celine.com",
+    "tiffany.com", "cartier.com", "swarovski.com",
+    # Department stores / marketplaces
+    "nordstrom.com", "nordstromrack.com", "macys.com", "bloomingdales.com",
+    "saksfifthavenue.com", "saks.com", "neimanmarcus.com", "bergdorfgoodman.com",
+    "target.com", "walmart.com", "costco.com", "kohls.com", "jcpenney.com",
+    "belk.com", "dsw.com", "aldoshoes.com", "aldo.com", "aldi.co.uk", "aldi.com",
+    "marshalls.com", "tjmaxx.com", "homegoods.com", "ross.com",
+    # Beauty / skincare
+    "sephora.com", "ulta.com", "glossier.com", "fentybeauty.com",
+    "charlotte tilbury.com", "charlottetilbury.com", "nars.com", "maccosmetics.com",
+    "kiehls.com", "lancome.com", "esteelauder.com", "clinique.com",
+    "lush.com", "thebodyshop.com", "bathandbodyworks.com",
+    # Activewear / lifestyle
+    "lululemon.com", "alo.com", "aloyoga.com", "vuori.com", "athleta.com",
+    "gymshark.com", "fabletics.com", "outdoor voices.com", "outdoorvoices.com",
+    # Home / furniture
+    "ikea.com", "wayfair.com", "overstock.com", "crateandbarrel.com", "cb2.com",
+    "westelm.com", "potterybarn.com", "restorationhardware.com", "rh.com",
+    "williams-sonoma.com", "surlatable.com", "anthropologie.com",
+    "zgallerie.com", "worldmarket.com", "pier1.com",
+    # Accessories / jewelry
+    "pandora.net", "signetjewelers.com", "zales.com", "kay.com", "jared.com",
+    "mejuri.com", "missoma.com", "gorjana.com", "kendra-scott.com",
+    # Other major retail
+    "apple.com", "samsung.com", "sony.com", "dell.com", "hp.com", "lenovo.com",
+    "bestbuy.com", "newegg.com", "bhphotovideo.com",
+    "petco.com", "petsmart.com", "chewy.com",
+    "vitaminshoppe.com", "gnc.com", "iherb.com",
+    "autozone.com", "advance auto.com", "advanceauto.com",
+    "wikipedia.org", "ar.wikipedia.org",
 ]
 
 def classify_site_type(domain: str, is_wordpress: bool, post_count: int, tech_stack: str = "") -> str:
@@ -1565,34 +1613,62 @@ def run_bulk_scrape_job(run_all: bool) -> None:
 
             target_sites = resumed_sites + claimed_sites
 
-            # Deduplicate: drop domains already finished in DB (prevents re-scanning on duplicate sheet rows)
+            # Filter: only scan blank site_type or Blog — skip already-classified non-blog sites
+            # Also deduplicates domains already finished in DB
             try:
                 db = get_db_connection()
-                done_rows = db.execute(
-                    "SELECT domain, site_type FROM scraped_websites WHERE status IN ('done','blocked')"
+                db_rows_all = db.execute(
+                    "SELECT domain, site_type, status FROM scraped_websites"
                 ).fetchall()
                 db.close()
-                done_domain_map = {r['domain']: (r['site_type'] or '') for r in done_rows}
-                done_domains    = set(done_domain_map.keys())
-                already_done = [s for s in target_sites if extract_domain(s['url']) in done_domains]
-                target_sites  = [s for s in target_sites if extract_domain(s['url']) not in done_domains]
-                if already_done:
-                    log(f"Skipped {len(already_done)} already-done domain(s) — marking 'Yes' + site_type in Sheets.")
-                    # Build updates with site_type from DB so Sheets column is also filled
-                    dedup_updates = []
-                    for _s in already_done:
-                        _dom = extract_domain(_s['url'])
-                        _st  = done_domain_map.get(_dom, '')
-                        _fields = {"scrapped": "Yes"}
-                        if _st:
-                            _fields["site_type"] = _st
-                        dedup_updates.append({"website": _s['url'], "fields": _fields})
+
+                # Map: domain → {site_type, status}
+                db_domain_map = {r['domain']: {'site_type': r['site_type'] or '', 'status': r['status'] or ''}
+                                 for r in db_rows_all if r['domain']}
+
+                skip_types = {"Store", "Social Media", "Link-in-Bio", "General Website"}
+                skip_sites   = []   # already classified non-blog → mark Yes, don't scan
+                already_done = []   # status=done/blocked in DB → mark Yes, don't scan
+                scan_sites   = []   # blank site_type or Blog → scan
+
+                for s in target_sites:
+                    dom = extract_domain(s['url'])
+                    info = db_domain_map.get(dom, {})
+                    st  = info.get('site_type', '')
+                    status = info.get('status', '')
+
+                    if status in ('done', 'blocked'):
+                        already_done.append((s, st))
+                    elif st in skip_types:
+                        # Classified but not yet marked done — skip scanning, mark done
+                        skip_sites.append((s, st))
+                    else:
+                        scan_sites.append(s)   # blank or Blog → scan
+
+                # Batch-mark all non-blog / already-done sites as Yes in Sheets
+                mark_yes_updates = []
+                for s, st in (already_done + skip_sites):
+                    _fields = {"scrapped": "Yes"}
+                    if st:
+                        _fields["site_type"] = st
+                    mark_yes_updates.append({"website": s['url'], "fields": _fields})
+
+                if mark_yes_updates:
+                    log(f"Skipped {len(mark_yes_updates)} site(s) (already classified/done) — marking 'Yes' in Sheets.")
                     _threading.Thread(
-                        target=lambda u=dedup_updates: _batch_update_sheets_raw(u),
+                        target=lambda u=mark_yes_updates: _batch_update_sheets_raw(u),
                         daemon=True
                     ).start()
+
+                if skip_sites:
+                    log(f"  → {len(skip_sites)} non-blog site(s) skipped (Store/Social/General Website).")
+                if already_done:
+                    log(f"  → {len(already_done)} already-done domain(s) skipped.")
+
+                target_sites = scan_sites
+
             except Exception as _ded_err:
-                log(f"Warning: deduplication check failed: {_ded_err}")
+                log(f"Warning: deduplication/filter check failed: {_ded_err}")
 
             if not target_sites:
                 if not claimed_sites and not resumed_sites:
