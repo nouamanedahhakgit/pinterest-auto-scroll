@@ -515,9 +515,24 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
         "Upgrade-Insecure-Requests": "1"
     }
     
+    r = None
+    # Try curl_cffi first to bypass Cloudflare/Captcha blocks if installed
     try:
-        r = requests.get(url, headers=headers, timeout=15)
-        
+        from curl_cffi import requests as curl_cffi_requests
+        if curl_cffi_requests is not None:
+            r = curl_cffi_requests.get(url, impersonate="chrome120", headers=headers, timeout=15, allow_redirects=True)
+    except Exception:
+        pass
+
+    if r is None:
+        try:
+            r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        except requests.exceptions.Timeout:
+            return True, "Connection Timeout"
+        except requests.exceptions.RequestException as e:
+            return True, f"Connection Failed: {str(e)}"
+    
+    try:
         # Check HTTP status codes commonly used for blocking
         if r.status_code in (403, 429, 503):
             text_lower = r.text.lower()
@@ -539,10 +554,8 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
                 return True, "Captcha Challenge Page"
                 
         return False, ""
-    except requests.exceptions.Timeout:
-        return True, "Connection Timeout"
-    except requests.exceptions.RequestException as e:
-        return True, f"Connection Failed: {str(e)}"
+    except Exception as e:
+        return True, f"Parsing Block Page Failed: {str(e)}"
 
 def extract_domain(url: str) -> str:
     parsed = urlparse(url)
