@@ -287,6 +287,14 @@ def main():
         except AttributeError:
             pass
 
+    # --no-aggregation: skip the UPDATE board/pinner count queries.
+    # Always used during auto-sync from magic_scroll (multi-computer mode)
+    # because those UPDATE queries hold exclusive row locks that block
+    # other computers' INSERT IGNORE operations on the same tables.
+    # Run  python 8_sync_to_mysql.py  manually (without the flag) to
+    # recalculate all counts once in a while.
+    no_aggregation = "--no-aggregation" in sys.argv
+
     if not os.path.exists(DB_PATH):
         print(f"\n  ❌ Local database not found: {DB_PATH}")
         print("  Run step 4 first to build your local SQLite database.\n")
@@ -359,26 +367,107 @@ def main():
     else:
         print(f"\n  (Skipping domain_quick_scrape.db sync -- not found yet. Run step 9 first.)")
 
-    # 5. Run aggregation updates to organize stats and counts (handling multi-computer merges)
-    print("\nOrganizing and recalculating metrics in MySQL (combining data from all workers)...")
-    
-    try:
-        new_pinners = new_scraped_ids.get("pinners", []) if new_scraped_ids else []
-        new_boards = new_scraped_ids.get("boards", []) if new_scraped_ids else []
+    # 5. Aggregation: recalculate board/pinner counts in MySQL.
+    # Skipped when --no-aggregation is passed (auto-sync from magic_scroll)
+    # because UPDATE queries hold exclusive row locks that block other
+    # computers' concurrent INSERT IGNORE operations on the same tables.
+    if no_aggregation:
+        print("\n  (Skipping metric aggregation \u2014 run  python 8_sync_to_mysql.py  manually to recalculate counts.)")
+    else:
+        try:
+            new_pinners = new_scraped_ids.get("pinners", []) if new_scraped_ids else []
+            new_boards = new_scraped_ids.get("boards", []) if new_scraped_ids else []
 
-        if new_scraped_ids:
-            # Incremental updates to avoid table locks and timeouts
-            if new_boards:
-                print(f"  - Calculating board pin counts for {len(new_boards)} boards...")
-                chunk_size = 1000
-                for j in range(0, len(new_boards), chunk_size):
-                    chunk = new_boards[j:j + chunk_size]
+            if new_scraped_ids:
+                # Incremental updates to avoid table locks and timeouts
+                if new_boards:
+                    print(f"  - Calculating board pin counts for {len(new_boards)} boards...")
+                    chunk_size = 1000
+                    for j in range(0, len(new_boards), chunk_size):
+                        chunk = new_boards[j:j + chunk_size]
+                        placeholders = ", ".join(["%s"] * len(chunk))
+                        execute_with_retry(mysql_cursor, mysql_conn, f"""
+                            UPDATE boards b 
+                            LEFT JOIN (
+                                SELECT board_id, COUNT(*) as cnt 
+                                FROM pins 
+                                WHERE board_id IN ({placeholders})
+                                GROUP BY board_id
+                            ) p_counts ON b.id = p_counts.board_id
+                            SET b.pin_count = COALESCE(p_counts.cnt, 0)
+                            WHERE b.id IN ({placeholders})
+                        """, chunk + chunk)
+
+                if new_pinners:
+                    print(f"  - Calculating pinner board counts for {len(new_pinners)} pinners...")
+                    chunk_size = 1000
+                    for j in range(0, len(new_pinners), chunk_size):
+                        chunk = new_pinners[j:j + chunk_size]
+                        placeholders = ", ".join(["%s"] * len(chunk))
+                        execute_with_retry(mysql_cursor, mysql_conn, f"""
+                            UPDATE pinners p
+                            LEFT JOIN (
+                                SELECT owner_username, COUNT(*) as cnt
+                                FROM boards
+                                WHERE owner_username IN ({placeholders})
+                                GROUP BY owner_username
+                            ) b_counts ON p.username = b_counts.owner_username
+                            SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
+                            WHERE p.username IN ({placeholders})
+                        """, chunk + chunk)
+
+                    print(f"  - Calculating pinner pin counts for {len(new_pinners)} pinners...")
+                    chunk_size = 1000
+                    for j in range(0, len(new_pinners), chunk_size):
+                        chunk = new_pinners[j:j + chunk_size]
+                        placeholders = ", ".join(["%s"] * len(chunk))
+                        execute_with_retry(mysql_cursor, mysql_conn, f"""
+                            UPDATE pinners p
+                            LEFT JOIN (
+                                SELECT pinner_username, COUNT(*) as cnt
+                                FROM pins
+                                WHERE pinner_username IN ({placeholders})
+                                GROUP BY pinner_username
+                            ) p_counts ON p.username = p_counts.pinner_username
+                            SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
+                            WHERE p.username IN ({placeholders})
+                        """, chunk + chunk)
+
+                    print(f"  - Calculating pinner created vs saved pin counts for {len(new_pinners)} pinners...")
+                    chunk_size = 1000
+                    for j in range(0, len(new_pinners), chunk_size):
+                        chunk = new_pinners[j:j + chunk_size]
+                        placeholders = ", ".join(["%s"] * len(chunk))
+                        execute_with_retry(mysql_cursor, mysql_conn, f"""
+                            UPDATE pinners p
+                            LEFT JOIN (
+                                SELECT pinner_username,
+                                       SUM(CASE WHEN pin_type = 'created' THEN 1 ELSE 0 END) as created_cnt,
+                                       SUM(CASE WHEN pin_type = 'saved' THEN 1 ELSE 0 END) as saved_cnt
+                                FROM pins
+                                WHERE pinner_username IN ({placeholders})
+                                GROUP BY pinner_username
+                            ) p_counts ON p.username = p_counts.pinner_username
+                            SET p.scraped_created_pins_count = COALESCE(p_counts.created_cnt, 0),
+                                p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
+                            WHERE p.username IN ({placeholders})
+                        """, chunk + chunk)
+            else:
+                # Full recalculation — process in chunks of 500 to avoid long lock holds
+                chunk_size = 500
+
+                # Board pin counts
+                print("  - Calculating all board pin counts (chunked)...")
+                mysql_cursor.execute("SELECT id FROM boards")
+                all_board_ids = [row[0] for row in mysql_cursor.fetchall()]
+                for j in range(0, len(all_board_ids), chunk_size):
+                    chunk = all_board_ids[j:j + chunk_size]
                     placeholders = ", ".join(["%s"] * len(chunk))
                     execute_with_retry(mysql_cursor, mysql_conn, f"""
-                        UPDATE boards b 
+                        UPDATE boards b
                         LEFT JOIN (
-                            SELECT board_id, COUNT(*) as cnt 
-                            FROM pins 
+                            SELECT board_id, COUNT(*) as cnt
+                            FROM pins
                             WHERE board_id IN ({placeholders})
                             GROUP BY board_id
                         ) p_counts ON b.id = p_counts.board_id
@@ -386,11 +475,12 @@ def main():
                         WHERE b.id IN ({placeholders})
                     """, chunk + chunk)
 
-            if new_pinners:
-                print(f"  - Calculating pinner board counts for {len(new_pinners)} pinners...")
-                chunk_size = 1000
-                for j in range(0, len(new_pinners), chunk_size):
-                    chunk = new_pinners[j:j + chunk_size]
+                # Pinner board + pin counts
+                print("  - Calculating all pinner board/pin counts (chunked)...")
+                mysql_cursor.execute("SELECT username FROM pinners")
+                all_pinners = [row[0] for row in mysql_cursor.fetchall()]
+                for j in range(0, len(all_pinners), chunk_size):
+                    chunk = all_pinners[j:j + chunk_size]
                     placeholders = ", ".join(["%s"] * len(chunk))
                     execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE pinners p
@@ -403,12 +493,6 @@ def main():
                         SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
-
-                print(f"  - Calculating pinner pin counts for {len(new_pinners)} pinners...")
-                chunk_size = 1000
-                for j in range(0, len(new_pinners), chunk_size):
-                    chunk = new_pinners[j:j + chunk_size]
-                    placeholders = ", ".join(["%s"] * len(chunk))
                     execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE pinners p
                         LEFT JOIN (
@@ -420,12 +504,6 @@ def main():
                         SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
-
-                print(f"  - Calculating pinner created vs saved pin counts for {len(new_pinners)} pinners...")
-                chunk_size = 1000
-                for j in range(0, len(new_pinners), chunk_size):
-                    chunk = new_pinners[j:j + chunk_size]
-                    placeholders = ", ".join(["%s"] * len(chunk))
                     execute_with_retry(mysql_cursor, mysql_conn, f"""
                         UPDATE pinners p
                         LEFT JOIN (
@@ -440,78 +518,12 @@ def main():
                             p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
                         WHERE p.username IN ({placeholders})
                     """, chunk + chunk)
-        else:
-            # Full recalculation — process in chunks of 500 to avoid long lock holds
-            chunk_size = 500
 
-            # Board pin counts
-            print("  - Calculating all board pin counts (chunked)...")
-            mysql_cursor.execute("SELECT id FROM boards")
-            all_board_ids = [row[0] for row in mysql_cursor.fetchall()]
-            for j in range(0, len(all_board_ids), chunk_size):
-                chunk = all_board_ids[j:j + chunk_size]
-                placeholders = ", ".join(["%s"] * len(chunk))
-                execute_with_retry(mysql_cursor, mysql_conn, f"""
-                    UPDATE boards b
-                    LEFT JOIN (
-                        SELECT board_id, COUNT(*) as cnt
-                        FROM pins
-                        WHERE board_id IN ({placeholders})
-                        GROUP BY board_id
-                    ) p_counts ON b.id = p_counts.board_id
-                    SET b.pin_count = COALESCE(p_counts.cnt, 0)
-                    WHERE b.id IN ({placeholders})
-                """, chunk + chunk)
+            print("  Metric calculations updated successfully.")
 
-            # Pinner board + pin counts
-            print("  - Calculating all pinner board/pin counts (chunked)...")
-            mysql_cursor.execute("SELECT username FROM pinners")
-            all_pinners = [row[0] for row in mysql_cursor.fetchall()]
-            for j in range(0, len(all_pinners), chunk_size):
-                chunk = all_pinners[j:j + chunk_size]
-                placeholders = ", ".join(["%s"] * len(chunk))
-                execute_with_retry(mysql_cursor, mysql_conn, f"""
-                    UPDATE pinners p
-                    LEFT JOIN (
-                        SELECT owner_username, COUNT(*) as cnt
-                        FROM boards
-                        WHERE owner_username IN ({placeholders})
-                        GROUP BY owner_username
-                    ) b_counts ON p.username = b_counts.owner_username
-                    SET p.scraped_boards_count = COALESCE(b_counts.cnt, 0)
-                    WHERE p.username IN ({placeholders})
-                """, chunk + chunk)
-                execute_with_retry(mysql_cursor, mysql_conn, f"""
-                    UPDATE pinners p
-                    LEFT JOIN (
-                        SELECT pinner_username, COUNT(*) as cnt
-                        FROM pins
-                        WHERE pinner_username IN ({placeholders})
-                        GROUP BY pinner_username
-                    ) p_counts ON p.username = p_counts.pinner_username
-                    SET p.scraped_pins_count = COALESCE(p_counts.cnt, 0)
-                    WHERE p.username IN ({placeholders})
-                """, chunk + chunk)
-                execute_with_retry(mysql_cursor, mysql_conn, f"""
-                    UPDATE pinners p
-                    LEFT JOIN (
-                        SELECT pinner_username,
-                               SUM(CASE WHEN pin_type = 'created' THEN 1 ELSE 0 END) as created_cnt,
-                               SUM(CASE WHEN pin_type = 'saved' THEN 1 ELSE 0 END) as saved_cnt
-                        FROM pins
-                        WHERE pinner_username IN ({placeholders})
-                        GROUP BY pinner_username
-                    ) p_counts ON p.username = p_counts.pinner_username
-                    SET p.scraped_created_pins_count = COALESCE(p_counts.created_cnt, 0),
-                        p.scraped_saved_pins_count = COALESCE(p_counts.saved_cnt, 0)
-                    WHERE p.username IN ({placeholders})
-                """, chunk + chunk)
-            
-        print("  Metric calculations updated successfully.")
-        
-    except Exception as err:
-        print(f"  Error running aggregations: {err}")
-        mysql_conn.rollback()
+        except Exception as err:
+            print(f"  Error running aggregations: {err}")
+            mysql_conn.rollback()
 
     # Clean up the new scraped IDs file after successful sync
     if new_scraped_ids and os.path.exists(new_ids_file):

@@ -1480,7 +1480,7 @@ def main():
                 print("  🔄 Automatically syncing local database to Cloud MySQL...")
                 try:
                     import subprocess
-                    subprocess.run([sys.executable, sync_script], cwd=BASE)
+                    subprocess.run([sys.executable, sync_script, "--no-aggregation"], cwd=BASE)
                 except Exception as e:
                     print(f"  ⚠️  Auto-sync failed: {e}")
             else:
