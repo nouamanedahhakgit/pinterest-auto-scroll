@@ -548,10 +548,26 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str]:
         # Even on 200, it could show a Cloudflare challenge page or Captcha page
         if r.status_code == 200:
             text_lower = r.text.lower()
-            if "cloudflare" in text_lower and ("challenge" in text_lower or "enable javascript" in text_lower or "checking your browser" in text_lower):
+            content_len = len(r.text)
+            # Real Cloudflare challenge pages are short and have specific markers
+            if content_len < 30000 and "cloudflare" in text_lower and ("challenge" in text_lower or "enable javascript" in text_lower or "checking your browser" in text_lower):
                 return True, "Cloudflare Challenge"
-            if "captcha" in text_lower or "recaptcha" in text_lower or "hcaptcha" in text_lower:
-                return True, "Captcha Challenge Page"
+            # Real captcha CHALLENGE pages are short (<15KB) and have specific
+            # blocking phrases. Normal sites often include reCAPTCHA scripts for
+            # contact forms or have "captcha" in JS bundle names — those are NOT blocks.
+            if content_len < 15000 and ("captcha" in text_lower or "recaptcha" in text_lower or "hcaptcha" in text_lower):
+                challenge_phrases = [
+                    "verify you are human",
+                    "please verify",
+                    "challenge-platform",
+                    "just a moment",
+                    "checking your browser",
+                    "are you a robot",
+                    "bot verification",
+                    "security check",
+                ]
+                if any(phrase in text_lower for phrase in challenge_phrases):
+                    return True, "Captcha Challenge Page"
                 
         return False, ""
     except Exception as e:
