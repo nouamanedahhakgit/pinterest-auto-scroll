@@ -60,6 +60,9 @@ function doPost(e) {
     if (data.action === "get_keywords") {
       return getKeywords(sheet);
     }
+    if (data.action === "reset_pending_keywords") {
+      return resetPendingKeywords(sheet);
+    }
 
     return writeColumn(sheet, data);
   } catch (err) {
@@ -187,6 +190,31 @@ function setupKeywords(sheet, rows) {
     sheet.getRange("A1:D" + all.length).setValues(all);
   }
   return jsonOut({ ok: true, action: "setup", count: rows.length });
+}
+
+function resetPendingKeywords(sheet) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const last = sheet.getLastRow();
+    if (last < 2) return jsonOut({ ok: true, reset: 0 });
+    const vals = sheet.getRange(2, 1, last - 1, 4).getValues();
+    let reset = 0;
+    for (let i = 0; i < vals.length; i++) {
+      const status = String(vals[i][3] || "").trim().toLowerCase();
+      if (status === "pending") {
+        vals[i][3] = "Not Yet";
+        reset++;
+      }
+    }
+    if (reset > 0) {
+      sheet.getRange(2, 1, vals.length, 4).setValues(vals);
+      SpreadsheetApp.flush();
+    }
+    return jsonOut({ ok: true, reset: reset });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function getKeywords(sheet) {

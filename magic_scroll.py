@@ -292,7 +292,25 @@ def run_step(label, args):
     subprocess.run([PY] + args, cwd=BASE)
 
 # ── main loop ─────────────────────────────────────────────────────────────────
+def reset_pending_keywords(gsc, cfg):
+    print("\n=== Reset Pending Keywords → Not Yet ===")
+    try:
+        data = gsc.post_webapp(cfg, {"action": "reset_pending_keywords"})
+        n = data.get("reset", 0)
+        print(f"  Reset {n} keyword(s) from 'pending' → 'Not Yet'.")
+    except Exception as e:
+        print(f"  Failed: {e}")
+
 def main():
+    if "--reset-keywords" in sys.argv:
+        gsc = load_sheet_client()
+        cfg = gsc.resolve_webapp() if gsc else None
+        if cfg:
+            reset_pending_keywords(gsc, cfg)
+        else:
+            print("  No google_sheets_webapp.json found.")
+        sys.exit(0)
+
     print(f"\n{'='*62}\n  MAGIC SCROLL — {BATCH} keywords/cycle · {MINUTES:g} min each\n{'='*62}")
     gsc = load_sheet_client()
     cfg = gsc.resolve_webapp() if gsc else None
