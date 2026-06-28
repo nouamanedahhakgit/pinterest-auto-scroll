@@ -150,21 +150,43 @@ def _kill_our_brave():
         _brave_proc = None
         time.sleep(2)
 
+def _find_brave():
+    candidates = [
+        BRAVE_PATH,
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
 def ensure_brave():
     global _brave_proc
     if _cdp_up():
         return True
     _kill_our_brave()   # kill only OUR Brave — regular Brave windows are untouched
+
+    brave = _find_brave()
+    if not brave:
+        print(f"  ERROR: brave.exe not found. Checked: {BRAVE_PATH}")
+        print("  Set BRAVE_PATH at the top of magic_scroll.py to the correct location.")
+        return False
+
     _brave_proc = subprocess.Popen([
-        BRAVE_PATH,
+        brave,
         f"--remote-debugging-port={CDP_PORT}",
         f"--profile-directory={BRAVE_PROFILE}",
         "--no-first-run", "--no-default-browser-check",
     ])
-    for _ in range(15):
+    # New profile takes longer on first launch — wait up to 30s
+    for _ in range(30):
         if _cdp_up():
             time.sleep(2); return True
         time.sleep(1)
+    print(f"  ERROR: Brave started (PID {_brave_proc.pid}) but CDP port {CDP_PORT} never opened.")
+    print("  Check that no other app is using port", CDP_PORT)
     return False
 
 def connect():
