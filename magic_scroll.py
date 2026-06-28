@@ -34,9 +34,8 @@ Run:
 import os, sys, time, socket, subprocess, re, json, datetime, platform
 
 BASE            = os.path.dirname(os.path.abspath(__file__))
-CDP_PORT        = 9223   # separate port — regular Brave stays on 9222 (or none)
+CDP_PORT        = 9222
 BRAVE_PATH      = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-BRAVE_PROFILE   = "MagicScroll"   # sub-profile inside default user data dir (isolated from your regular Brave)
 PY              = sys.executable
 LOG_PATH        = os.path.join(BASE, "magic_log.jsonl")
 ENV_PATH        = os.path.join(BASE, ".env")
@@ -177,7 +176,6 @@ def ensure_brave():
     _brave_proc = subprocess.Popen([
         brave,
         f"--remote-debugging-port={CDP_PORT}",
-        f"--profile-directory={BRAVE_PROFILE}",
         "--no-first-run", "--no-default-browser-check",
     ])
     # New profile takes longer on first launch — wait up to 30s
