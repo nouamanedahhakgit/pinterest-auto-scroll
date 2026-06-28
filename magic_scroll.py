@@ -33,12 +33,15 @@ Run:
 
 import os, sys, time, socket, subprocess, re, json, datetime, platform
 
-BASE       = os.path.dirname(os.path.abspath(__file__))
-CDP_PORT   = 9222
-BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-PY         = sys.executable
-LOG_PATH   = os.path.join(BASE, "magic_log.jsonl")   # job log (the viewer reads this)
-ENV_PATH   = os.path.join(BASE, ".env")
+BASE            = os.path.dirname(os.path.abspath(__file__))
+CDP_PORT        = 9223   # separate port — regular Brave stays on 9222 (or none)
+BRAVE_PATH      = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+BRAVE_PROFILE   = "MagicScroll"   # sub-profile inside default user data dir (isolated from your regular Brave)
+PY              = sys.executable
+LOG_PATH        = os.path.join(BASE, "magic_log.jsonl")
+ENV_PATH        = os.path.join(BASE, ".env")
+
+_brave_proc = None   # track our Brave PID — only kill OUR instance, not all Brave windows
 
 def load_env():
     env = {}
@@ -137,13 +140,27 @@ def _cdp_up():
     except OSError:
         return False
 
+def _kill_our_brave():
+    global _brave_proc
+    if _brave_proc is not None:
+        try:
+            _brave_proc.kill()
+        except Exception:
+            pass
+        _brave_proc = None
+        time.sleep(2)
+
 def ensure_brave():
+    global _brave_proc
     if _cdp_up():
         return True
-    subprocess.run(["taskkill", "/F", "/IM", "brave.exe"], capture_output=True)
-    time.sleep(2)
-    subprocess.Popen([BRAVE_PATH, f"--remote-debugging-port={CDP_PORT}",
-                      "--no-first-run", "--no-default-browser-check"])
+    _kill_our_brave()   # kill only OUR Brave — regular Brave windows are untouched
+    _brave_proc = subprocess.Popen([
+        BRAVE_PATH,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--profile-directory={BRAVE_PROFILE}",
+        "--no-first-run", "--no-default-browser-check",
+    ])
     for _ in range(15):
         if _cdp_up():
             time.sleep(2); return True
@@ -161,7 +178,7 @@ def connect():
 def open_keyword_tab(driver, kw):
     url = "https://www.pinterest.com/search/pins/?q=" + kw.replace(" ", "+") + "&rs=typed"
     existing = set(driver.window_handles)
-    subprocess.Popen([BRAVE_PATH, url])
+    driver.execute_script(f"window.open('{url}', '_blank')")  # open inside our Brave, not the user's
     for _ in range(15):
         time.sleep(1)
         new = set(driver.window_handles) - existing
@@ -363,6 +380,7 @@ def main():
             driver.quit()
         except Exception:
             pass
+        _kill_our_brave()   # close only the MagicScroll Brave, not the user's windows
         if scrolled_kws:
             run_step(f"build database ({len(scrolled_kws)} keywords)", BUILD_ARGS)
 
