@@ -150,6 +150,28 @@ def _kill_our_brave():
         _brave_proc = None
         time.sleep(2)
 
+def _find_brave_profile_dir(display_name: str) -> str:
+    """Return the real folder name (e.g. 'Profile 1') for a profile whose display name matches."""
+    ud = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                      "BraveSoftware", "Brave-Browser", "User Data")
+    state_file = os.path.join(ud, "Local State")
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, encoding="utf-8") as f:
+                state = json.load(f)
+            cache = state.get("profile", {}).get("info_cache", {})
+            for dir_name, info in cache.items():
+                if info.get("name", "").strip().lower() == display_name.strip().lower():
+                    print(f"  Found '{display_name}' profile → directory: {dir_name}")
+                    return dir_name
+            # Print available profiles to help user diagnose
+            names = {d: info.get("name", "?") for d, info in cache.items()}
+            print(f"  WARNING: No profile named '{display_name}' found.")
+            print(f"  Available profiles: {names}")
+        except Exception as e:
+            print(f"  Could not read Brave Local State: {e}")
+    return display_name   # fallback — use as-is
+
 def _find_brave():
     candidates = [
         BRAVE_PATH,
@@ -174,10 +196,11 @@ def ensure_brave():
         print("  Set BRAVE_PATH at the top of magic_scroll.py to the correct location.")
         return False
 
+    profile_dir = _find_brave_profile_dir(BRAVE_PROFILE)
     _brave_proc = subprocess.Popen([
         brave,
         f"--remote-debugging-port={CDP_PORT}",
-        f"--profile-directory={BRAVE_PROFILE}",
+        f"--profile-directory={profile_dir}",
         "--no-first-run", "--no-default-browser-check",
         "--disable-features=Translate",
         "--disable-default-apps",
