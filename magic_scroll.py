@@ -36,6 +36,7 @@ import os, sys, time, socket, subprocess, re, json, datetime, platform
 BASE            = os.path.dirname(os.path.abspath(__file__))
 CDP_PORT        = 9222
 BRAVE_PATH      = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+BRAVE_PROFILE   = "MagicScroll"   # separate profile — install SortPin + login to Pinterest here once
 PY              = sys.executable
 LOG_PATH        = os.path.join(BASE, "magic_log.jsonl")
 ENV_PATH        = os.path.join(BASE, ".env")
@@ -176,15 +177,22 @@ def ensure_brave():
     _brave_proc = subprocess.Popen([
         brave,
         f"--remote-debugging-port={CDP_PORT}",
+        f"--profile-directory={BRAVE_PROFILE}",
         "--no-first-run", "--no-default-browser-check",
+        "--disable-features=Translate",
+        "--disable-default-apps",
+        "--disable-sync",
     ])
-    # New profile takes longer on first launch — wait up to 30s
-    for _ in range(30):
+    # Wait up to 60s — first launch of MagicScroll profile can be slow
+    for i in range(60):
         if _cdp_up():
             time.sleep(2); return True
+        if i == 10:
+            print("  (waiting for Brave... if first launch of MagicScroll profile, takes ~20s)")
         time.sleep(1)
     print(f"  ERROR: Brave started (PID {_brave_proc.pid}) but CDP port {CDP_PORT} never opened.")
-    print("  Check that no other app is using port", CDP_PORT)
+    print(f"  • Make sure MagicScroll profile exists in Brave (Profiles menu → Add profile)")
+    print(f"  • Install SortPin + log into Pinterest in that profile")
     return False
 
 def connect():
