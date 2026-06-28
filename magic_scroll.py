@@ -241,7 +241,7 @@ def open_keyword_tab(driver, kw):
 def click_start(driver):
     """Native (trusted) click on SortPin's 'Start Scroll' for the current tab."""
     from selenium.webdriver.common.by import By
-    for _ in range(12):
+    for _ in range(20):
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
         except Exception:
@@ -341,7 +341,7 @@ def scroll_keyword(driver, kw, base_tab, minutes, cycle=0):
     print(f"    ▶ '{kw}' — up to {minutes:g} min")
     t0 = time.time()
     open_keyword_tab(driver, kw)
-    time.sleep(6)
+    time.sleep(12)   # give SortPin extension time to inject its overlay
     started = click_start(driver)
     print("      " + ("SortPin scrolling" if started else "⚠ could not start SortPin (continuing)"))
     why = wait_pins(driver, int(minutes * 60))   # ends early when no new pins
