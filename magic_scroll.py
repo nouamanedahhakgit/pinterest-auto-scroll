@@ -316,7 +316,7 @@ def main():
         print("  claimed (pending):", ", ".join(kws))
         log_event(event="claim", cycle=cycle, keywords=kws, count=len(kws))
 
-        # scroll every claimed keyword
+        # scroll every claimed keyword — keep Brave open the whole cycle
         if not ensure_brave():
             print("  Could not start Brave — releasing keywords is not automatic; "
                   "set them back to 'Not Yet' on the sheet if needed.")
@@ -324,45 +324,68 @@ def main():
         driver = connect()
         base_tab = driver.current_window_handle
         cyc_start = time.time()
+        scrolled_kws = []
         for idx, kw in enumerate(kws):
-            if idx > 0:
+            # Reconnect only if Brave died mid-cycle
+            if not _cdp_up():
+                print(f"  Brave lost — reconnecting before '{kw}'…")
                 if not ensure_brave():
-                    print("  Could not restart Brave. Breaking cycle.")
+                    print("  Could not restart Brave. Stopping cycle early.")
                     break
                 driver = connect()
                 base_tab = driver.current_window_handle
 
             scroll_keyword(driver, kw, base_tab, MINUTES, cycle=cycle)
+            scrolled_kws.append(kw)
+            # Just close Pinterest tab — keep Brave alive for next keyword
+            close_pinterest_tabs(driver, base_tab)
 
-            # Safely close Selenium before build closes Brave
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        # ── Build DB once for the whole cycle (not once per keyword) ──────────
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        if scrolled_kws:
+            run_step(f"build database ({len(scrolled_kws)} keywords)", BUILD_ARGS)
 
-            # Build database for this keyword immediately
-            run_step("build database for keyword", BUILD_ARGS + ["--keyword", kw])
-            
-            # Clear SortPin after building (closes Brave and archives data)
+            # ── Sync to MySQL then clear local SQLite ─────────────────────────
+            db_path = os.path.join(BASE, "sortpin.db")
+            synced = False
+            if os.path.exists(db_path):
+                try:
+                    import sqlite3
+                    con = sqlite3.connect(db_path)
+                    db_pins_after    = con.execute("SELECT COUNT(*) FROM pins").fetchone()[0]
+                    db_created_after = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='created'").fetchone()[0]
+                    db_saved_after   = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='saved'").fetchone()[0]
+                    con.close()
+                except Exception:
+                    db_pins_after = db_created_after = db_saved_after = 0
+
+                print(f"  [Magic Status] Pins in local DB: {db_pins_after} "
+                      f"(created: {db_created_after}, saved: {db_saved_after})")
+
+                # Push to MySQL
+                sync_result = subprocess.run(
+                    [PY, "8_sync_to_mysql.py"], cwd=BASE, capture_output=False
+                )
+                synced = sync_result.returncode == 0
+
+                if synced:
+                    # Clear local SQLite — MySQL is now the source of truth
+                    try:
+                        os.remove(db_path)
+                        print("  Local sortpin.db cleared — MySQL holds all data.")
+                    except Exception as e:
+                        print(f"  Warning: could not delete sortpin.db: {e}")
+                else:
+                    print("  MySQL sync failed — keeping sortpin.db locally (data safe).")
+            else:
+                db_pins_after = db_created_after = db_saved_after = 0
+
             run_step("clear SortPin", ["6_clear_sortpin.py", "--yes"])
 
-        # Fetch database statistics after cycle to print status and log event
-        db_pins_after = 0
-        db_created_after = 0
-        db_saved_after = 0
-        db_path = os.path.join(BASE, "sortpin.db")
-        if os.path.exists(db_path):
-            try:
-                import sqlite3
-                con = sqlite3.connect(db_path)
-                db_pins_after = con.execute("SELECT COUNT(*) FROM pins").fetchone()[0]
-                db_created_after = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='created'").fetchone()[0]
-                db_saved_after = con.execute("SELECT COUNT(*) FROM pins WHERE pin_type='saved'").fetchone()[0]
-                con.close()
-            except Exception:
-                pass
-
-        print(f"  [Magic Status] Total Pins in DB: {db_pins_after} (created: {db_created_after}, saved: {db_saved_after})")
+        print(f"  [Magic Status] Total Pins this cycle: {db_pins_after} (created: {db_created_after}, saved: {db_saved_after})")
 
         log_event(event="cycle_done", cycle=cycle, keywords=kws,
                   seconds=int(time.time() - cyc_start),

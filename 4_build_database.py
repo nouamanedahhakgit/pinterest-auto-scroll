@@ -297,7 +297,77 @@ def _numeric_cols(cols, pk, rows):
             num.add(c)
     return num
 
-def write_sqlite(data, keyword=None):
+def _upsert_into_sqlite(data, keyword=None):
+    """
+    Fast incremental path: INSERT OR REPLACE only new records into existing DB.
+    Does NOT delete/recreate the DB — proportional to new data size only.
+    """
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA cache_size=-32768")
+
+    for table, pk in _TABLE_PK.items():
+        rows = data.get(table) or []
+        if not rows:
+            continue
+        cols = _columns_for(pk, rows)
+        if table in ("pinners", "boards") and "status" not in cols:
+            cols.append("status")
+
+        # Ensure table exists (create if first run)
+        try:
+            con.execute(f'SELECT 1 FROM "{table}" LIMIT 1')
+        except sqlite3.OperationalError:
+            num = _numeric_cols(cols, pk, rows)
+            defs = ", ".join(
+                f'"{c}" {"INTEGER" if c in num else "TEXT"}' + (" PRIMARY KEY" if c == pk else "")
+                for c in cols)
+            con.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({defs})')
+
+        placeholders = ", ".join("?" for _ in cols)
+        col_list     = ", ".join(f'"{c}"' for c in cols)
+        sql = f'INSERT OR REPLACE INTO "{table}" ({col_list}) VALUES ({placeholders})'
+
+        to_insert = []
+        for row in rows:
+            vals = []
+            for c in cols:
+                v = row.get(c)
+                if c == "status" and table in ("pinners", "boards"):
+                    # Preserve existing status if row already in DB
+                    v = v or None
+                vals.append(v)
+            to_insert.append(vals)
+
+        if to_insert:
+            con.executemany(sql, to_insert)
+
+    # Update keyword status if provided
+    if keyword:
+        try:
+            con.execute(
+                'INSERT OR REPLACE INTO keywords (keyword, status, last_scraped_at) VALUES (?,?,?)',
+                [keyword, "Done", current_time]
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    con.commit()
+    con.close()
+
+    total = sum(len(data.get(t) or []) for t in _TABLE_PK)
+    print(f"  (incremental) Upserted {total} record(s) into existing DB. ✓")
+
+    # Write MySQL export (append mode not supported — skip in incremental)
+    try:
+        _write_mysql_export(data)
+    except Exception:
+        pass
+
+
+def write_sqlite(data, keyword=None, is_incremental=False):
     # 1) Preserve existing status values from DB before removing/recreating it
     existing_statuses = {"pinners": {}, "boards": {}}
     existing_keywords = {}
@@ -361,14 +431,15 @@ def write_sqlite(data, keyword=None):
         except Exception:
             pass
 
-    # Fetch latest statuses from Google Sheets
+    # Fetch latest statuses from Google Sheets (skip in incremental mode — saves ~5s)
     sheet_statuses = {}
-    try:
-        import google_sheets_client as gsc
-        webapp = gsc.resolve_webapp()
-        sheet_statuses = gsc.get_existing_sheet_statuses(webapp)
-    except Exception as e:
-        print(f"  (sync) could not fetch statuses from Google Sheets: {e}")
+    if not is_incremental:
+        try:
+            import google_sheets_client as gsc
+            webapp = gsc.resolve_webapp()
+            sheet_statuses = gsc.get_existing_sheet_statuses(webapp)
+        except Exception as e:
+            print(f"  (sync) could not fetch statuses from Google Sheets: {e}")
 
     # Load progress.json statuses
     progress_statuses = {}
@@ -443,6 +514,9 @@ def write_sqlite(data, keyword=None):
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA cache_size=-32768")
     for table, pk in _TABLE_PK.items():
         rows = data[table]
         cols = _columns_for(pk, rows)
@@ -1347,27 +1421,42 @@ def main():
         print("  Reading SortPin CSV data from this folder...")
         csv_leads, csv_boards, csv_pins = load_from_csv()
 
-    # Load historical data from SQLite database to avoid scanning slow disk archives.
-    db_leads, db_boards, db_pins = [], [], []
+    # --incremental: skip loading 64K historical records — only upsert new data
+    is_incremental = "--incremental" in args
     has_archive_arg = ("--archive" in args) or ("archive" in args)
-    if not has_archive_arg:
-        db_leads, db_boards, db_pins = load_from_sqlite()
 
-    # 3) Combine live data (CDP or disk IndexedDB) directly with local CSVs and SQLite historical data
-    leads = (live[0] if (live and live[0]) else []) + db_leads + csv_leads
-    boards = (live[1] if (live and live[1]) else []) + db_boards + csv_boards
-    pins = (live[2] if (live and live[2]) else []) + db_pins + csv_pins
+    if is_incremental and os.path.exists(DB_PATH):
+        # Fast path: normalize only the new live/csv data and UPSERT into existing DB
+        new_leads  = (live[0] if (live and live[0]) else []) + csv_leads
+        new_boards = (live[1] if (live and live[1]) else []) + csv_boards
+        new_pins   = (live[2] if (live and live[2]) else []) + csv_pins
+        if not (new_leads or new_boards or new_pins):
+            print("\n  ⚠  No new data found.\n"); sys.exit(1)
+        print(f"\n  [incremental] Upserting {len(new_leads)} pinner(s), "
+              f"{len(new_boards)} board(s), {len(new_pins)} pin(s) into existing DB...")
+        data = normalize(new_leads, new_boards, new_pins)
+        data = _clean_bytes(data)
+        _upsert_into_sqlite(data, keyword=keyword_arg)
+    else:
+        # Full rebuild path (default)
+        db_leads, db_boards, db_pins = [], [], []
+        if not has_archive_arg:
+            db_leads, db_boards, db_pins = load_from_sqlite()
 
-    if not (leads or boards or pins):
-        print("\n  ⚠  No data found.\n"
-              "     Export Pins / Boards / Pinners from the SortPin popup and put\n"
-              "     the 3 CSV files in this folder, then re-run.\n")
-        sys.exit(1)
+        leads  = (live[0] if (live and live[0]) else []) + db_leads + csv_leads
+        boards = (live[1] if (live and live[1]) else []) + db_boards + csv_boards
+        pins   = (live[2] if (live and live[2]) else []) + db_pins + csv_pins
 
-    print("\n  Normalizing into Pinner → Boards → Pins ...")
-    data = normalize(leads, boards, pins)
-    data = _clean_bytes(data)
-    write_sqlite(data, keyword=keyword_arg)
+        if not (leads or boards or pins):
+            print("\n  ⚠  No data found.\n"
+                  "     Export Pins / Boards / Pinners from the SortPin popup and put\n"
+                  "     the 3 CSV files in this folder, then re-run.\n")
+            sys.exit(1)
+
+        print("\n  Normalizing into Pinner → Boards → Pins ...")
+        data = normalize(leads, boards, pins)
+        data = _clean_bytes(data)
+        write_sqlite(data, keyword=keyword_arg)
     
     # If a keyword was successfully processed, mark it done in progress.json & Google Sheets
     if keyword_arg:
