@@ -238,56 +238,66 @@ def open_keyword_tab(driver, kw):
     if driver.window_handles:
         driver.switch_to.window(driver.window_handles[-1])
 
+SORTPIN_EXT_ID = "djcledakkebdgjncnemijiabiaimbaic"
+
 def click_start(driver):
-    """Native (trusted) click on SortPin's 'Start Scroll' for the current tab."""
+    """Open SortPin popup, click Start Scroll, then return to Pinterest tab."""
     from selenium.webdriver.common.by import By
-    for _ in range(20):
+    pinterest_tab = driver.current_window_handle
+
+    # Open the SortPin popup in a new tab
+    popup_url = f"chrome-extension://{SORTPIN_EXT_ID}/popup.html"
+    try:
+        existing = set(driver.window_handles)
+        driver.execute_script(f"window.open('{popup_url}', '_blank')")
+        time.sleep(3)
+        new_tabs = set(driver.window_handles) - existing
+        if not new_tabs:
+            return False
+        popup_tab = next(iter(new_tabs))
+        driver.switch_to.window(popup_tab)
+    except Exception:
+        return False
+
+    # Look for Start Scroll / Stop Scroll button in the popup
+    started = False
+    for _ in range(15):
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
-        except Exception:
-            time.sleep(2)
-            continue
+            texts = [(b, (b.text or "").lower()) for b in btns]
 
-        # Check if already scrolling
-        has_stop = False
-        for b in btns:
-            try:
-                if "stop scroll" in (b.text or "").lower():
-                    has_stop = True
+            if any("stop scroll" in t for _, t in texts):
+                started = True
+                break                       # already scrolling
+
+            for b, t in texts:
+                if "start scroll" in t or "start" in t:
+                    try:
+                        driver.execute_script("arguments[0].click();", b)
+                        time.sleep(2)
+                        # verify
+                        after = [(x.text or "").lower() for x in driver.find_elements(By.TAG_NAME, "button")]
+                        if any("stop scroll" in a or "stop" in a for a in after):
+                            started = True
+                    except Exception:
+                        pass
                     break
-            except Exception:
-                pass
-
-        if has_stop:
-            return True                                    # already scrolling
-
-        for b in btns:
-            try:
-                t = (b.text or "").lower()
-            except Exception:
-                continue
-            if "start scroll" in t:
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
-                    time.sleep(0.2)
-                    b.click()
-                    time.sleep(1.5)
-                    
-                    # Verify it flipped to stop scroll
-                    has_stop_after = False
-                    for x in driver.find_elements(By.TAG_NAME, "button"):
-                        try:
-                            if "stop scroll" in (x.text or "").lower():
-                                has_stop_after = True
-                                break
-                        except Exception:
-                            pass
-                    if has_stop_after:
-                        return True
-                except Exception:
-                    pass
+        except Exception:
+            pass
+        if started:
+            break
         time.sleep(2)
-    return False
+
+    # Close popup tab, return to Pinterest
+    try:
+        driver.close()
+    except Exception:
+        pass
+    try:
+        driver.switch_to.window(pinterest_tab)
+    except Exception:
+        pass
+    return started
 
 def close_pinterest_tabs(driver, base_tab):
     for h in list(driver.window_handles):
