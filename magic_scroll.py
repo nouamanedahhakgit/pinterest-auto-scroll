@@ -33,15 +33,12 @@ Run:
 
 import os, sys, time, socket, subprocess, re, json, datetime, platform
 
-BASE            = os.path.dirname(os.path.abspath(__file__))
-CDP_PORT        = 9222
-BRAVE_PATH      = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-BRAVE_PROFILE   = "MagicScroll"   # separate profile — install SortPin + login to Pinterest here once
-PY              = sys.executable
-LOG_PATH        = os.path.join(BASE, "magic_log.jsonl")
-ENV_PATH        = os.path.join(BASE, ".env")
-
-_brave_proc = None   # track our Brave PID — only kill OUR instance, not all Brave windows
+BASE       = os.path.dirname(os.path.abspath(__file__))
+CDP_PORT   = 9222
+BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+PY         = sys.executable
+LOG_PATH   = os.path.join(BASE, "magic_log.jsonl")
+ENV_PATH   = os.path.join(BASE, ".env")
 
 def load_env():
     env = {}
@@ -140,82 +137,17 @@ def _cdp_up():
     except OSError:
         return False
 
-def _kill_our_brave():
-    global _brave_proc
-    if _brave_proc is not None:
-        try:
-            _brave_proc.kill()
-        except Exception:
-            pass
-        _brave_proc = None
-        time.sleep(2)
-
-def _find_brave_profile_dir(display_name: str) -> str:
-    """Return the real folder name (e.g. 'Profile 1') for a profile whose display name matches."""
-    ud = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                      "BraveSoftware", "Brave-Browser", "User Data")
-    state_file = os.path.join(ud, "Local State")
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, encoding="utf-8") as f:
-                state = json.load(f)
-            cache = state.get("profile", {}).get("info_cache", {})
-            for dir_name, info in cache.items():
-                if info.get("name", "").strip().lower() == display_name.strip().lower():
-                    print(f"  Found '{display_name}' profile → directory: {dir_name}")
-                    return dir_name
-            # Print available profiles to help user diagnose
-            names = {d: info.get("name", "?") for d, info in cache.items()}
-            print(f"  WARNING: No profile named '{display_name}' found.")
-            print(f"  Available profiles: {names}")
-        except Exception as e:
-            print(f"  Could not read Brave Local State: {e}")
-    return display_name   # fallback — use as-is
-
-def _find_brave():
-    candidates = [
-        BRAVE_PATH,
-        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return None
-
 def ensure_brave():
-    global _brave_proc
     if _cdp_up():
         return True
-    _kill_our_brave()   # kill only OUR Brave — regular Brave windows are untouched
-
-    brave = _find_brave()
-    if not brave:
-        print(f"  ERROR: brave.exe not found. Checked: {BRAVE_PATH}")
-        print("  Set BRAVE_PATH at the top of magic_scroll.py to the correct location.")
-        return False
-
-    profile_dir = _find_brave_profile_dir(BRAVE_PROFILE)
-    _brave_proc = subprocess.Popen([
-        brave,
-        f"--remote-debugging-port={CDP_PORT}",
-        f"--profile-directory={profile_dir}",
-        "--no-first-run", "--no-default-browser-check",
-        "--disable-features=Translate",
-        "--disable-default-apps",
-        "--disable-sync",
-    ])
-    # Wait up to 60s — first launch of MagicScroll profile can be slow
-    for i in range(60):
+    subprocess.run(["taskkill", "/F", "/IM", "brave.exe"], capture_output=True)
+    time.sleep(2)
+    subprocess.Popen([BRAVE_PATH, f"--remote-debugging-port={CDP_PORT}",
+                      "--no-first-run", "--no-default-browser-check"])
+    for _ in range(15):
         if _cdp_up():
             time.sleep(2); return True
-        if i == 10:
-            print("  (waiting for Brave... if first launch of MagicScroll profile, takes ~20s)")
         time.sleep(1)
-    print(f"  ERROR: Brave started (PID {_brave_proc.pid}) but CDP port {CDP_PORT} never opened.")
-    print(f"  • Make sure MagicScroll profile exists in Brave (Profiles menu → Add profile)")
-    print(f"  • Install SortPin + log into Pinterest in that profile")
     return False
 
 def connect():
@@ -229,7 +161,7 @@ def connect():
 def open_keyword_tab(driver, kw):
     url = "https://www.pinterest.com/search/pins/?q=" + kw.replace(" ", "+") + "&rs=typed"
     existing = set(driver.window_handles)
-    driver.execute_script(f"window.open('{url}', '_blank')")  # open inside our Brave, not the user's
+    subprocess.Popen([BRAVE_PATH, url])
     for _ in range(15):
         time.sleep(1)
         new = set(driver.window_handles) - existing
@@ -238,66 +170,40 @@ def open_keyword_tab(driver, kw):
     if driver.window_handles:
         driver.switch_to.window(driver.window_handles[-1])
 
-SORTPIN_EXT_ID = "djcledakkebdgjncnemijiabiaimbaic"
-
 def click_start(driver):
-    """Open SortPin popup, click Start Scroll, then return to Pinterest tab."""
+    """Click SortPin's Start Scroll button on the current Pinterest page."""
     from selenium.webdriver.common.by import By
-    pinterest_tab = driver.current_window_handle
-
-    # Open the SortPin popup in a new tab
-    popup_url = f"chrome-extension://{SORTPIN_EXT_ID}/popup.html"
-    try:
-        existing = set(driver.window_handles)
-        driver.execute_script(f"window.open('{popup_url}', '_blank')")
-        time.sleep(3)
-        new_tabs = set(driver.window_handles) - existing
-        if not new_tabs:
-            return False
-        popup_tab = next(iter(new_tabs))
-        driver.switch_to.window(popup_tab)
-    except Exception:
-        return False
-
-    # Look for Start Scroll / Stop Scroll button in the popup
-    started = False
-    for _ in range(15):
+    for _ in range(12):
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
-            texts = [(b, (b.text or "").lower()) for b in btns]
-
-            if any("stop scroll" in t for _, t in texts):
-                started = True
-                break                       # already scrolling
-
-            for b, t in texts:
-                if "start scroll" in t or "start" in t:
-                    try:
-                        driver.execute_script("arguments[0].click();", b)
-                        time.sleep(2)
-                        # verify
-                        after = [(x.text or "").lower() for x in driver.find_elements(By.TAG_NAME, "button")]
-                        if any("stop scroll" in a or "stop" in a for a in after):
-                            started = True
-                    except Exception:
-                        pass
-                    break
         except Exception:
-            pass
-        if started:
-            break
-        time.sleep(2)
+            time.sleep(2)
+            continue
 
-    # Close popup tab, return to Pinterest
-    try:
-        driver.close()
-    except Exception:
-        pass
-    try:
-        driver.switch_to.window(pinterest_tab)
-    except Exception:
-        pass
-    return started
+        for b in btns:
+            try:
+                if "stop scroll" in (b.text or "").lower():
+                    return True   # already scrolling
+            except Exception:
+                pass
+
+        for b in btns:
+            try:
+                if "start scroll" in (b.text or "").lower():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                    time.sleep(0.2)
+                    b.click()
+                    time.sleep(1.5)
+                    for x in driver.find_elements(By.TAG_NAME, "button"):
+                        try:
+                            if "stop scroll" in (x.text or "").lower():
+                                return True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        time.sleep(2)
+    return False
 
 def close_pinterest_tabs(driver, base_tab):
     for h in list(driver.window_handles):
@@ -351,7 +257,7 @@ def scroll_keyword(driver, kw, base_tab, minutes, cycle=0):
     print(f"    ▶ '{kw}' — up to {minutes:g} min")
     t0 = time.time()
     open_keyword_tab(driver, kw)
-    time.sleep(12)   # give SortPin extension time to inject its overlay
+    time.sleep(6)
     started = click_start(driver)
     print("      " + ("SortPin scrolling" if started else "⚠ could not start SortPin (continuing)"))
     why = wait_pins(driver, int(minutes * 60))   # ends early when no new pins
@@ -441,7 +347,7 @@ def main():
             driver.quit()
         except Exception:
             pass
-        _kill_our_brave()   # close only the MagicScroll Brave, not the user's windows
+
         if scrolled_kws:
             run_step(f"build database ({len(scrolled_kws)} keywords)", BUILD_ARGS)
 
