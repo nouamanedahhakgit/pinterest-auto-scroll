@@ -19,7 +19,7 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `5_view_data.py` | Prints statistics + builds/opens `sortpin_viewer.html` to browse Pinner→Boards→Pins. |
 | `6_clear_sortpin.py` | Archives extension data into `_SORTPIN_ARCHIVE/` then clears it from Brave. Run step 4 first to save. |
 | `7_scrape_profiles.py` | **Deep scrape:** for each pinner → open profile → open every board → scroll till end. Resumable (`profiles_progress.json`). |
-| `magic_scroll.py` | **All-in-one multi-computer loop:** claim 5 keywords from sheet (pending) → scroll → build DB → mark Done → clear SortPin → repeat. |
+| `magic_scroll.py` | **All-in-one multi-computer loop:** claim 5 keywords from sheet (pending) → scroll → build DB → mark Done → clear SortPin → repeat. Also has a **pinner mode** (`--pinner N`) that deep-scrapes pinners instead — see below. |
 | `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
 | `sortpin_data.json` | Auto-created (step 4). Flat pinners/boards/pins arrays (feeds the viewer). |
 | `sortpin_viewer.html` | Auto-created (step 5). Offline browser with Pinners / Boards / Pins tabs. |
@@ -52,6 +52,9 @@ python 7_scrape_profiles.py --limit 50  # process 50 pinners this run (resumable
 python magic_scroll.py                  # multi-PC: claim→scroll→build→done→clear→repeat (5 min/kw)
 python magic_scroll.py --2m --batch 5   # 2 min per keyword, 5 keywords per cycle
 python magic_scroll.py --disk           # build DB from disk each cycle (needs ccl_chromium_reader)
+python magic_scroll.py --pinner 10      # PINNER MODE: claim 10 pinners from sortpin.db, deep-scrape each (5 min/board default)
+python magic_scroll.py --pinner 10 --15m       # 15 min cap per board/profile instead of the 5 min default
+python magic_scroll.py --pinner 10 --blog-only # only pinners step 7 classified as "blog" sites
 ```
 
 ## magic_scroll — multi-computer workflow
@@ -61,6 +64,21 @@ python magic_scroll.py --disk           # build DB from disk each cycle (needs c
   on the sheet, run step 6 to **clear** SortPin (archived first), then repeat.
 - One-time: redeploy `google_sheets_apps_script.js` (v3, has claim/mark) as the web app;
   `google_sheets_webapp.json` holds the `/exec` URL. Sheet col A = keyword, col D = Status.
+
+## magic_scroll — pinner mode (`--pinner N`)
+- Same script, totally different loop: deep-scrapes **pinners** instead of keywords. No
+  Google Sheet involved — pinners + progress live in `sortpin.db`'s `status` column
+  (`pinners`/`boards` tables, same as step 7), so it's resumable and multi-PC safe just by
+  re-running (claimed rows are marked `'running'` immediately).
+- Each cycle: **claim** up to N not-`done` pinners (highest `follower_count` first) →
+  **scan** each one (saved profile → boards, created profile → created pins, then every
+  board scrolled till it stops loading new pins — step 7's logic) → **build** the DB
+  (`sortpin.db` is *never* deleted in this mode, since it's what tracks progress) →
+  **clear** SortPin → repeat until no pinners are left.
+- `--blog-only` adds step 7's "only pinners whose site is classified as a blog" filter.
+  It's off by default because `scraped_websites` currently has very few classified
+  domains — with it on by default the filter would silently match nothing.
+- Per-board/profile time cap defaults to 5 minutes; override with `--Nm` (e.g. `--15m`).
 
 ## Steps 4 & 5 — SortPin data → relational DB + viewer
 - **Data model:** `leads` CSV = master pinners; `boards` link to pinner via `owner_username`;
