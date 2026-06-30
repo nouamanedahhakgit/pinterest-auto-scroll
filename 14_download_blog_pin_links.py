@@ -520,6 +520,31 @@ def ensure_mysql_pinner_columns(mysql_conn):
     cur.close()
 
 
+def _pinners_username_collation(mysql_conn) -> str:
+    """Looks up the ACTUAL collation of pinners.username on this server,
+    rather than assuming one. 8_sync_to_mysql.py's CREATE TABLE only sets a
+    table-level DEFAULT CHARSET=utf8mb4 (no explicit COLLATE), so the column's
+    real collation is whatever the schema's default happened to be at the
+    moment that table was first created -- which can silently differ from a
+    bare CREATE TEMPORARY TABLE's default collation (e.g. utf8mb4_unicode_ci
+    vs utf8mb4_0900_ai_ci), and MySQL refuses to compare two columns with
+    different *implicit* collations ('Illegal mix of collations'). Matching
+    the temp table's column to the real one exactly avoids that, instead of
+    hardcoding a guess that only works on some servers."""
+    cur = mysql_conn.cursor()
+    try:
+        cur.execute(
+            "SELECT COLLATION_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pinners' AND COLUMN_NAME = 'username'"
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] else "utf8mb4_unicode_ci"
+    except Exception:
+        return "utf8mb4_unicode_ci"
+    finally:
+        cur.close()
+
+
 def sync_site_types_mysql(mysql_conn, classifications: dict) -> int:
     """Writes the Sheet's real site_type STRING (Blog / Store / Link-in-Bio /
     General Website / etc., not just a blog/not-blog flag) straight into
@@ -538,16 +563,20 @@ def sync_site_types_mysql(mysql_conn, classifications: dict) -> int:
     row, so 40k+ classified pinners meant 40k+ round trips to the remote DB
     (the actual cause of this step taking minutes). INSERT batches fine, so
     we stage all (username, site_type) pairs into a temp table with batched
-    INSERTs, then do the whole update as one JOIN statement."""
+    INSERTs, then do the whole update as one JOIN statement. The temp table's
+    username column is created with the SAME collation as pinners.username
+    (looked up via _pinners_username_collation) so the JOIN never hits
+    MySQL's 'Illegal mix of collations' error."""
     if not classifications:
         return 0
     items = list(classifications.items())
+    collation = _pinners_username_collation(mysql_conn)
     cur = mysql_conn.cursor()
     try:
         cur.execute("DROP TEMPORARY TABLE IF EXISTS tmp_site_types")
         cur.execute(
             "CREATE TEMPORARY TABLE tmp_site_types ("
-            "username VARCHAR(190) PRIMARY KEY, site_type VARCHAR(64))"
+            f"username VARCHAR(190) COLLATE {collation} PRIMARY KEY, site_type VARCHAR(64))"
         )
         insert_sql = "INSERT INTO tmp_site_types (username, site_type) VALUES (%s, %s)"
         batch_size = 5000
