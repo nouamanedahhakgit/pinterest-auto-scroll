@@ -820,6 +820,71 @@ def load_webapp_config():
     except Exception:
         return None
 
+def claim_from_db(count: int) -> list:
+    """Claim up to `count` pinner domains directly from the DB — no Google Sheet needed.
+    Marks each claimed domain as 'running' immediately so other instances skip it.
+    Returns list of {"url": ..., "scrapped": "Running"} dicts."""
+    db = get_db_connection()
+    try:
+        init_bulk_tables(db)
+        now = db_now()
+        # Find pinner domains not yet in scraped_websites at all, ordered by follower_count desc
+        if db.is_mysql:
+            q = """
+                SELECT p.domain_url AS domain, p.website_url AS website_url
+                FROM pinners p
+                LEFT JOIN scraped_websites sw ON sw.domain = p.domain_url
+                WHERE p.domain_url IS NOT NULL AND p.domain_url != ''
+                  AND sw.domain IS NULL
+                ORDER BY COALESCE(p.follower_count, 0) DESC
+                LIMIT %s
+            """
+            rows = db.execute(q, [count]).fetchall()
+        else:
+            q = """
+                SELECT p.domain_url AS domain, p.website_url AS website_url
+                FROM pinners p
+                LEFT JOIN scraped_websites sw ON sw.domain = p.domain_url
+                WHERE p.domain_url IS NOT NULL AND p.domain_url != ''
+                  AND sw.domain IS NULL
+                ORDER BY COALESCE(p.follower_count, 0) DESC
+                LIMIT ?
+            """
+            rows = db.execute(q, [count]).fetchall()
+
+        if not rows:
+            return []
+
+        claimed = []
+        for row in rows:
+            domain = row['domain']
+            website_url = row.get('website_url') or f"https://{domain}"
+            url = normalize_url(website_url or f"https://{domain}")
+            # Mark as running immediately (atomic claim)
+            try:
+                if db.is_mysql:
+                    db.execute(
+                        "INSERT INTO scraped_websites (domain, url, status, last_scraped_at) VALUES (%s, %s, 'running', %s) "
+                        "ON DUPLICATE KEY UPDATE status='running', last_scraped_at=%s",
+                        [domain, url, now, now]
+                    )
+                else:
+                    db.execute(
+                        "INSERT OR REPLACE INTO scraped_websites (domain, url, status, last_scraped_at) VALUES (?, ?, 'running', ?)",
+                        [domain, url, now]
+                    )
+            except Exception:
+                pass
+            claimed.append({"url": url, "scrapped": "Running"})
+        db.commit()
+        return claimed
+    except Exception as e:
+        print(f"  Warning: claim_from_db failed: {e}")
+        return []
+    finally:
+        db.close()
+
+
 def get_websites_from_sheets() -> list:
     cfg = load_webapp_config()
     if not cfg:
@@ -2338,6 +2403,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--run", action="store_true", help="Bulk scan pending domains listed in Google Sheets and exit (this is also the default when no flags are given)")
     parser.add_argument("--runjobforall", action="store_true", help="Bulk scan all domains listed in Google Sheets and exit")
+    parser.add_argument("--db", action="store_true", help="Bot mode: read pinner domains directly from DB (no Google Sheet), never stops, polls every --poll-minutes for new pinners")
+    parser.add_argument("--poll-minutes", type=int, default=5, help="Minutes to wait between polls in --db bot mode (default 5)")
     parser.add_argument("--serve", action="store_true", help="Start the Flask API server instead of bulk-scanning")
     parser.add_argument("--reset-running", action="store_true",
                         help="Reset all 'Running' sites to 'Not Yet' in DB and Google Sheets, then exit")
@@ -2386,6 +2453,112 @@ def main() -> int:
             db.close()
 
         app.run(host=args.host, port=args.port, debug=False, threaded=True)
+        return 0
+
+    # --db is default unless --serve / --run / --runjobforall / other flags given
+    if not args.serve and not args.run and not args.runjobforall and not args.reset_running and not args.fix_site_types and not args.mark_stores and not args.recheck_blogs:
+        args.db = True
+
+    # --db bot mode: read directly from DB, never stop
+    if args.db:
+        env_vars = load_env()
+        try:
+            batch_size = int(env_vars.get("BATCH_CLAIM_SIZE", 20))
+        except Exception:
+            batch_size = 20
+        poll_minutes = args.poll_minutes
+        print(f"[DB Bot] Starting — reading pinner domains directly from DB, batch={batch_size}, poll={poll_minutes}min. Ctrl+C to stop.")
+
+        # Initialize DB tables once
+        db = get_db_connection()
+        try:
+            init_bulk_tables(db)
+        finally:
+            db.close()
+
+        pass_num = 0
+        while True:
+            pass_num += 1
+            # Count remaining
+            try:
+                db = get_db_connection()
+                if db.is_mysql:
+                    remaining = db.execute(
+                        "SELECT COUNT(*) AS c FROM pinners p LEFT JOIN scraped_websites sw ON sw.domain = p.domain_url "
+                        "WHERE p.domain_url IS NOT NULL AND p.domain_url != '' AND sw.domain IS NULL"
+                    ).fetchone()['c']
+                else:
+                    remaining = db.execute(
+                        "SELECT COUNT(*) AS c FROM pinners p LEFT JOIN scraped_websites sw ON sw.domain = p.domain_url "
+                        "WHERE p.domain_url IS NOT NULL AND p.domain_url != '' AND sw.domain IS NULL"
+                    ).fetchone()['c']
+                db.close()
+            except Exception:
+                remaining = '?'
+
+            print(f"\n[DB Bot] Pass #{pass_num} — {remaining} pinner domain(s) not yet scraped.")
+
+            if remaining == 0 or remaining == '0':
+                print(f"[DB Bot] All done. Waiting {poll_minutes} min for new pinners...")
+                time.sleep(poll_minutes * 60)
+                continue
+
+            # Claim a batch and scan it
+            batch = claim_from_db(batch_size)
+            if not batch:
+                print(f"[DB Bot] Nothing to claim right now. Waiting {poll_minutes} min...")
+                time.sleep(poll_minutes * 60)
+                continue
+
+            print(f"[DB Bot] Claimed {len(batch)} domain(s): {[s['url'] for s in batch]}")
+
+            from concurrent.futures import ThreadPoolExecutor
+            settings = load_settings()
+            provider = settings.get("quick_scrape_ai_provider", "local")
+            if provider == "openrouter":
+                model = settings.get("quick_scrape_openrouter_model", "openai/gpt-4.1-mini")
+            else:
+                model = settings.get("quick_scrape_groq_model", "llama-3.3-70b-versatile")
+
+            try:
+                max_workers = int(env_vars.get("MAX_BULK_WORKERS", 20))
+            except Exception:
+                max_workers = 20
+
+            def _db_log(msg):
+                print(f"[DB Bot] {msg}")
+
+            def _db_worker(site_info):
+                try:
+                    run_single_scrape(site_info, provider, model, lambda m: print(f"[Bulk Log] [{site_info.get('url','')}] {m}"))
+                except Exception as e:
+                    print(f"[DB Bot] Worker error for {site_info.get('url','')}: {e}")
+
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(batch))) as executor:
+                list(executor.map(_db_worker, batch))
+
+            # Stats after each batch
+            try:
+                db = get_db_connection()
+                row = db.execute(
+                    "SELECT "
+                    "  SUM(CASE WHEN sw.domain IS NULL THEN 1 ELSE 0 END) AS not_yet, "
+                    "  SUM(CASE WHEN sw.status='done' THEN 1 ELSE 0 END) AS done, "
+                    "  SUM(CASE WHEN sw.status='failed' THEN 1 ELSE 0 END) AS failed, "
+                    "  SUM(CASE WHEN sw.status='blocked' THEN 1 ELSE 0 END) AS blocked, "
+                    "  SUM(CASE WHEN sw.status='done' AND sw.site_type LIKE '%blog%' THEN 1 ELSE 0 END) AS blogs "
+                    "FROM pinners p "
+                    "LEFT JOIN scraped_websites sw ON sw.domain = p.domain_url "
+                    "WHERE p.domain_url IS NOT NULL AND p.domain_url != ''"
+                ).fetchone()
+                db.close()
+                print(
+                    f"[DB Bot] Batch complete. "
+                    f"Not yet: {row['not_yet']} | Done: {row['done']} (blogs: {row['blogs']}) | "
+                    f"Failed: {row['failed']} | Blocked: {row['blocked']}"
+                )
+            except Exception as e:
+                print(f"[DB Bot] Batch complete. (Stats error: {e})")
         return 0
 
     # Run in CLI Mode — default when no flags given (same as --run), or --runjobforall for a full sweep
