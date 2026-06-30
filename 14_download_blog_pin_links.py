@@ -529,23 +529,42 @@ def sync_site_types_mysql(mysql_conn, classifications: dict) -> int:
     site_type stays current on MySQL itself, not just inferred internally by
     this script. Only updates pinners that already exist in MySQL (a website
     classified on the Sheet for a pinner no PC has ever scraped into MySQL
-    yet has nothing to attach to)."""
+    yet has nothing to attach to).
+
+    Bulk-loads via a temporary table + a single UPDATE...JOIN instead of one
+    UPDATE per username. mysql-connector-python's executemany() only rewrites
+    INSERT statements into a single multi-row round trip -- for UPDATE (the
+    old approach here) it just loops and sends one network round trip per
+    row, so 40k+ classified pinners meant 40k+ round trips to the remote DB
+    (the actual cause of this step taking minutes). INSERT batches fine, so
+    we stage all (username, site_type) pairs into a temp table with batched
+    INSERTs, then do the whole update as one JOIN statement."""
     if not classifications:
         return 0
-    cur = mysql_conn.cursor()
     items = list(classifications.items())
-    updated = 0
-    batch_size = 500
-    for i in range(0, len(items), batch_size):
-        batch = items[i:i + batch_size]
+    cur = mysql_conn.cursor()
+    try:
+        cur.execute("DROP TEMPORARY TABLE IF EXISTS tmp_site_types")
+        cur.execute(
+            "CREATE TEMPORARY TABLE tmp_site_types ("
+            "username VARCHAR(190) PRIMARY KEY, site_type VARCHAR(64))"
+        )
+        insert_sql = "INSERT INTO tmp_site_types (username, site_type) VALUES (%s, %s)"
+        batch_size = 5000
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            cur.executemany(insert_sql, [(username, site_type) for username, site_type in batch])
+        mysql_conn.commit()
+
+        updated = 0
         for attempt in range(1, 4):
             try:
-                cur.executemany(
-                    "UPDATE pinners SET site_type=%s WHERE username=%s",
-                    [(site_type, username) for username, site_type in batch],
+                cur.execute(
+                    "UPDATE pinners p INNER JOIN tmp_site_types t ON t.username = p.username "
+                    "SET p.site_type = t.site_type"
                 )
+                updated = cur.rowcount
                 mysql_conn.commit()
-                updated += len(batch)
                 break
             except Exception as err:
                 mysql_conn.rollback()
@@ -553,10 +572,18 @@ def sync_site_types_mysql(mysql_conn, classifications: dict) -> int:
                 if is_lock and attempt < 3:
                     time.sleep(5 * attempt)
                     continue
-                print(f"  (warning: site_type batch sync failed — {err})")
+                print(f"  (warning: site_type bulk sync failed — {err})")
                 break
+
+        cur.execute("DROP TEMPORARY TABLE IF EXISTS tmp_site_types")
+        mysql_conn.commit()
+    except Exception as err:
+        mysql_conn.rollback()
+        print(f"  (warning: site_type sync setup failed — {err})")
+        cur.close()
+        return 0
     cur.close()
-    print(f"  Synced site_type for {updated} pinner(s) into MySQL.")
+    print(f"  Synced site_type for {updated} pinner(s) into MySQL ({len(items)} classified on the Sheet).")
     return updated
 
 
