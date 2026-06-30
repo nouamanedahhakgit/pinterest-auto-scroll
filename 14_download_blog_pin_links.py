@@ -545,6 +545,30 @@ def _pinners_username_collation(mysql_conn) -> str:
         cur.close()
 
 
+def sync_site_types_from_db(mysql_conn) -> int:
+    """Sync site_type from scraped_websites directly into pinners.site_type — no Google Sheet needed.
+    Joins pinners.domain_url = scraped_websites.domain, copies site_type where it differs."""
+    cur = mysql_conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE pinners p "
+            "INNER JOIN scraped_websites sw ON sw.domain = p.domain_url "
+            "SET p.site_type = sw.site_type "
+            "WHERE sw.site_type IS NOT NULL AND sw.site_type != '' "
+            "  AND sw.status = 'done' "
+            "  AND (p.site_type IS NULL OR p.site_type != sw.site_type)"
+        )
+        updated = cur.rowcount
+        mysql_conn.commit()
+        cur.close()
+        return updated
+    except Exception as e:
+        mysql_conn.rollback()
+        cur.close()
+        print(f"  (warning: sync_site_types_from_db failed — {e})")
+        return 0
+
+
 def sync_site_types_mysql(mysql_conn, classifications: dict) -> int:
     """Writes the Sheet's real site_type STRING (Blog / Store / Link-in-Bio /
     General Website / etc., not just a blog/not-blog flag) straight into
@@ -1014,8 +1038,12 @@ def main():
         ensure_mysql_pinner_columns(mysql_conn)
         print(f"  14_download_blog_pin_links.py — workers={args.workers}, source=mysql (all PCs' data)")
         while True:
-            classifications = fetch_website_classifications(gsc, cfg)
-            sync_site_types_mysql(mysql_conn, classifications)
+            # Sync site_type directly from scraped_websites (written by step 10) — no Sheet needed
+            updated = sync_site_types_from_db(mysql_conn)
+            if updated > 0:
+                print(f"  Synced site_type for {updated} pinner(s) from scraped_websites (DB-direct, no Sheet).")
+            else:
+                print(f"  site_type sync from DB: 0 new updates (all pinners already up to date).")
             units = fetch_eligible_units_mysql(mysql_conn, args.limit, args.retry_failed)
             if units:
                 write_fn = lambda pin_ids, status, h, c, j: write_unit_result_mysql(mysql_conn, pin_ids, status, h, c, j)
