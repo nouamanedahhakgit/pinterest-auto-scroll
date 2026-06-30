@@ -511,18 +511,27 @@ def write_sqlite(data, keyword=None, is_incremental=False):
     data["keywords"] = list(keywords_to_write.values())
     data["pin_keywords"] = pin_keywords_to_write
 
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    # Open the DB without deleting it first — dropping only step-4 tables (pinners,
+    # boards, pins, pin_keywords, keywords) and recreating them, while leaving any
+    # other tables intact (e.g. scraped_websites / scraped_categories created by
+    # 10_domain_quick_scrape_api.py).  This avoids the Windows PermissionError that
+    # occurs when another process (10_domain_quick_scrape_api.py, magic_scroll, etc.)
+    # has sortpin.db open at the same time — os.remove() on an open file fails on
+    # Windows; DROP TABLE + CREATE TABLE inside an existing connection does not.
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.execute("PRAGMA cache_size=-32768")
+    con.execute("PRAGMA busy_timeout=15000")   # wait up to 15 s if another writer holds the lock
+    for table in _TABLE_PK:
+        con.execute(f'DROP TABLE IF EXISTS "{table}"')
+    con.commit()
     for table, pk in _TABLE_PK.items():
         rows = data[table]
         cols = _columns_for(pk, rows)
         if table in ("pinners", "boards") and "status" not in cols:
             cols.append("status")
-            
+
         num = _numeric_cols(cols, pk, rows)
         defs = ", ".join(
             f'"{c}" {"INTEGER" if c in num else "TEXT"}' + (" PRIMARY KEY" if c == pk else "")
