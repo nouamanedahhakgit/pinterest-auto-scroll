@@ -566,20 +566,21 @@ STORE_DOMAINS = [
     "wikipedia.org", "ar.wikipedia.org",
 ]
 
+SOCIAL_MEDIA_DOMAINS = [
+    "pinterest.com", "pinterest.fr", "pinterest.de", "pinterest.co.uk",
+    "instagram.com", "facebook.com", "youtube.com", "youtu.be",
+    "twitter.com", "x.com", "tiktok.com", "linktr.ee", "t.co", "github.com", "google.com",
+    # Blog / community platforms — subdomains ARE user blogs, not stores
+    "tumblr.com", "medium.com", "substack.com", "blogspot.com", "blogger.com",
+    "wordpress.com", "weebly.com", "wixsite.com", "squarespace.com",
+    "reddit.com", "quora.com",
+]
+
 def classify_site_type(domain: str, is_wordpress: bool, post_count: int, tech_stack: str = "") -> str:
     domain = domain.lower()
 
     # 1. Social Media / blog-platform check
-    social_domains = [
-        "pinterest.com", "pinterest.fr", "pinterest.de", "pinterest.co.uk",
-        "instagram.com", "facebook.com", "youtube.com", "youtu.be",
-        "twitter.com", "x.com", "tiktok.com", "linktr.ee", "t.co", "github.com", "google.com",
-        # Blog / community platforms — subdomains ARE user blogs, not stores
-        "tumblr.com", "medium.com", "substack.com", "blogspot.com", "blogger.com",
-        "wordpress.com", "weebly.com", "wixsite.com", "squarespace.com",
-        "reddit.com", "quora.com",
-    ]
-    for social in social_domains:
+    for social in SOCIAL_MEDIA_DOMAINS:
         if domain == social or domain.endswith("." + social):
             return "Social Media"
 
@@ -621,6 +622,13 @@ def is_marketplace_or_social(domain: str) -> bool:
             return True
     # Check link-in-bio services
     for p in LINK_IN_BIO_DOMAINS:
+        if domain == p or domain.endswith("." + p):
+            return True
+    # Check social-media / blog-platform domains (weebly, wordpress.com, wixsite,
+    # squarespace, blogspot, blogger, tumblr, medium, substack, reddit, quora, etc.)
+    # — same list classify_site_type() uses, so a subdomain on one of these never
+    # falls through to the full slow scrape pipeline before being recognized.
+    for p in SOCIAL_MEDIA_DOMAINS:
         if domain == p or domain.endswith("." + p):
             return True
     return False
@@ -1515,31 +1523,39 @@ def run_bulk_scrape_job(run_all: bool) -> None:
             site_log("Parallel scan completed successfully.")
         except Exception as e:
             site_log(f"Parallel scan failed: {e}")
-            # Automatically update DB status and sheet to failed to avoid infinite loop
-            db = get_db_connection()
-            use_lock = not db.is_mysql
-            if use_lock:
-                db_write_lock.acquire()
+            # Automatically update DB status and sheet to failed to avoid infinite loop.
+            # This recovery block must never itself raise — get_db_connection() can throw
+            # too (e.g. a corrupted local sortpin.db: "database disk image is malformed"),
+            # and an uncaught exception here would escape scan_worker and propagate through
+            # executor.map(), aborting the ENTIRE bulk batch for every other site still
+            # queued behind this one. So the whole recovery attempt is wrapped defensively.
             try:
-                db.execute(
-                    "UPDATE scraped_websites SET status = 'failed', last_scraped_at = ? WHERE domain = ?",
-                    [db_now(), domain]
-                )
-                db.execute(
-                    """
-                    INSERT INTO scraped_websites_history
-                    (domain, run_date, status, posts_count, posts_added, posts_removed, log)
-                    VALUES (?, ?, 'failed', 0, 0, 0, ?)
-                    """,
-                    [domain, db_now(), f"Scan failed: {e}"]
-                )
-                db.commit()
-            except Exception as db_err:
-                site_log(f"Warning: Failed to set failed status in database: {db_err}")
-            finally:
-                db.close()
+                db = get_db_connection()
+                use_lock = not db.is_mysql
                 if use_lock:
-                    db_write_lock.release()
+                    db_write_lock.acquire()
+                try:
+                    db.execute(
+                        "UPDATE scraped_websites SET status = 'failed', last_scraped_at = ? WHERE domain = ?",
+                        [db_now(), domain]
+                    )
+                    db.execute(
+                        """
+                        INSERT INTO scraped_websites_history
+                        (domain, run_date, status, posts_count, posts_added, posts_removed, log)
+                        VALUES (?, ?, 'failed', 0, 0, 0, ?)
+                        """,
+                        [domain, db_now(), f"Scan failed: {e}"]
+                    )
+                    db.commit()
+                except Exception as db_err:
+                    site_log(f"Warning: Failed to set failed status in database: {db_err}")
+                finally:
+                    db.close()
+                    if use_lock:
+                        db_write_lock.release()
+            except Exception as conn_err:
+                site_log(f"Warning: Could not record failure in database (unreachable or corrupted?): {conn_err}")
             try:
                 _sheets_update_async(site_info["url"], {"scrapped": f"Failed ({str(e)[:50]})"})
             except Exception as sheet_err:
