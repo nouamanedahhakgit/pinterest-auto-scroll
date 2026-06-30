@@ -439,6 +439,23 @@ def init_bulk_tables(db: DBWrapper):
         except Exception as e:
             print(f"Error migrating database (adding url): {e}")
 
+    # Self-healing: ia_confirmed_blog column
+    # 1 = AI confirmed blog, 0 = AI said NOT a blog (site_type corrected), NULL = not yet checked
+    try:
+        db.execute("SELECT ia_confirmed_blog FROM scraped_websites LIMIT 1")
+    except Exception:
+        alter_query = (
+            "ALTER TABLE scraped_websites ADD COLUMN ia_confirmed_blog TINYINT DEFAULT NULL"
+            if db.is_mysql else
+            "ALTER TABLE scraped_websites ADD COLUMN ia_confirmed_blog INTEGER DEFAULT NULL"
+        )
+        try:
+            db.execute(alter_query)
+            db.commit()
+            print("Successfully added ia_confirmed_blog column to scraped_websites table.")
+        except Exception as e:
+            print(f"Error migrating database (adding ia_confirmed_blog): {e}")
+
 # ─── Settings & Config Helpers ────────────────────────────────────────────────
 
 def utc_now() -> str:
@@ -1018,6 +1035,40 @@ def _sheets_update_async(url: str, updates: dict):
 
 # ─── Scraper Core & Post Comparison ───────────────────────────────────────────
 
+def ai_confirm_blog(domain: str, title: str, description: str, post_count: int,
+                    provider: str, model: str, log_cb: Any) -> tuple:
+    """Ask AI whether a heuristically-classified 'Blog' is really a blog.
+    Returns (is_blog: bool, corrected_site_type: str).
+    Falls back to (True, 'Blog') on any error (keep heuristic result)."""
+    try:
+        ai_client, ai_err = get_ai_client(provider, model)
+        if ai_err or not ai_client:
+            return True, "Blog"
+        system_prompt = (
+            "You are a website type classifier. Given a domain, title, description and post count, "
+            "decide if this site is primarily a BLOG (publishes original articles/recipes/tutorials regularly). "
+            "Answer with a JSON object: {\"is_blog\": true/false, \"site_type\": \"<type>\"}. "
+            "site_type must be exactly one of: Blog, Store, Social Media, Link-in-Bio, SaaS/Tool, Portfolio, News/Media, General Website."
+        )
+        user_prompt = (
+            f"Domain: {domain}\nTitle: {title or ''}\nDescription: {(description or '')[:300]}\n"
+            f"Posts discovered: {post_count}\n\nIs this primarily a blog?"
+        )
+        response_text = ai_client._chat(system_prompt, user_prompt)
+        m = re.search(r"\{.*?\}", response_text, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            is_blog = bool(data.get("is_blog", True))
+            corrected = str(data.get("site_type", "Blog")).strip()
+            valid = {"Blog", "Store", "Social Media", "Link-in-Bio", "SaaS/Tool", "Portfolio", "News/Media", "General Website"}
+            if corrected not in valid:
+                corrected = "Blog" if is_blog else "General Website"
+            return is_blog, corrected
+    except Exception as e:
+        log_cb(f"  ai_confirm_blog error: {e} — keeping heuristic result")
+    return True, "Blog"
+
+
 def _fast_track_marketplace_result(site: dict, domain: str, site_type: str, log_cb: Any) -> dict:
     """Write a fast-tracked Store/Social Media/Link-in-Bio classification without
     running the full scrape/sitemap-discovery pipeline. Shared by the upfront
@@ -1452,12 +1503,37 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             tech_stack=tech_stack
         )
         log_cb(f"Classified site type: {site_type}")
-        
+
+        # AI blog confirmation — only for heuristically-classified blogs
+        ia_confirmed_blog = None
+        if site_type == "Blog":
+            log_cb(f"AI confirming if '{domain}' is really a blog...")
+            settings = load_settings()
+            _ai_provider = settings.get("quick_scrape_ai_provider", "local")
+            _ai_model = (
+                settings.get("quick_scrape_openrouter_model", "openai/gpt-4.1-nano")
+                if _ai_provider == "openrouter"
+                else settings.get("quick_scrape_groq_model", "llama-3.3-70b-versatile")
+            )
+            is_blog, ai_site_type = ai_confirm_blog(
+                domain,
+                site_info.get("name") or "",
+                site_info.get("description") or "",
+                len(posts_scraped),
+                _ai_provider, _ai_model, log_cb
+            )
+            ia_confirmed_blog = 1 if is_blog else 0
+            if not is_blog:
+                log_cb(f"AI says NOT a blog → correcting site_type: Blog → {ai_site_type}")
+                site_type = ai_site_type
+            else:
+                log_cb(f"AI confirmed: '{domain}' IS a blog ✓")
+
         db.execute(
             """
             INSERT INTO scraped_websites
-            (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?)
+            (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type, ia_confirmed_blog)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 url = VALUES(url),
                 title = VALUES(title),
@@ -1467,16 +1543,18 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
                 status = 'done',
                 post_count = VALUES(post_count),
                 last_scraped_at = VALUES(last_scraped_at),
-                site_type = VALUES(site_type)
+                site_type = VALUES(site_type),
+                ia_confirmed_blog = VALUES(ia_confirmed_blog)
             """ if db.is_mysql else
             """
             INSERT OR REPLACE INTO scraped_websites
-            (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?)
+            (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type, ia_confirmed_blog)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?)
             """,
-            [domain, site["url"], site_info.get("name") or "", site_info.get("description") or "", cms, tech_stack, category_id, len(posts_scraped), now_ts, site_type]
+            [domain, site["url"], site_info.get("name") or "", site_info.get("description") or "",
+             cms, tech_stack, category_id, len(posts_scraped), now_ts, site_type, ia_confirmed_blog]
         )
-        
+
         # Log execution history
         db.execute(
             """
@@ -1487,14 +1565,16 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             [domain, now_ts, len(posts_scraped), added_count, removed_count, "Single Scan Done"]
         )
         db.commit()
-        
+
         log_cb(f"Syncing results to Google Sheets Row...")
         sheet_updates = {
             "scrapped": "Yes",
             "name": site_info.get("name") or "",
             "scraped_pins": len(posts_scraped),
-            "site_type": site_type
+            "site_type": site_type,
         }
+        if ia_confirmed_blog is not None:
+            sheet_updates["ia_confirmed_blog"] = "Yes" if ia_confirmed_blog else "No"
         _sheets_update_async(site["url"], sheet_updates)
         log_cb(f"Database and Google Sheets updated successfully. Added {added_count} posts, removed {removed_count} posts.")
         
