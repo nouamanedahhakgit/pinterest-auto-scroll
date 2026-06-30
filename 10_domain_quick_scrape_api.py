@@ -1693,11 +1693,20 @@ def run_bulk_scrape_job(run_all: bool) -> None:
             finally:
                 db.close()
 
-            # Check local/remote DB for recently-crashed/running crawls (< 3 h old = genuine resume)
+            # Resume sites stuck in 'running' for 20-180 min — genuinely crashed,
+            # not actively being scanned by another instance right now.
+            # (Sites set to 'running' <20 min ago are skipped — another instance
+            # is still working on them. Sites >3 h ago were already reset to
+            # 'failed' by the stale cleanup above.)
             resumed_sites = []
             db = get_db_connection()
             try:
-                cur = db.execute("SELECT domain, url FROM scraped_websites WHERE status = 'running'")
+                resume_q = (
+                    "SELECT domain, url FROM scraped_websites WHERE status = 'running' AND last_scraped_at < DATE_SUB(NOW(), INTERVAL 20 MINUTE)"
+                    if db.is_mysql else
+                    "SELECT domain, url FROM scraped_websites WHERE status = 'running' AND datetime(last_scraped_at) < datetime('now', '-20 minutes')"
+                )
+                cur = db.execute(resume_q)
                 rows = cur.fetchall()
                 for row in rows:
                     domain_val = row['domain']
@@ -1775,7 +1784,7 @@ def run_bulk_scrape_job(run_all: bool) -> None:
 
                 if mark_yes_updates:
                     log(f"Skipped {len(mark_yes_updates)} site(s) (already classified/done) — marking 'Yes' in Sheets.")
-                    _threading.Thread(
+                    threading.Thread(
                         target=lambda u=mark_yes_updates: _batch_update_sheets_raw(u),
                         daemon=True
                     ).start()
@@ -2083,7 +2092,7 @@ def fix_missing_site_types() -> int:
         for i in range(0, len(sheets_batch), chunk):
             group = sheets_batch[i:i + chunk]
             threads = [
-                _threading.Thread(
+                threading.Thread(
                     target=lambda u=url, t=st: update_website_in_sheets(u, {"site_type": t}),
                     daemon=True
                 )
@@ -2178,7 +2187,7 @@ def recheck_blogs() -> int:
     print(f"  {len(rows)} site(s) to re-check. 15 parallel workers, ~5-12s each.\n")
 
     changed = []
-    lock = _threading.Lock()
+    lock = threading.Lock()
     done_count = [0]
 
     def check_one(row):
