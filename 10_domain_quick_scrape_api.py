@@ -232,7 +232,7 @@ def _get_mysql_pool():
             return None
         try:
             import mysql.connector.pooling
-            pool_size = int(env.get("MYSQL_POOL_SIZE", 15))
+            pool_size = int(env.get("MYSQL_POOL_SIZE", 8))
             _mysql_pool = mysql.connector.pooling.MySQLConnectionPool(
                 pool_name="step10",
                 pool_size=pool_size,
