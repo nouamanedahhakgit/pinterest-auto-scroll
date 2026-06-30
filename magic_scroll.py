@@ -36,8 +36,13 @@ PINNER MODE — same "magic" loop, but deep-scrapes PINNERS instead of keywords:
   cycle:
     1. CLAIM up to N pinners from sortpin.db (status != 'done', highest
        followers first) → marks them 'running' so an interrupted run
-       resumes correctly. Add --blog-only to also apply step 7's
-       "only scraped_websites.site_type contains 'blog'" filter.
+       resumes correctly. Add --blog-only to require a CONFIRMED "blog"
+       classification, and/or --min-reach N to require reach >= N (both
+       filters AND together — e.g. --blog-only --min-reach 100000 = blog
+       sites with Reach > 100k). Both filters check the Google Sheet's
+       "websites" tab first (shared across every PC — classification often
+       runs on a different machine), falling back to the local sortpin.db
+       only when a pinner isn't on the Sheet yet.
     2. SCAN each pinner: open their saved-profile (captures boards), their
        created-profile (captures created pins), then every one of their
        boards, scrolling each till it stops loading new pins (step 7's logic).
@@ -45,13 +50,18 @@ PINNER MODE — same "magic" loop, but deep-scrapes PINNERS instead of keywords:
        (status columns are preserved across rebuilds — sortpin.db is NOT
        deleted in this mode, since it's what tracks pinner/board progress)
     4. CLEAR SortPin → python 6_clear_sortpin.py --yes
-    5. Repeat until no pinners are left.
+    5. Repeat FOREVER — never exits. If a cycle finds no eligible pinners
+       (e.g. all done, or none yet match --blog-only/--min-reach), it idles
+       5 minutes and checks again, so newly-added/newly-classified pinners
+       get picked up automatically without restarting the script.
 
   python magic_scroll.py --pinner 10        # 10 pinners/cycle, deep-scrape each
   python magic_scroll.py --pinner=10        # same, alternative syntax
   python magic_scroll.py --10pinners        # same, alternative syntax
   python magic_scroll.py --pinner 10 --5m   # 5 min cap per board/profile (default 5)
-  python magic_scroll.py --pinner 10 --blog-only   # only pinners step 7 classified as blogs
+  python magic_scroll.py --pinner 10 --blog-only              # only pinners step 7 classified as blogs
+  python magic_scroll.py --pinner 10 --min-reach 100000        # only profile_reach >= 100000
+  python magic_scroll.py --pinner 10 --blog-only --min-reach 100000  # blog sites AND Reach > 100k
 """
 
 import os, sys, time, socket, subprocess, re, json, datetime, platform, sqlite3
@@ -124,6 +134,20 @@ def _pinner_batch():
             return int(m.group(1))
     return None
 
+def _min_reach():
+    """--min-reach N (or bare --min-reach, which defaults to 100000) filters
+    pinner-mode claims to profile_reach >= N. Returns 0 (no filter) if absent."""
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--min-reach":
+            if i + 1 < len(args) and re.match(r"^\d+$", args[i + 1]):
+                return int(args[i + 1])
+            return 100_000
+        m = re.match(r"^--min-reach=(\d+)$", a)
+        if m:
+            return int(m.group(1))
+    return 0
+
 def _batch():
     args = sys.argv[1:]
     # Check for --batch <N>
@@ -156,6 +180,8 @@ MINUTES   = _minutes()
 BATCH     = _batch()
 PINNER_BATCH   = _pinner_batch()
 PINNER_MAX_MIN = _explicit_minutes() if _explicit_minutes() is not None else 5.0  # step 7's default
+PINNER_MIN_REACH = _min_reach()
+PINNER_IDLE_WAIT_SECS = 300   # pinner mode never exits — polls for new eligible pinners every 5 min
 BUILD_ARGS = ["4_build_database.py", "--no-csv"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
 PINNER_BUILD_ARGS_LIVE = ["4_build_database.py", "--no-clear", "--no-csv"] + (["--disk"] if "--disk" in sys.argv[1:] else [])
 
@@ -376,30 +402,84 @@ def _set_board_status(board_id, status):
     con.execute("UPDATE boards SET status=? WHERE id=?", (status, board_id))
     con.commit(); con.close()
 
-def claim_pinner_batch(n, blog_only=False):
+def claim_pinner_batch(n, blog_only=False, min_reach=0):
     """Pick up to n not-done pinners from sortpin.db (highest followers first),
     and mark them 'running' immediately so an interrupted run resumes them.
-    With blog_only=True, applies step 7's "only scraped_websites.site_type
-    contains 'blog'" filter — off by default here, since right now almost no
-    pinner has been domain-classified yet, which would make this silently
-    claim nothing. Pass --blog-only to opt into that stricter behavior."""
+
+    blog_only / min_reach check the Google Sheet's "websites" tab FIRST
+    (username -> site_type/reach/scrapped), since domain classification
+    (10_domain_quick_scrape_api.py) usually runs on a different PC than the
+    one doing --pinner mode — the local scraped_websites table here is often
+    empty/stale even though the Sheet already has the real answer. Falls back
+    to the local DB (scraped_websites with status='done', pinners.profile_reach)
+    for any pinner not on the Sheet, or if the Sheet/web app is unreachable.
+
+    blog_only only counts a site as "blog" when it was actually confirmed
+    scanned (scrapped starts with "yes") — an unscanned, failed, or blocked
+    site is never assumed to be a blog. (Previously, an empty local
+    classification table made the filter silently let EVERYONE through
+    instead of no one — that's what was claiming non-blog pinners.)
+    With min_reach > 0, also requires reach >= min_reach (Sheet's reach column
+    if present and nonzero, else pinners.profile_reach). Both filters AND
+    together."""
     con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
     all_pinners = [dict(r) for r in con.execute(
-        "SELECT username, full_name, follower_count, website_url, status FROM pinners "
+        "SELECT username, full_name, follower_count, profile_reach, website_url, status FROM pinners "
         "WHERE status IS NULL OR status<>'done' ORDER BY follower_count DESC")]
+
+    # local fallback: domain -> site_type, only trusted for CONFIRMED done scans
+    local_site_types = {}
+    if blog_only:
+        try:
+            for r in con.execute(
+                    "SELECT domain, site_type FROM scraped_websites "
+                    "WHERE domain IS NOT NULL AND status='done'"):
+                if r[0] and r[1]:
+                    local_site_types[r[0].lower().strip()] = r[1]
+        except sqlite3.OperationalError:
+            pass
+
+    # Sheet ("excel" — shared across every PC): username -> {site_type, reach, scrapped}
+    sheet_by_user = {}
+    if blog_only or min_reach > 0:
+        try:
+            gsc = load_sheet_client()
+            cfg = gsc.resolve_webapp() if gsc else None
+            if cfg:
+                data = gsc.post_webapp(cfg, {"action": "get_websites"})
+                for w in data.get("websites", []):
+                    uid = str(w.get("id", "")).strip().lower()
+                    if uid:
+                        sheet_by_user[uid] = w
+                print(f"    (loaded {len(sheet_by_user)} website row(s) from the Sheet for status/reach)")
+        except Exception as e:
+            print(f"  (couldn't reach Google Sheet for site status/reach — using local DB only: {e})")
+
+    def is_blog(p):
+        w = sheet_by_user.get(p["username"].strip().lower())
+        if w is not None:
+            scrapped = str(w.get("scrapped", "")).strip().lower()
+            site_type = str(w.get("site_type", "")).strip().lower()
+            return scrapped.startswith("yes") and "blog" in site_type
+        dom = _extract_domain(p.get("website_url", ""))
+        return "blog" in local_site_types.get(dom, "").lower()
+
+    def reach_of(p):
+        w = sheet_by_user.get(p["username"].strip().lower())
+        if w is not None:
+            try:
+                sheet_reach = int(float(w.get("reach") or 0))
+            except (TypeError, ValueError):
+                sheet_reach = 0
+            if sheet_reach > 0:
+                return sheet_reach
+        return p.get("profile_reach") or 0
 
     pinners = all_pinners
     if blog_only:
-        site_types = {}
-        try:
-            for r in con.execute("SELECT domain, site_type FROM scraped_websites WHERE domain IS NOT NULL"):
-                if r[0] and r[1]:
-                    site_types[r[0].lower().strip()] = r[1]
-        except sqlite3.OperationalError:
-            pass
-        if site_types:
-            pinners = [p for p in all_pinners
-                       if "blog" in site_types.get(_extract_domain(p.get("website_url", "")), "").lower()]
+        pinners = [p for p in pinners if is_blog(p)]
+    if min_reach > 0:
+        pinners = [p for p in pinners if reach_of(p) >= min_reach]
 
     batch = pinners[:n]
     for p in batch:
@@ -480,9 +560,10 @@ def scrape_pinner(driver, base_tab, pinner_row, max_min, cycle=0):
               remaining_boards=remaining)
     return {"pinner": u, "seconds": secs, "boards": len(board_results), "remaining": remaining}
 
-def pinner_mode(batch_size, max_min, blog_only=False):
+def pinner_mode(batch_size, max_min, blog_only=False, min_reach=0):
+    filters = (" · blog-only" if blog_only else "") + (f" · reach≥{min_reach:,}" if min_reach else "")
     print(f"\n{'='*62}\n  MAGIC SCROLL (pinners) — {batch_size} pinners/cycle · "
-          f"{max_min:g} min/board" + (" · blog-only" if blog_only else "") + f"\n{'='*62}")
+          f"{max_min:g} min/board{filters}\n{'='*62}")
     if not os.path.exists(DB_PATH):
         print("  sortpin.db not found — run step 2 + step 4 first.\n")
         sys.exit(1)
@@ -492,10 +573,15 @@ def pinner_mode(batch_size, max_min, blog_only=False):
     while True:
         cycle += 1
         print(f"\n── cycle {cycle}: claiming up to {batch_size} pinners ──")
-        batch = claim_pinner_batch(batch_size, blog_only=blog_only)
+        batch = claim_pinner_batch(batch_size, blog_only=blog_only, min_reach=min_reach)
         if not batch:
-            print("  No pinners left to claim (all Done). Finished. 🎉")
-            break
+            # Never stop: new pinners keep arriving (keyword scans, new site
+            # classifications). Idle-poll instead of exiting, forever.
+            mins = PINNER_IDLE_WAIT_SECS // 60
+            print(f"  No eligible pinners right now — waiting {mins} min, then checking for new ones again...")
+            log_event(event="pinner_idle_wait", cycle=cycle, wait_seconds=PINNER_IDLE_WAIT_SECS)
+            time.sleep(PINNER_IDLE_WAIT_SECS)
+            continue
         names = ", ".join("@" + p["username"] for p in batch)
         print("  claimed (running):", names)
         log_event(event="claim_pinners", cycle=cycle,
@@ -557,7 +643,8 @@ def reset_pending_keywords(gsc, cfg):
 
 def main():
     if PINNER_BATCH:
-        pinner_mode(PINNER_BATCH, PINNER_MAX_MIN, blog_only=("--blog-only" in sys.argv[1:]))
+        pinner_mode(PINNER_BATCH, PINNER_MAX_MIN, blog_only=("--blog-only" in sys.argv[1:]),
+                    min_reach=PINNER_MIN_REACH)
         return
 
     if "--reset-keywords" in sys.argv:

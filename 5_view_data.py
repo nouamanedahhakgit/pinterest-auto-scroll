@@ -248,7 +248,7 @@ def run_websites_sync(db_path):
             p["scraped_pins_count"] or 0,
             p["scraped_created_pins_count"] or 0,
             p["scraped_saved_pins_count"] or 0,
-            site_types.get(_extract_domain(p["website_url"]), "Blog")
+            site_types.get(_extract_domain(p["website_url"]), "")
         ]
         for p in pinners
     ]
@@ -317,16 +317,23 @@ def load_from_db(db_path):
     for p in pins:
         if p.get("pinner_username"): np_[p["pinner_username"]] = np_.get(p["pinner_username"], 0) + 1
 
+    con2 = get_db_connection(db_path)
+    status_by_domain = _site_scan_status_map(con2)
+    con2.close()
+
     pout = []
     for p in pinners:
         u = p["username"]
+        url = p.get("website_url", "")
+        site_scan_status = ("no_website" if not url
+                             else status_by_domain.get(_domain_from_url(url), "unscanned"))
         pout.append({
             "username": u, "full_name": p.get("full_name", ""), "image_url": p.get("image_url", ""),
             "website_url": p.get("website_url", ""), "domain_url": p.get("domain_url", ""),
             "contact_email": p.get("contact_email", ""), "follower_count": p.get("follower_count", 0),
             "pin_count": p.get("pin_count", 0), "board_count": p.get("board_count", 0),
-            "profile_reach": p.get("profile_reach", 0), 
-            "nb": p.get("scraped_boards_count") if p.get("scraped_boards_count") is not None else nb.get(u, 0), 
+            "profile_reach": p.get("profile_reach", 0), "site_scan_status": site_scan_status,
+            "nb": p.get("scraped_boards_count") if p.get("scraped_boards_count") is not None else nb.get(u, 0),
             "np": p.get("scraped_pins_count") if p.get("scraped_pins_count") is not None else np_.get(u, 0),
             "np_created": p.get("scraped_created_pins_count") if p.get("scraped_created_pins_count") is not None else sum(1 for x in pins if x.get("pinner_username") == u and x.get("pin_type") == "created"),
             "np_saved": p.get("scraped_saved_pins_count") if p.get("scraped_saved_pins_count") is not None else sum(1 for x in pins if x.get("pinner_username") == u and x.get("pin_type") == "saved")
@@ -422,6 +429,46 @@ _SEARCH = {
 _PK = {"pinners": "username", "boards": "id", "pins": "id"}
 _DEFAULT_SORT = {"pinners": "follower_count", "boards": "pin_count", "pins": "repin_count"}
 
+def _domain_from_url(url):
+    """Strip protocol/www from a URL down to a bare domain, for matching against
+    scraped_websites.domain. Returns "" for empty/unparseable input."""
+    if not url:
+        return ""
+    try:
+        u = url.strip().lower()
+        if not u.startswith("http"):
+            u = "https://" + u
+        host = urllib.parse.urlparse(u).hostname or ""
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
+
+def _site_scan_status_map(con):
+    """domain -> scraped_websites.status ('not_yet'|'running'|'blocked'|'failed'|'done'),
+    built once per request. Empty dict if the table doesn't exist yet."""
+    out = {}
+    try:
+        for r in con.execute("SELECT domain, status FROM scraped_websites WHERE domain IS NOT NULL"):
+            if r[0]:
+                out[r[0].lower().strip()] = r[1] or "not_yet"
+    except Exception:
+        pass
+    return out
+
+def _attach_site_scan_status(con, rows):
+    """Adds a 'site_scan_status' field to each pinner row: the scraped_websites.status
+    for that pinner's website domain ('not_yet'/'running'/'blocked'/'failed'/'done'),
+    or 'no_website' if the pinner has no website_url, or 'unscanned' if they have one
+    but 10_domain_quick_scrape_api.py hasn't scanned that domain yet."""
+    status_by_domain = _site_scan_status_map(con)
+    for row in rows:
+        url = row.get("website_url")
+        if not url:
+            row["site_scan_status"] = "no_website"
+            continue
+        dom = _domain_from_url(url)
+        row["site_scan_status"] = status_by_domain.get(dom, "unscanned")
+
 def _cols(con, table):
     if getattr(con, "is_mysql", False):
         return [r[0] for r in con.execute(f"SHOW COLUMNS FROM `{table}`")]
@@ -443,13 +490,22 @@ def api_list(con, t, q, sort, dir_, limit, offset):
     rows = [dict(r) for r in con.execute(
         f"SELECT * FROM `{t}` {where} ORDER BY `{sort}` {dir_} LIMIT ? OFFSET ?",
         params + [limit, offset])]
+    if t == "pinners":
+        _attach_site_scan_status(con, rows)
+        if "site_scan_status" not in cols:
+            cols = cols + ["site_scan_status"]
     return {"columns": cols, "rows": rows, "total": total, "sort": sort, "dir": dir_.lower()}
 
 def api_get(con, t, id_):
     if t not in _PK:
         return None
     r = con.execute(f"SELECT * FROM `{t}` WHERE `{_PK[t]}`=?", [id_]).fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    row = dict(r)
+    if t == "pinners":
+        _attach_site_scan_status(con, [row])
+    return row
 
 def api_children(con, t, id_):
     if t == "pinner":
@@ -756,6 +812,11 @@ async function renderInsights(){
 }
 
 function imgCell(p){return p.image?`<img loading="lazy" src="${esc(p.image)}" onerror="this.style.visibility='hidden'">`:`<div style="height:160px"></div>`;}
+function scanBadge(s){
+ const map={done:['Scanned','#2ecc71'],running:['Scanning…','#f39c12'],blocked:['Blocked','#e74c3c'],failed:['Failed','#e74c3c'],not_yet:['Not Scanned','#95a5a6'],unscanned:['Not Scanned','#95a5a6'],no_website:['No Website','#555']};
+ const [label,color]=map[s]||['Not Scanned','#95a5a6'];
+ return `<span style="background:${color};color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold">${label}</span>`;
+}
 
 async function load(){
  const r=await api('/api/list',{type:state.t,q:state.q,sort:state.sort,dir:state.dir,limit:state.limit,offset:state.off});
@@ -786,7 +847,7 @@ function card(row){
  
  const cr = row.scraped_created_pins_count !== undefined ? row.scraped_created_pins_count : (row.np_created || 0);
  const sv = row.scraped_saved_pins_count !== undefined ? row.scraped_saved_pins_count : (row.np_saved || 0);
- return `<div class="card" data-type="pinner" data-id="${esc(row.username)}"><div class="bd"><div class="t">${esc(row.full_name||row.username)}</div><div class="m"><span>${num(row.follower_count)} foll</span><span>@${esc(row.username)}</span></div><div class="m" style="margin-top:4px;font-size:11px"><span>Created: <b>${num(cr)}</b></span><span>Saved: <b>${num(sv)}</b></span></div><div class="muted" style="margin-top:4px">${esc(row.contact_email||row.website_url||'')}</div></div></div>`;
+ return `<div class="card" data-type="pinner" data-id="${esc(row.username)}"><div class="bd"><div class="t">${esc(row.full_name||row.username)}</div><div class="m"><span>${num(row.follower_count)} foll</span><span>@${esc(row.username)}</span></div><div class="m" style="margin-top:4px;font-size:11px"><span>Created: <b>${num(cr)}</b></span><span>Saved: <b>${num(sv)}</b></span></div><div class="m" style="margin-top:4px">${scanBadge(row.site_scan_status)}</div><div class="muted" style="margin-top:4px">${esc(row.contact_email||row.website_url||'')}</div></div></div>`;
 }
 function kvTable(obj){return '<div class="kvs">'+Object.keys(obj).map(k=>{let v=obj[k];let vh=esc(v);
  if(typeof v==='string'&&/^https?:\/\//.test(v))vh=`<a href="${esc(v)}" target="_blank">${esc(v)}</a>`;

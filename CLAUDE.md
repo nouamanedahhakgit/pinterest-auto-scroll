@@ -19,10 +19,14 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `5_view_data.py` | Prints statistics + builds/opens `sortpin_viewer.html` to browse Pinner→Boards→Pins. |
 | `6_clear_sortpin.py` | Archives extension data into `_SORTPIN_ARCHIVE/` then clears it from Brave. Run step 4 first to save. |
 | `7_scrape_profiles.py` | **Deep scrape:** for each pinner → open profile → open every board → scroll till end. Resumable (`profiles_progress.json`). |
+| `10_domain_quick_scrape_api.py` | Flask app + bulk job: heuristically classifies each pinner's `website` (Store / Link-in-Bio / Social Media / Blog / General Website) via `STORE_DOMAINS`/`LINK_IN_BIO_DOMAINS` lists + WordPress/post-count signals. Writes `scrapped`/`site_type`/`categories` on the Sheet's `websites` tab + local `scraped_websites`. |
+| `13_scan-website-interface-by-ia.py` | **AI website scanner bot.** Standalone, multi-threaded, separate from step 10. For every General-Website/Blog/not-yet-classified pinner site (skips Store/Link-in-Bio/Social Media — step 10 already nailed those), fetches the homepage and asks an OpenRouter model for the site's real type, a short filterable category/theme, and a description — catches step 10's false "Blog" calls on sites that just have a marketing blog bolted onto a SaaS/store/agency. Writes 4 new columns ending in `_website_scaned_by_ia` (local `sortpin.db` + the Sheet, auto-created on first run). Scans the whole backlog once, then polls every 10 min forever for newly-eligible sites — leave it running, Ctrl+C to stop. |
+| `14_download_blog_pin_links.py` | **Blog pin destination-link downloader bot.** Standalone, multi-threaded. Syncs the Sheet's `site_type` column into a new local `pinners.site_type` column, then for every pin whose pinner's `site_type` contains "blog", downloads the pin's outbound `link` (not `pin_url`) — page HTML + every linked CSS/JS file + inline `<style>`/`<script>` blocks — into 5 new `pins` columns. De-dupes by unique link before downloading (a link pinned many times is fetched once, written to every matching pin). Writes to the DB as each link completes, not batched. Detects Cloudflare blocks specifically (vs a generic HTTP block) and tries a curl_cffi Chrome-impersonation bypass first. Downloads the whole backlog once, then polls every 10 min forever for newly-eligible pins — leave it running, Ctrl+C to stop. |
 | `magic_scroll.py` | **All-in-one multi-computer loop:** claim 5 keywords from sheet (pending) → scroll → build DB → mark Done → clear SortPin → repeat. Also has a **pinner mode** (`--pinner N`) that deep-scrapes pinners instead — see below. |
 | `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
 | `sortpin_data.json` | Auto-created (step 4). Flat pinners/boards/pins arrays (feeds the viewer). |
 | `sortpin_viewer.html` | Auto-created (step 5). Offline browser with Pinners / Boards / Pins tabs. |
+| `websites_sheet_cache.json` | Auto-created (step 13). Last successful `get_websites` Sheet pull — fallback when that read flakes. |
 | `IMPORTANT_DATABASE/` | Auto-created (step 4). `sortpin_mysql.sql` (import into MySQL) + a copy of `sortpin.db`. |
 | `_SORTPIN_ARCHIVE/` | Auto-created (step 6). Timestamped backups of cleared extension data. Gitignored. |
 | `google_sheets_apps_script.js` | Apps Script web app (v3): setup/column/**claim**/**mark** (LockService = multi-PC safe). Redeploy after edits. |
@@ -55,6 +59,19 @@ python magic_scroll.py --disk           # build DB from disk each cycle (needs c
 python magic_scroll.py --pinner 10      # PINNER MODE: claim 10 pinners from sortpin.db, deep-scrape each (5 min/board default)
 python magic_scroll.py --pinner 10 --15m       # 15 min cap per board/profile instead of the 5 min default
 python magic_scroll.py --pinner 10 --blog-only # only pinners step 7 classified as "blog" sites
+python magic_scroll.py --pinner 10 --min-reach 100000              # only pinners with profile_reach >= 100k
+python magic_scroll.py --pinner 10 --blog-only --min-reach 100000  # blog sites AND Reach > 100k — never stops, idles 5 min between checks for new ones
+python 13_scan-website-interface-by-ia.py                  # AI scanner bot: scan all eligible sites, then poll every 10 min forever
+python 13_scan-website-interface-by-ia.py --once            # single pass then exit (no polling)
+python 13_scan-website-interface-by-ia.py --workers 100     # more parallel threads (default 60)
+python 13_scan-website-interface-by-ia.py --poll-minutes 5  # check more often than 10 min
+python 13_scan-website-interface-by-ia.py --limit 20 --once --dry-run  # quick test, no writes
+python 14_download_blog_pin_links.py                       # download bot: sync site_type, download all eligible pin links, then poll every 10 min forever
+python 14_download_blog_pin_links.py --once                # single pass then exit (no polling)
+python 14_download_blog_pin_links.py --workers 120         # more parallel threads (default 80)
+python 14_download_blog_pin_links.py --poll-minutes 5      # check more often than 10 min
+python 14_download_blog_pin_links.py --retry-failed        # also re-attempt Failed/Blocked pins, not just untried ones
+python 14_download_blog_pin_links.py --limit 20 --once --dry-run  # quick test, no writes
 ```
 
 ## magic_scroll — multi-computer workflow
@@ -74,11 +91,135 @@ python magic_scroll.py --pinner 10 --blog-only # only pinners step 7 classified 
   **scan** each one (saved profile → boards, created profile → created pins, then every
   board scrolled till it stops loading new pins — step 7's logic) → **build** the DB
   (`sortpin.db` is *never* deleted in this mode, since it's what tracks progress) →
-  **clear** SortPin → repeat until no pinners are left.
-- `--blog-only` adds step 7's "only pinners whose site is classified as a blog" filter.
-  It's off by default because `scraped_websites` currently has very few classified
-  domains — with it on by default the filter would silently match nothing.
+  **clear** SortPin → repeat.
+- `--blog-only` requires a **confirmed** "blog" classification — checked against the
+  Google Sheet's `websites` tab first (`site_type` column, only trusted when `scrapped`
+  starts with "Yes"), since `10_domain_quick_scrape_api.py` classification usually runs
+  on a different PC than the one doing `--pinner` mode, so the local `scraped_websites`
+  table here is often empty/stale. Falls back to local `scraped_websites` (status='done'
+  rows only) for any pinner not yet on the Sheet, or if the Sheet/web app is unreachable.
+  An unscanned, failed, or blocked site is never assumed to be a blog — it's excluded.
+  (Fixed a bug where an empty local classification table made this silently match
+  *everyone* instead of no one.)
+- `--min-reach N` requires reach `>= N` (bare `--min-reach` with no number defaults to
+  100000) — uses the Sheet's `reach` column when present and nonzero, else falls back to
+  local `pinners.profile_reach`. Combine with `--blog-only` to get exactly "blog sites
+  with Reach > 100k" — both filters AND together.
 - Per-board/profile time cap defaults to 5 minutes; override with `--Nm` (e.g. `--15m`).
+- **Never stops.** When a cycle finds zero eligible pinners (all done, or none yet
+  match the filters), it idles 5 minutes and checks again — so pinners added or
+  newly classified later (new keyword scans, new site-type classifications from
+  `10_domain_quick_scrape_api.py`) get picked up automatically without restarting.
+  Leave it running in the background; Ctrl+C to stop.
+
+## Step 13 — AI website scanner bot (`13_scan-website-interface-by-ia.py`)
+- **Why it exists:** step 10's classifier is a fast heuristic (domain lists + WordPress/
+  post-count signals) and over-fires "Blog" for any site with an RSS feed or `/blog/`
+  folder anywhere on the page — even SaaS tools, agencies, and stores that just publish a
+  marketing blog as one feature (e.g. postermywall.com). This script asks an actual AI
+  model to read the homepage and judge the site by its real primary purpose.
+- **Eligibility:** skips any pinner website whose existing `site_type` is `Store`,
+  `Link-in-Bio`, or `Social Media` — step 10 already classified those correctly and
+  confidently. Scans everything else: `General Website`, `Blog` (re-verifies it), and
+  blank/not-yet-classified. Also skips any row that already has a value in
+  `status_website_scaned_by_ia` (so re-running only picks up new/unscanned sites).
+- **Standalone, separate from step 10:** its own `.env`/DB/Sheet-client code, no shared
+  state or imports from `10_domain_quick_scrape_api.py`. Uses OpenRouter directly via
+  `requests` (model from `.env`'s `QUICK_SCRAPE_OPENROUTER_MODEL`, default
+  `openai/gpt-4.1-nano`) — needs `OPENROUTER_API_KEY` in `.env`.
+- **Output — 4 new columns**, written to both local `sortpin.db` (`scraped_websites`
+  table, auto-migrated) and the Sheet's `websites` tab (auto-created there on first run
+  via one `update_website` warm-up call, since the Sheet's `batch_update_websites` action
+  can't create new columns itself — only `update_website` can):
+  - `status_website_scaned_by_ia` — `Done` / `Failed (...)` / `Blocked (...)`
+  - `type_website_scaned_by_ia` — Blog / Store / SaaS/Tool / Portfolio / News/Media / etc.
+  - `category_website_scaned_by_ia` — short 1-3 word theme (e.g. "Fashion & Beauty"),
+    meant for Sheet filtering
+  - `description_website_scaned_by_ia` — 1-2 sentence plain description
+- **Speed:** high thread count (`--workers`, default 60) fetches+classifies sites in
+  parallel; token cost is a non-issue by design (nano model, short responses). Each site
+  gets a fast TCP ping (port 443 then 80, hostname matched exactly to what the real
+  fetch will use — not the www-stripped `domain` field, since some sites only have a
+  DNS record for one of bare/`www.`) before anything else — dead/unreachable domains
+  fail in ~6s (hard-capped) instead of stalling on a slow DNS lookup or the full request
+  timeout. The script also forces IPv4-only DNS resolution process-wide (monkeypatches
+  `socket.getaddrinfo`): some sites publish an IPv6 record that's dead/blackholed on a
+  given network, and unlike browsers (real Happy Eyeballs, RFC 6555), Python's
+  socket/requests stack tries addresses sequentially and burns the full timeout on the
+  dead IPv6 address before falling back to the working IPv4 one — explains sites that
+  load fine in a browser but were slow/"unreachable" here. The homepage GET also bypasses
+  any system/VPN/antivirus HTTP proxy explicitly (`proxies={"http": None, "https": None}`)
+  — `requests` honors such a proxy by default while the raw-socket ping never does, so a
+  local proxy can make ping pass fast while the real fetch silently stalls behind it — and
+  streams the body itself under a hard 15s wall-clock deadline, since `requests`' own
+  read-timeout only bounds gaps *between* chunks, not total transfer time (a server
+  trickling data without ever going silent for the full read-timeout window can otherwise
+  hang far longer than the nominal timeout suggests). Every result line also prints its own
+  elapsed seconds plus a pass-total/average at the end; a background watchdog also prints a
+  heartbeat for any single site stuck on the same phase (pinging/fetching/asking AI) for
+  5s+, naming the domain and phase directly instead of going silent until it times out.
+  The Sheet's `get_websites` read (69k+ rows) is retried automatically (3 attempts, 3s/6s
+  backoff) if it errors or comes back with a valid-but-empty list — a heavy read like that
+  occasionally has a transient Apps Script hiccup. If still empty after retries, it falls
+  back to `websites_sheet_cache.json` (the last successful pull, auto-saved every time one
+  succeeds) instead of just the thin local `scraped_websites` table — so one flaky read
+  doesn't make the whole 37k-site backlog look like it vanished.
+- **Bot behaviour:** does one fast full pass over the current backlog, then — once
+  nothing eligible is left — idles and re-checks every `--poll-minutes` (default 10) for
+  newly-synced or newly-eligible sites. Never stops on its own; `--once` for a single pass,
+  Ctrl+C to quit the loop. `--dry-run` scans and prints without writing anything;
+  `--limit N` caps how many rows a pass scans (handy for testing).
+
+## Step 14 — Blog pin destination-link downloader (`14_download_blog_pin_links.py`)
+- **Why it exists:** download the actual content (HTML/CSS/JS) behind every pin that
+  belongs to a pinner whose website is a confirmed blog — pins from non-blog pinners are
+  never touched.
+- **"Is this pinner a blog?" — local, not per-pin Sheet calls:** a new `site_type` column
+  on the local `pinners` table. At the start of every pass the script bulk-syncs it
+  straight from the Sheet's `websites` tab `site_type` column, matched purely by `id`
+  (= pinner `username`) — no domain-guessing needed. After that one sync call, the blog
+  filter (`site_type` contains "blog", case-insensitive — same substring check as
+  magic_scroll's `--blog-only`) runs entirely off the local DB. Sync uses the same
+  3-attempt retry + `websites_sheet_cache.json` fallback as step 13 (shared cache file —
+  either script's last successful pull benefits the other); if the Sheet's unreachable,
+  it just keeps whatever `site_type` is already stored locally rather than blocking.
+- **What gets downloaded:** the pin's `link` column — the real outbound URL the pin
+  points to, NOT `pin_url` (that's just the Pinterest pin page itself). De-duplicates by
+  unique `link` before downloading (the same URL is often pinned many times across boards/
+  repins) — each unique link is fetched once, and that one result is written to every pin
+  row sharing it.
+- **Output — 5 new columns on `pins`:**
+  - `link_download_status` — `Done` / `Blocked (Cloudflare)` / `Blocked (HTTP ...)` /
+    `Failed (...)` / `Failed (no link)`
+  - `link_downloaded_at` — timestamp of the attempt
+  - `link_html` — destination page's raw HTML (capped ~3MB)
+  - `link_css` — inline `<style>` blocks + every linked external `.css` file's contents,
+    concatenated (capped ~4MB total)
+  - `link_js` — inline `<script>` blocks + every linked external `.js` file's contents,
+    concatenated (capped ~6MB total)
+- **Cloudflare detected specifically** (not lumped into a generic block reason): on a
+  403/429/503, first retries once via curl_cffi's Chrome-impersonation bypass (same
+  technique step 13 uses); if that also fails, checks response headers (`cf-ray`,
+  `Server: cloudflare`) and known challenge-page text ("Checking your browser...",
+  "Just a moment...", etc.) to label it `Blocked (Cloudflare)` specifically rather than
+  just `Blocked (HTTP 403)`.
+- **Speed / concurrency:** same proven primitives as step 13 — process-wide IPv4-only DNS
+  monkeypatch, a dedicated hard-ceiling TCP ping pre-check (`quick_ping`), proxy-bypassed
+  streaming GETs with a real wall-clock deadline (not just requests' between-chunk
+  read-timeout), and a watchdog heartbeat thread that prints anything stuck 5s+ in the
+  same phase. High-thread-count `ThreadPoolExecutor` (`--workers`, default 80) downloads
+  many destination pages + their assets in parallel; each completed unique link is
+  written to the DB IMMEDIATELY inside `handle_result` (lock-guarded UPDATE, not buffered
+  to the end), so progress survives an interruption.
+- **Standalone, separate from steps 10/13:** its own DB/Sheet-client code, no shared
+  state or imports (those scripts' filenames aren't even valid Python module names). Needs
+  no `.env`/API key — it's a pure download job, no AI classification involved.
+- **Bot behaviour:** downloads the whole eligible backlog, then — once nothing eligible is
+  left — idles and re-checks every `--poll-minutes` (default 10) for newly-scraped pins or
+  newly-confirmed-blog pinners. Never stops on its own; `--once` for a single pass, Ctrl+C
+  to quit. `--dry-run` downloads and prints without writing anything; `--limit N` caps how
+  many unique links a pass downloads (testing); `--retry-failed` also re-attempts pins
+  already marked Failed/Blocked instead of only untried ones.
 
 ## Steps 4 & 5 — SortPin data → relational DB + viewer
 - **Data model:** `leads` CSV = master pinners; `boards` link to pinner via `owner_username`;
@@ -95,6 +236,16 @@ python magic_scroll.py --pinner 10 --blog-only # only pinners step 7 classified 
   recovered from `pin_url` (`/pin/<id>`). Empty phantom CSV rows are skipped.
 - **Step 5:** `sortpin_viewer.html` is one offline file (data embedded) — searchable,
   sortable pinner list → click a pinner → their boards → click a board → its pins.
+- **Site-scan status column:** every pinner row (in `--server` table view, card view badge,
+  and the static viewer's JSON) carries a live-computed `site_scan_status`: `done` /
+  `running` / `blocked` / `failed` / `not_yet` (from `scraped_websites.status`, matched
+  by domain), `unscanned` (has a website but `10_domain_quick_scrape_api.py` hasn't
+  reached that domain yet), or `no_website`. It's computed on the fly from `pinners` +
+  `scraped_websites`, not a stored column, so it's never stale or wiped by a rebuild.
+  On the **Sheet** side, the `websites` tab's `scrapped` column already serves the same
+  purpose — `10_domain_quick_scrape_api.py` writes real values there as it works
+  (`Not Yet` → `Running` → `Yes`/`Failed (...)`/`Blocked (...)`); the value `run_websites_sync`
+  writes at first-sync time (`"not yet"`) is just a placeholder until step 10 visits it.
 
 ## Script 2 — how it works
 1. Reads `progress.json`, skips already-Done keywords
