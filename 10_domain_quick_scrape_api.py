@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import queue as _queue
 import re
 import sys
 import threading
@@ -209,31 +210,54 @@ def load_env() -> dict:
                     env[k.strip()] = v.strip()
     return env
 
-def get_db_connection():
-    """Loads MySQL configuration from env and attempts to connect.
-    Falls back to SQLite (sortpin.db) if not configured or if connection fails."""
-    env = load_env()
-    mysql_password = env.get("MYSQL_PASSWORD", "")
-    if mysql_password and mysql_password != "YOUR_PASSWORD_HERE":
-        try:
-            import mysql.connector
-            host = env.get("MYSQL_HOST", "72.61.197.144")
-            port = int(env.get("MYSQL_PORT", "3306"))
-            db = env.get("MYSQL_DB", "data_pint")
-            user = env.get("MYSQL_USER", "data_pint_user")
+# ── Shared MySQL connection pool ───────────────────────────────────────────────
+# Created lazily on first use (thread-safe double-checked locking).
+# All worker threads share one pool instead of opening a new physical connection
+# per get_db_connection() call, which previously caused "pool exhausted" errors
+# when MAX_BULK_WORKERS concurrent threads all tried to connect simultaneously.
+_mysql_pool      = None
+_mysql_pool_lock = threading.Lock()
 
-            conn = mysql.connector.connect(
-                host=host,
-                port=port,
-                database=db,
-                user=user,
-                password=mysql_password,
+def _get_mysql_pool():
+    """Return the shared MySQLConnectionPool, creating it on first call."""
+    global _mysql_pool
+    if _mysql_pool is not None:
+        return _mysql_pool
+    with _mysql_pool_lock:
+        if _mysql_pool is not None:
+            return _mysql_pool
+        env = load_env()
+        pw = env.get("MYSQL_PASSWORD", "")
+        if not pw or pw == "YOUR_PASSWORD_HERE":
+            return None
+        try:
+            import mysql.connector.pooling
+            pool_size = int(env.get("MYSQL_POOL_SIZE", 15))
+            _mysql_pool = mysql.connector.pooling.MySQLConnectionPool(
+                pool_name="step10",
+                pool_size=pool_size,
+                pool_reset_session=False,          # keep SET SESSION vars across checkouts
+                host=env.get("MYSQL_HOST", "72.61.197.144"),
+                port=int(env.get("MYSQL_PORT", "3306")),
+                database=env.get("MYSQL_DB", "data_pint"),
+                user=env.get("MYSQL_USER", "data_pint_user"),
+                password=pw,
                 charset="utf8mb4",
                 collation="utf8mb4_general_ci",
                 autocommit=True,
                 connection_timeout=30,
-                pool_reset_session=False
             )
+            return _mysql_pool
+        except Exception as e:
+            print(f"  Warning: MySQL pool init failed: {e}. Will fall back to SQLite.")
+            return None
+
+def get_db_connection():
+    """Get a DB connection from the shared MySQL pool, or fall back to SQLite."""
+    pool = _get_mysql_pool()
+    if pool is not None:
+        try:
+            conn = pool.get_connection()
             try:
                 cursor = conn.cursor()
                 cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -245,16 +269,17 @@ def get_db_connection():
                 pass
             return DBWrapper(is_mysql=True, conn=conn)
         except Exception as e:
-            print(f"  Warning: MySQL connection failed: {e}. Falling back to SQLite.")
+            print(f"  Warning: MySQL pool get_connection failed: {e}. Falling back to SQLite.")
 
     import sqlite3
     sqlite_path = os.path.join(BASE, "sortpin.db")
     conn = sqlite3.connect(sqlite_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")       # concurrent readers + writer
-    conn.execute("PRAGMA synchronous=NORMAL")     # safe but faster than FULL
-    conn.execute("PRAGMA cache_size=-65536")      # 64 MB page cache
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-65536")
     conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA busy_timeout=15000")
     return DBWrapper(is_mysql=False, conn=conn)
 
 # ─── Table Auto-Initialization ────────────────────────────────────────────────
@@ -841,8 +866,6 @@ def update_website_in_sheets(website_url: str, updates: dict) -> bool:
         print(f"  Error updating website {website_url} in Google Sheets: {e}")
     return False
 
-import threading as _threading
-
 def _batch_update_sheets_raw(updates: list):
     """Send a list of {website, fields} updates to Apps Script in one call."""
     cfg = load_webapp_config()
@@ -870,14 +893,49 @@ def _batch_mark_yes_in_sheets(urls: list):
     except Exception:
         pass  # non-critical — DB is already authoritative
 
-def _sheets_update_async(url: str, updates: dict):
-    """Fire-and-forget Google Sheets update — never blocks the scan worker."""
-    def _do():
+# ── Batched async Sheets writer ────────────────────────────────────────────────
+# The old implementation spawned a new thread per update, so 30 workers finishing
+# simultaneously fired 30+ individual HTTP requests to Apps Script at once →
+# all timed out (60 s each) and/or triggered rate-limit 404s.
+# This version accumulates updates in a queue and flushes them as a single
+# batch_update_websites call every BATCH_WINDOW seconds (or when BATCH_MAX is hit),
+# reducing N individual calls to 1 call per time window regardless of concurrency.
+_sheets_write_queue          = _queue.Queue()
+_sheets_batch_started        = False
+_sheets_batch_started_lock   = threading.Lock()
+
+def _sheets_batch_writer():
+    BATCH_WINDOW = 3.0   # flush at most every 3 s
+    BATCH_MAX    = 50    # or when 50 items accumulate, whichever comes first
+    pending  = []
+    deadline = time.time() + BATCH_WINDOW
+    while True:
+        timeout = max(0.05, deadline - time.time())
         try:
-            update_website_in_sheets(url, updates)
-        except Exception:
+            item = _sheets_write_queue.get(timeout=timeout)
+            if item is None:
+                break
+            pending.append(item)
+        except _queue.Empty:
             pass
-    _threading.Thread(target=_do, daemon=True).start()
+        if pending and (time.time() >= deadline or len(pending) >= BATCH_MAX):
+            try:
+                batch = [{"website": it["url"], "fields": it["updates"]} for it in pending]
+                _batch_update_sheets_raw(batch)
+            except Exception:
+                pass
+            pending.clear()
+            deadline = time.time() + BATCH_WINDOW
+
+def _sheets_update_async(url: str, updates: dict):
+    """Queue a Sheets update — batched by background thread, never blocks workers."""
+    global _sheets_batch_started
+    if not _sheets_batch_started:
+        with _sheets_batch_started_lock:
+            if not _sheets_batch_started:
+                threading.Thread(target=_sheets_batch_writer, daemon=True).start()
+                _sheets_batch_started = True
+    _sheets_write_queue.put({"url": url, "updates": updates})
 
 # ─── Scraper Core & Post Comparison ───────────────────────────────────────────
 
@@ -1493,14 +1551,14 @@ def run_bulk_scrape_job(run_all: bool) -> None:
         
     env_vars = load_env()
     try:
-        max_workers = int(env_vars.get("MAX_BULK_WORKERS", 5))
+        max_workers = int(env_vars.get("MAX_BULK_WORKERS", 20))
     except Exception:
-        max_workers = 5
+        max_workers = 20
 
     try:
-        batch_size = int(env_vars.get("BATCH_CLAIM_SIZE", 5))
+        batch_size = int(env_vars.get("BATCH_CLAIM_SIZE", 20))
     except Exception:
-        batch_size = 5
+        batch_size = 20
         
     from concurrent.futures import ThreadPoolExecutor
     
