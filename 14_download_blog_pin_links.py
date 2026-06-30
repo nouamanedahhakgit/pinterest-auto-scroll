@@ -235,6 +235,62 @@ def sync_site_types(gsc, cfg, conn) -> int:
     return len(rows)
 
 
+def _extract_domain(url: str) -> str:
+    """Same normalization magic_scroll.py's --blog-only fallback uses, so domain
+    matching against the local scraped_websites table is consistent project-wide."""
+    if not url:
+        return ""
+    u = url.strip().lower()
+    if not u.startswith("http"):
+        u = "https://" + u
+    try:
+        h = urlparse(u).hostname or ""
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
+
+def apply_local_site_type_fallback(conn) -> int:
+    """For any pinner whose site_type is still empty after the Sheet sync
+    (Sheet unreachable/stale-deployment/not-yet-classified-there), fill it in
+    from this PC's own local `scraped_websites` table (written by
+    10_domain_quick_scrape_api.py when IT runs here), matched by domain —
+    same fallback magic_scroll.py's --blog-only already relies on. This is a
+    last resort: the Sheet is the real cross-machine source of truth, but a
+    pinner scanned locally on THIS PC shouldn't sit ineligible just because
+    the Sheet round-trip failed."""
+    try:
+        local_rows = conn.execute(
+            "SELECT domain, site_type FROM scraped_websites "
+            "WHERE domain IS NOT NULL AND status='done' AND site_type IS NOT NULL AND site_type <> ''"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0  # table doesn't exist on this PC yet — nothing to fall back to
+
+    if not local_rows:
+        return 0
+    local_by_domain = {r[0].strip().lower(): r[1] for r in local_rows if r[0]}
+
+    pending = conn.execute(
+        "SELECT username, website_url FROM pinners WHERE (site_type IS NULL OR site_type='') "
+        "AND website_url IS NOT NULL AND website_url <> ''"
+    ).fetchall()
+
+    updates = []
+    for username, website_url in pending:
+        dom = _extract_domain(website_url)
+        st = local_by_domain.get(dom)
+        if st:
+            updates.append((st, username))
+
+    if updates:
+        with _db_lock:
+            conn.executemany("UPDATE pinners SET site_type=? WHERE username=?", updates)
+            conn.commit()
+    print(f"  (Local fallback: filled site_type for {len(updates)} pinner(s) from this PC's own scraped_websites table.)")
+    return len(updates)
+
+
 def fetch_eligible_units(conn, limit, retry_failed: bool) -> list:
     """Returns a list of {'link': ..., 'pin_ids': [...]} units — one per
     UNIQUE destination link among pins whose pinner is a confirmed blog.
@@ -577,6 +633,7 @@ def main():
     print(f"  14_download_blog_pin_links.py — workers={args.workers}")
     while True:
         sync_site_types(gsc, cfg, conn)
+        apply_local_site_type_fallback(conn)
         units = fetch_eligible_units(conn, args.limit, args.retry_failed)
         if units:
             run_pass(units, conn, args.workers, args.dry_run)
