@@ -21,7 +21,7 @@ Automates Pinterest keyword scrolling so the **SortPin** browser extension (inst
 | `7_scrape_profiles.py` | **Deep scrape:** for each pinner → open profile → open every board → scroll till end. Resumable (`profiles_progress.json`). |
 | `10_domain_quick_scrape_api.py` | Flask app + bulk job: heuristically classifies each pinner's `website` (Store / Link-in-Bio / Social Media / Blog / General Website) via `STORE_DOMAINS`/`LINK_IN_BIO_DOMAINS` lists + WordPress/post-count signals. Writes `scrapped`/`site_type`/`categories` on the Sheet's `websites` tab + local `scraped_websites`. |
 | `13_scan-website-interface-by-ia.py` | **AI website scanner bot.** Standalone, multi-threaded, separate from step 10. For every General-Website/Blog/not-yet-classified pinner site (skips Store/Link-in-Bio/Social Media — step 10 already nailed those), fetches the homepage and asks an OpenRouter model for the site's real type, a short filterable category/theme, and a description — catches step 10's false "Blog" calls on sites that just have a marketing blog bolted onto a SaaS/store/agency. Writes 4 new columns ending in `_website_scaned_by_ia` (local `sortpin.db` + the Sheet, auto-created on first run). Scans the whole backlog once, then polls every 10 min forever for newly-eligible sites — leave it running, Ctrl+C to stop. |
-| `14_download_blog_pin_links.py` | **Blog pin destination-link downloader bot.** Standalone, multi-threaded. Syncs the Sheet's `site_type` column into a new local `pinners.site_type` column, then for every pin whose pinner's `site_type` contains "blog", downloads the pin's outbound `link` (not `pin_url`) — page HTML + every linked CSS/JS file + inline `<style>`/`<script>` blocks — into 5 new `pins` columns. De-dupes by unique link before downloading (a link pinned many times is fetched once, written to every matching pin). Writes to the DB as each link completes, not batched. Detects Cloudflare blocks specifically (vs a generic HTTP block) and tries a curl_cffi Chrome-impersonation bypass first. Downloads the whole backlog once, then polls every 10 min forever for newly-eligible pins — leave it running, Ctrl+C to stop. |
+| `14_download_blog_pin_links.py` | **Blog pin destination-link downloader bot.** Standalone, multi-threaded. Syncs the Sheet's `site_type` column into `pinners.site_type` (local sortpin.db, or the cloud MySQL `pinners` table — see `--source` below), then for every pin whose pinner's `site_type` contains "blog", downloads the pin's outbound `link` (not `pin_url`) — page HTML + every linked CSS/JS file + inline `<style>`/`<script>` blocks — into 5 new `pins` columns. De-dupes by unique link before downloading (a link pinned many times is fetched once, written to every matching pin). Writes to the DB as each link completes, not batched. Detects Cloudflare blocks specifically (vs a generic HTTP block) and tries a curl_cffi Chrome-impersonation bypass first. **`--source mysql\|sqlite\|auto`** (default `mysql`): `mysql` reads/writes the shared cloud MySQL DB (every PC's pins+pinners — see `8_sync_to_mysql.py`) and exits if `.env`'s `MYSQL_PASSWORD` isn't configured/reachable, `sqlite` is this PC's local `sortpin.db` only, `auto` picks `mysql` when `.env` has a working `MYSQL_PASSWORD` else falls back to `sqlite` (this was the old default). Downloads the whole backlog once, then polls every 10 min forever for newly-eligible pins — leave it running, Ctrl+C to stop. |
 | `magic_scroll.py` | **All-in-one multi-computer loop:** claim 5 keywords from sheet (pending) → scroll → build DB → mark Done → clear SortPin → repeat. Also has a **pinner mode** (`--pinner N`) that deep-scrapes pinners instead — see below. |
 | `sortpin.db` | Auto-created (step 4). SQLite: tables `pinners`, `boards`, `pins` with foreign keys. |
 | `sortpin_data.json` | Auto-created (step 4). Flat pinners/boards/pins arrays (feeds the viewer). |
@@ -66,12 +66,15 @@ python 13_scan-website-interface-by-ia.py --once            # single pass then e
 python 13_scan-website-interface-by-ia.py --workers 100     # more parallel threads (default 60)
 python 13_scan-website-interface-by-ia.py --poll-minutes 5  # check more often than 10 min
 python 13_scan-website-interface-by-ia.py --limit 20 --once --dry-run  # quick test, no writes
-python 14_download_blog_pin_links.py                       # download bot: sync site_type, download all eligible pin links, then poll every 10 min forever
+python 14_download_blog_pin_links.py                       # download bot: mysql by default, sync site_type, download all eligible pin links, then poll every 10 min forever
 python 14_download_blog_pin_links.py --once                # single pass then exit (no polling)
 python 14_download_blog_pin_links.py --workers 120         # more parallel threads (default 80)
 python 14_download_blog_pin_links.py --poll-minutes 5      # check more often than 10 min
 python 14_download_blog_pin_links.py --retry-failed        # also re-attempt Failed/Blocked pins, not just untried ones
 python 14_download_blog_pin_links.py --limit 20 --once --dry-run  # quick test, no writes
+python 14_download_blog_pin_links.py --source mysql         # explicit (same as default) — cloud MySQL, every PC's pins+pinners
+python 14_download_blog_pin_links.py --source sqlite        # force this PC's local sortpin.db only
+python 14_download_blog_pin_links.py --source auto          # mysql if .env has MYSQL_PASSWORD, else sqlite (old default)
 ```
 
 ## magic_scroll — multi-computer workflow
@@ -174,15 +177,41 @@ python 14_download_blog_pin_links.py --limit 20 --once --dry-run  # quick test, 
 - **Why it exists:** download the actual content (HTML/CSS/JS) behind every pin that
   belongs to a pinner whose website is a confirmed blog — pins from non-blog pinners are
   never touched.
-- **"Is this pinner a blog?" — local, not per-pin Sheet calls:** a new `site_type` column
-  on the local `pinners` table. At the start of every pass the script bulk-syncs it
-  straight from the Sheet's `websites` tab `site_type` column, matched purely by `id`
-  (= pinner `username`) — no domain-guessing needed. After that one sync call, the blog
-  filter (`site_type` contains "blog", case-insensitive — same substring check as
-  magic_scroll's `--blog-only`) runs entirely off the local DB. Sync uses the same
-  3-attempt retry + `websites_sheet_cache.json` fallback as step 13 (shared cache file —
-  either script's last successful pull benefits the other); if the Sheet's unreachable,
-  it just keeps whatever `site_type` is already stored locally rather than blocking.
+- **"Is this pinner a blog?" — local, not per-pin Sheet calls:** a `site_type` column
+  on the `pinners` table (local `sortpin.db`, or MySQL's `pinners` table in `--source
+  mysql` mode — see below). At the start of every pass the script bulk-syncs it straight
+  from the Sheet's `websites` tab `site_type` column, matched purely by `id` (= pinner
+  `username`) — no domain-guessing needed. After that one sync call, the blog filter
+  (`site_type` contains "blog", case-insensitive — same substring check as magic_scroll's
+  `--blog-only`) runs entirely off the DB. Sync uses the same 3-attempt retry +
+  `websites_sheet_cache.json` fallback as step 13 (shared cache file — either script's
+  last successful pull benefits the other); if the Sheet's unreachable, it just keeps
+  whatever `site_type` is already stored rather than blocking.
+- **Two pin sources — `--source {mysql,sqlite,auto}` (default `mysql`):**
+  - `mysql` — (default) the shared cloud MySQL database `8_sync_to_mysql.py` pushes every PC's data
+    into. Local `sortpin.db` only has what *this* machine has scraped; MySQL is the union
+    across every PC, since `8_sync_to_mysql.py` additively `INSERT IGNORE`s each PC's rows
+    into the same shared tables — this is why MySQL holds far more pins/pinners than any
+    one PC's local DB. **Site_type is written straight into MySQL's `pinners` table** via
+    a plain `UPDATE ... WHERE username=...` (not `INSERT IGNORE`) — `8_sync_to_mysql.py`'s
+    own pinners sync is insert-only and never updates a row already in MySQL, so a
+    classification made locally *after* that pinner's row was already synced would
+    otherwise never reach MySQL. Eligible pins are then found with a direct SQL
+    `INNER JOIN` (`pins.pinner_username = pinners.username AND pinners.site_type LIKE
+    '%blog%'`), and the same 5 download columns are added to MySQL's `pins` table and
+    written there too, so progress is shared across every PC running the script. A
+    selected batch is immediately marked `link_download_status='Running'` as best-effort
+    dedup against another PC running concurrently — not a hard lock; a crashed run can
+    leave pins stuck at `'Running'`, cleared by rerunning with `--retry-failed` (which
+    bypasses the status filter entirely). Exits instead of falling back if MySQL isn't
+    reachable/configured (check `.env`'s `MYSQL_PASSWORD`).
+  - `sqlite` — this PC's local `sortpin.db` only, the script's original mode. If the Sheet
+    is unreachable, falls back to the local `scraped_websites` table (status='done' rows,
+    matched by domain — mirrors magic_scroll's `--blog-only` fallback).
+  - `auto` — `mysql` when `.env` has a working `MYSQL_PASSWORD` (same credential keys as
+    `8_sync_to_mysql.py`: `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_DB`/`MYSQL_USER`/
+    `MYSQL_PASSWORD`), else falls back to `sqlite`. This was the default before `mysql`
+    became the default.
 - **What gets downloaded:** the pin's `link` column — the real outbound URL the pin
   points to, NOT `pin_url` (that's just the Pinterest pin page itself). De-duplicates by
   unique `link` before downloading (the same URL is often pinned many times across boards/
@@ -212,8 +241,10 @@ python 14_download_blog_pin_links.py --limit 20 --once --dry-run  # quick test, 
   written to the DB IMMEDIATELY inside `handle_result` (lock-guarded UPDATE, not buffered
   to the end), so progress survives an interruption.
 - **Standalone, separate from steps 10/13:** its own DB/Sheet-client code, no shared
-  state or imports (those scripts' filenames aren't even valid Python module names). Needs
-  no `.env`/API key — it's a pure download job, no AI classification involved.
+  state or imports (those scripts' filenames aren't even valid Python module names; the
+  MySQL connection helper is its own copy too, not imported from `8_sync_to_mysql.py`).
+  No AI classification involved — pure download job. `.env`/`MYSQL_PASSWORD` is only
+  needed for `--source mysql`/`auto`'s MySQL path; `--source sqlite` needs no `.env`.
 - **Bot behaviour:** downloads the whole eligible backlog, then — once nothing eligible is
   left — idles and re-checks every `--poll-minutes` (default 10) for newly-scraped pins or
   newly-confirmed-blog pinners. Never stops on its own; `--once` for a single pass, Ctrl+C

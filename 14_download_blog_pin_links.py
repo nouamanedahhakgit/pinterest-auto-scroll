@@ -12,14 +12,42 @@ columns on the `pins` table. Pins belonging to a non-blog (or not-yet-known)
 pinner are skipped entirely; nothing is written for them.
 
 "Is this pinner's website a blog?" — per-pinner, not per-domain:
-  A new `site_type` column is added to the local `pinners` table. At the
-  start of every pass this script bulk-syncs it straight from the Google
-  Sheet's "websites" tab (`get_websites` action — same data step 10/13 write),
-  matching purely by username (the Sheet's `id` column = pinner username, no
-  domain-guessing needed). After that one sync call, the blog filter runs
-  entirely off the local DB — no per-pin Sheet round-trips. A pinner counts
-  as "blog" when `site_type` contains "blog" (case-insensitive) — same
-  substring check used by magic_scroll.py's --blog-only.
+  A `site_type` column holds the Google Sheet's "websites" tab classification
+  (`get_websites` action — same data step 10/13 write), matched purely by
+  username (the Sheet's `id` column = pinner username, no domain-guessing
+  needed). A pinner counts as "blog" when `site_type` contains "blog"
+  (case-insensitive) — same substring check used by magic_scroll.py's
+  --blog-only.
+
+Two pin sources (--source, default mysql):
+  --source mysql     (default) The shared cloud MySQL database 8_sync_to_mysql.py pushes
+                     every PC's local data into — pins/pinners from ALL PCs,
+                     not just this one, since local sortpin.db only has what
+                     THIS machine has scraped. `site_type` (the real string —
+                     Blog/Store/Link-in-Bio/General Website/etc., not just a
+                     blog flag) is written straight into MySQL's `pinners`
+                     table every pass via a plain UPDATE keyed by username —
+                     unlike 8_sync_to_mysql.py's own pinners sync, which uses
+                     INSERT IGNORE (insert-only, never updates an existing
+                     row), so a later classification would otherwise never
+                     reach MySQL. Eligible pins are then found there directly
+                     with a SQL JOIN (pins.pinner_username = pinners.username
+                     AND pinners.site_type LIKE '%blog%'), and the 5 download
+                     columns below are added to MySQL's `pins` table and
+                     written there too — so progress is shared across every
+                     PC that runs this script, not siloed per machine. Claims
+                     a batch (`link_download_status='Running'`) the moment
+                     it's selected, as best-effort dedup against another PC
+                     running the same pass concurrently — not a hard lock; a
+                     crashed run can leave some pins stuck at 'Running',
+                     cleared by rerunning with --retry-failed. Exits if
+                     .env's MYSQL_PASSWORD isn't configured/reachable.
+  --source sqlite    This PC's local sortpin.db only. `site_type` is synced
+                     into the local `pinners` table every pass; if the Sheet
+                     is unreachable, falls back to the local `scraped_websites`
+                     table (status='done' rows, matched by domain — mirrors
+                     magic_scroll.py's --blog-only fallback).
+  --source auto      mysql if .env has a working MYSQL_PASSWORD, else sqlite.
 
 Same unique LINK is often pinned many times (repins, multiple boards) — this
 script de-duplicates by `link` before downloading, fetches each unique link
@@ -53,11 +81,14 @@ newly-scraped pins or newly-confirmed-blog pinners. Never stops on its own;
 Ctrl+C to quit.
 
 Run:
-  python 14_download_blog_pin_links.py                       # bot mode: download all, then poll every 10 min
+  python 14_download_blog_pin_links.py                       # bot mode: mysql by default; poll every 10 min
+  python 14_download_blog_pin_links.py --source mysql         # explicit (same as default) — shared cloud DB (all PCs' pins)
+  python 14_download_blog_pin_links.py --source sqlite        # force this PC's local sortpin.db only
+  python 14_download_blog_pin_links.py --source auto          # mysql if .env configured, else sqlite (old default)
   python 14_download_blog_pin_links.py --once                # single pass, then exit
   python 14_download_blog_pin_links.py --workers 120          # more parallel threads (default 80)
   python 14_download_blog_pin_links.py --poll-minutes 5       # check more often than 10 min
-  python 14_download_blog_pin_links.py --retry-failed         # also re-attempt Failed/Blocked pins, not just untried ones
+  python 14_download_blog_pin_links.py --retry-failed         # also re-attempt Failed/Blocked/Running pins, not just untried ones
   python 14_download_blog_pin_links.py --limit 20 --once --dry-run   # quick test, no writes
 """
 from __future__ import annotations
@@ -347,6 +378,287 @@ def write_unit_result(conn, pin_ids: list, status: str, html_: str, css_: str, j
         conn.commit()
 
 
+def fetch_website_classifications(gsc, cfg) -> dict:
+    """Same Sheet read + retry + cache-fallback as sync_site_types(), but
+    returns the full {username_lower: site_type} mapping instead of writing
+    it anywhere — shared by both backends below: the sqlite backend still
+    writes it into local pinners.site_type (sync_site_types), the MySQL
+    backend writes the *real* site_type string into MySQL's pinners.site_type
+    column too (sync_site_types_mysql) so it's visible/queryable there, not
+    just used internally for filtering."""
+    if not (gsc and cfg):
+        print("  (No Sheet client/config for site_type.)")
+        return {}
+
+    data = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            data = gsc.post_webapp(cfg, {"action": "get_websites"})
+            last_err = None
+            if data.get("websites"):
+                break
+        except Exception as e:
+            last_err = e
+            data = None
+        if attempt < 2:
+            time.sleep(3 * (attempt + 1))
+
+    if data and data.get("websites"):
+        _save_sheet_cache(data["websites"])
+    else:
+        cached = _load_sheet_cache()
+        if cached:
+            data = {"websites": cached}
+            print(f"  (Sheet unreachable/empty — using last cached snapshot ({len(cached)} sites) for site_type.)")
+        else:
+            print(f"  (Could not reach Sheet for site_type — {last_err or 'empty response, no cache available'}.)")
+            return {}
+
+    classifications = {}
+    for w in data.get("websites", []):
+        uid = str(w.get("id") or "").strip().lower()
+        st = str(w.get("site_type") or "").strip()
+        if uid and st:
+            classifications[uid] = st
+    blog_count = sum(1 for st in classifications.values() if "blog" in st.lower())
+    print(f"  {len(classifications)} pinner(s) classified on the Sheet ({blog_count} 'blog').")
+    return classifications
+
+
+# ─── MySQL backend ────────────────────────────────────────────────────────────
+# Optional alternate pin source: the cloud MySQL database 8_sync_to_mysql.py
+# pushes every PC's local sortpin.db into. Local sortpin.db only has whatever
+# THIS PC has scraped; MySQL has the union across every PC, so it's a much
+# bigger eligible-pin pool. Selected via --source mysql (or --source auto,
+# the default, when a working .env MySQL password is present); falls back to
+# the local-sqlite backend above when MySQL isn't configured or unreachable.
+# Write-back goes straight to MySQL's `pins` table so progress is shared
+# across every PC that runs this script, instead of siloed per-machine.
+
+def load_env() -> dict:
+    env = {}
+    env_path = os.path.join(BASE, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    return env
+
+
+def mysql_configured(env: dict) -> bool:
+    pw = env.get("MYSQL_PASSWORD", "")
+    return bool(pw) and pw != "YOUR_PASSWORD_HERE"
+
+
+def get_mysql_connection(env: dict):
+    """Same connection routine 8_sync_to_mysql.py uses (same host/db/user
+    defaults, same stale-sleeping-connection cleanup) but never sys.exit()s
+    on failure — returns None so the caller can fall back to sqlite mode."""
+    if not mysql_configured(env):
+        return None
+    try:
+        import mysql.connector
+    except ImportError:
+        print("  (mysql-connector-python not installed — pip install mysql-connector-python cryptography. Falling back to sqlite mode.)")
+        return None
+
+    host = env.get("MYSQL_HOST", "72.61.197.144")
+    port = int(env.get("MYSQL_PORT", "3306"))
+    db = env.get("MYSQL_DB", "data_pint")
+    user = env.get("MYSQL_USER", "data_pint_user")
+    password = env.get("MYSQL_PASSWORD", "")
+
+    try:
+        con = mysql.connector.connect(
+            host=host, port=port, database=db, user=user, password=password,
+            charset="utf8mb4", collation="utf8mb4_general_ci",
+        )
+        cur = con.cursor()
+        try:
+            cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            cur.execute("SET SESSION innodb_lock_wait_timeout = 120")
+        finally:
+            cur.close()
+        print(f"  Connected to cloud MySQL ({host}:{port}, db={db}) — using it as the pin source (all PCs' data).")
+        return con
+    except Exception as e:
+        print(f"  (Could not connect to MySQL — {e}. Falling back to local sqlite mode.)")
+        return None
+
+
+def ensure_mysql_pin_columns(mysql_conn):
+    cur = mysql_conn.cursor()
+    cur.execute("SHOW COLUMNS FROM pins")
+    existing = {row[0] for row in cur.fetchall()}
+    type_map = {
+        "link_download_status": "VARCHAR(64)",
+        "link_downloaded_at": "VARCHAR(32)",
+        "link_html": "LONGTEXT",
+        "link_css": "LONGTEXT",
+        "link_js": "LONGTEXT",
+    }
+    for col, mysql_type in type_map.items():
+        if col not in existing:
+            cur.execute(f"ALTER TABLE pins ADD COLUMN `{col}` {mysql_type}")
+            mysql_conn.commit()
+            print(f"  (MySQL: added column `{col}` to pins.)")
+    cur.close()
+
+
+def ensure_mysql_pinner_columns(mysql_conn):
+    cur = mysql_conn.cursor()
+    cur.execute("SHOW COLUMNS FROM pinners")
+    existing = {row[0] for row in cur.fetchall()}
+    if "site_type" not in existing:
+        cur.execute("ALTER TABLE pinners ADD COLUMN `site_type` VARCHAR(64)")
+        mysql_conn.commit()
+        print("  (MySQL: added column `site_type` to pinners.)")
+    cur.close()
+
+
+def sync_site_types_mysql(mysql_conn, classifications: dict) -> int:
+    """Writes the Sheet's real site_type STRING (Blog / Store / Link-in-Bio /
+    General Website / etc., not just a blog/not-blog flag) straight into
+    MySQL's pinners.site_type column, by username. Unlike 8_sync_to_mysql.py's
+    pinners sync (INSERT IGNORE — insert-only, never touches an existing row),
+    this is a plain UPDATE, so it overwrites whatever's there every pass —
+    site_type stays current on MySQL itself, not just inferred internally by
+    this script. Only updates pinners that already exist in MySQL (a website
+    classified on the Sheet for a pinner no PC has ever scraped into MySQL
+    yet has nothing to attach to)."""
+    if not classifications:
+        return 0
+    cur = mysql_conn.cursor()
+    items = list(classifications.items())
+    updated = 0
+    batch_size = 500
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+        for attempt in range(1, 4):
+            try:
+                cur.executemany(
+                    "UPDATE pinners SET site_type=%s WHERE username=%s",
+                    [(site_type, username) for username, site_type in batch],
+                )
+                mysql_conn.commit()
+                updated += len(batch)
+                break
+            except Exception as err:
+                mysql_conn.rollback()
+                is_lock = "1205" in str(err) or getattr(err, "errno", None) == 1205
+                if is_lock and attempt < 3:
+                    time.sleep(5 * attempt)
+                    continue
+                print(f"  (warning: site_type batch sync failed — {err})")
+                break
+    cur.close()
+    print(f"  Synced site_type for {updated} pinner(s) into MySQL.")
+    return updated
+
+
+def _mysql_execute_retry(mysql_conn, sql, params=None, retries=3, delay=5):
+    cur = mysql_conn.cursor()
+    for attempt in range(1, retries + 1):
+        try:
+            cur.execute(sql, params or ())
+            mysql_conn.commit()
+            cur.close()
+            return
+        except Exception as err:
+            mysql_conn.rollback()
+            is_lock = "1205" in str(err) or getattr(err, "errno", None) == 1205
+            if is_lock and attempt < retries:
+                time.sleep(delay * attempt)
+                continue
+            cur.close()
+            raise
+
+
+def fetch_eligible_units_mysql(mysql_conn, limit, retry_failed: bool) -> list:
+    """Same shape/diagnostics as fetch_eligible_units() but reads from MySQL
+    directly — a plain JOIN against pinners.site_type (kept fresh every pass
+    by sync_site_types_mysql, called right before this in main()), so no
+    Python-side username set/chunking needed; MySQL does the filtering.
+    Also immediately marks claimed pins 'Running' so a second PC's concurrent
+    pass mostly avoids re-claiming the same backlog (best-effort, not a hard
+    lock — a crashed run can leave some pins stuck at 'Running'; rerun with
+    --retry-failed to sweep those back up)."""
+    cur = mysql_conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM pins")
+    total_pins = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM pinners WHERE site_type LIKE '%blog%'")
+    blog_pinner_count = cur.fetchone()[0]
+
+    if not blog_pinner_count:
+        print(f"  (pins total in MySQL: {total_pins}, blog pinners (site_type on MySQL): 0 — nothing eligible.)")
+        cur.close()
+        return []
+
+    status_clause = "" if retry_failed else "AND (p.link_download_status IS NULL OR p.link_download_status='')"
+
+    cur.execute(
+        "SELECT COUNT(*) FROM pins p INNER JOIN pinners pn ON pn.username = p.pinner_username "
+        "WHERE pn.site_type LIKE '%blog%'"
+    )
+    pins_under_blog = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM pins p INNER JOIN pinners pn ON pn.username = p.pinner_username "
+        "WHERE pn.site_type LIKE '%blog%' AND p.link IS NOT NULL AND p.link <> ''"
+    )
+    pins_under_blog_with_link = cur.fetchone()[0]
+
+    cur.execute(
+        f"SELECT p.id, p.link FROM pins p INNER JOIN pinners pn ON pn.username = p.pinner_username "
+        f"WHERE pn.site_type LIKE '%blog%' AND p.link IS NOT NULL AND p.link <> '' {status_clause}"
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    units_map = {}
+    for pin_id, link in rows:
+        link = (link or "").strip()
+        if not link:
+            continue
+        units_map.setdefault(link, []).append(pin_id)
+    unit_list = [{"link": link, "pin_ids": pin_ids} for link, pin_ids in units_map.items()]
+
+    print(f"  (pins total in MySQL: {total_pins}, blog pinners (site_type on MySQL): {blog_pinner_count}, "
+          f"pins under blog pinners: {pins_under_blog}, with a link: {pins_under_blog_with_link}, "
+          f"eligible (not yet attempted): {len(rows)}, unique links to download: {len(unit_list)}.)")
+
+    if limit:
+        unit_list = unit_list[:limit]
+
+    all_ids = [pid for u in unit_list for pid in u["pin_ids"]]
+    for i in range(0, len(all_ids), 500):
+        chunk = all_ids[i:i + 500]
+        placeholders = ", ".join(["%s"] * len(chunk))
+        try:
+            _mysql_execute_retry(
+                mysql_conn,
+                f"UPDATE pins SET link_download_status='Running' WHERE id IN ({placeholders})",
+                chunk,
+            )
+        except Exception as e:
+            print(f"  (warning: couldn't claim a batch — {e})")
+
+    return unit_list
+
+
+def write_unit_result_mysql(mysql_conn, pin_ids: list, status: str, html_: str, css_: str, js_: str):
+    placeholders = ",".join(["%s"] * len(pin_ids))
+    sql = (f"UPDATE pins SET link_download_status=%s, link_downloaded_at=%s, "
+           f"link_html=%s, link_css=%s, link_js=%s WHERE id IN ({placeholders})")
+    params = [status, time.strftime("%Y-%m-%d %H:%M:%S"), html_, css_, js_] + pin_ids
+    _mysql_execute_retry(mysql_conn, sql, params)
+
+
 # ─── Fetch + extract ─────────────────────────────────────────────────────────
 
 # Dead/unresolvable domains can make DNS resolution hang far longer than any
@@ -563,7 +875,7 @@ def download_one(unit: dict, progress: dict = None, progress_lock=None) -> dict:
 
 # ─── Main pass ────────────────────────────────────────────────────────────────
 
-def run_pass(units: list, conn, workers: int, dry_run: bool) -> int:
+def run_pass(units: list, write_fn, workers: int, dry_run: bool) -> int:
     total = len(units)
     total_pins = sum(len(u["pin_ids"]) for u in units)
     pass_t0 = time.time()
@@ -595,7 +907,7 @@ def run_pass(units: list, conn, workers: int, dry_run: bool) -> int:
         print(f"  [{done}/{total}] {res['link'][:80]} -> {res['status']} ({n_pins} pin(s)) [{secs}s]")
         if dry_run:
             return
-        write_unit_result(conn, res["pin_ids"], res["status"], res["html"], res["css"], res["js"])
+        write_fn(res["pin_ids"], res["status"], res["html"], res["css"], res["js"])
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(download_one, u, progress, progress_lock): u for u in units}
@@ -622,21 +934,58 @@ def main():
     ap.add_argument("--poll-minutes", type=int, default=10, help="idle check interval after backlog clears (default 10)")
     ap.add_argument("--once", action="store_true", help="single pass then exit (no polling loop)")
     ap.add_argument("--limit", type=int, default=None, help="cap unique links downloaded this run (testing)")
-    ap.add_argument("--retry-failed", action="store_true", help="also re-attempt pins with a Failed/Blocked status, not just untried ones")
+    ap.add_argument("--retry-failed", action="store_true", help="also re-attempt pins with a Failed/Blocked/Running status, not just untried ones")
     ap.add_argument("--dry-run", action="store_true", help="download + print only, write nothing")
+    ap.add_argument("--source", choices=["auto", "mysql", "sqlite"], default="mysql",
+                     help="pin source: 'mysql' (default) = shared cloud DB (every PC's pins+pinners, "
+                          "see 8_sync_to_mysql.py) — exits if .env's MYSQL_PASSWORD isn't configured/reachable, "
+                          "'sqlite' = this PC's local sortpin.db only, "
+                          "'auto' = mysql when .env has a working MYSQL_PASSWORD, else falls back to sqlite")
     args = ap.parse_args()
 
     gsc = load_sheet_client()
     cfg = gsc.resolve_webapp() if gsc else None
-    conn = connect_db()
 
-    print(f"  14_download_blog_pin_links.py — workers={args.workers}")
+    mysql_conn = None
+    if args.source in ("auto", "mysql"):
+        mysql_conn = get_mysql_connection(load_env())
+        if args.source == "mysql" and mysql_conn is None:
+            print("  --source mysql was requested but MySQL isn't reachable/configured (check .env). Exiting.")
+            sys.exit(1)
+
+    if mysql_conn is not None:
+        ensure_mysql_pin_columns(mysql_conn)
+        ensure_mysql_pinner_columns(mysql_conn)
+        print(f"  14_download_blog_pin_links.py — workers={args.workers}, source=mysql (all PCs' data)")
+        while True:
+            classifications = fetch_website_classifications(gsc, cfg)
+            sync_site_types_mysql(mysql_conn, classifications)
+            units = fetch_eligible_units_mysql(mysql_conn, args.limit, args.retry_failed)
+            if units:
+                write_fn = lambda pin_ids, status, h, c, j: write_unit_result_mysql(mysql_conn, pin_ids, status, h, c, j)
+                run_pass(units, write_fn, args.workers, args.dry_run)
+            else:
+                print("  No eligible pins right now in MySQL (no confirmed-blog pinners yet, or all already downloaded/running).")
+
+            if args.once:
+                break
+            print(f"  Idling {args.poll_minutes} min before next check... (Ctrl+C to stop)")
+            try:
+                time.sleep(args.poll_minutes * 60)
+            except KeyboardInterrupt:
+                print("\n  Stopped.")
+                break
+        return
+
+    conn = connect_db()
+    print(f"  14_download_blog_pin_links.py — workers={args.workers}, source=sqlite (this PC only)")
     while True:
         sync_site_types(gsc, cfg, conn)
         apply_local_site_type_fallback(conn)
         units = fetch_eligible_units(conn, args.limit, args.retry_failed)
         if units:
-            run_pass(units, conn, args.workers, args.dry_run)
+            write_fn = lambda pin_ids, status, h, c, j: write_unit_result(conn, pin_ids, status, h, c, j)
+            run_pass(units, write_fn, args.workers, args.dry_run)
         else:
             print("  No eligible pins right now (no confirmed-blog pinners yet, or all already downloaded).")
 
