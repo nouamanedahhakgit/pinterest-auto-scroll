@@ -53,6 +53,10 @@ python 6_clear_sortpin.py               # archives backup → _SORTPIN_ARCHIVE/ 
 python 6_clear_sortpin.py --yes         # no confirmation prompt
 python 7_scrape_profiles.py             # deep-scrape pinners → boards → pins (20 pinners/run)
 python 7_scrape_profiles.py --limit 50  # process 50 pinners this run (resumable)
+python 10_domain_quick_scrape_api.py             # DEFAULT = bulk scan pending sites (same as --run), exits when sheet queue is empty
+python 10_domain_quick_scrape_api.py --run       # explicit, identical to the no-flags default
+python 10_domain_quick_scrape_api.py --runjobforall  # scan every site in the sheet, ignoring site_type/done filters
+python 10_domain_quick_scrape_api.py --serve     # start the Flask API server instead (must be requested explicitly)
 python magic_scroll.py                  # multi-PC: claim→scroll→build→done→clear→repeat (5 min/kw)
 python magic_scroll.py --2m --batch 5   # 2 min per keyword, 5 keywords per cycle
 python magic_scroll.py --disk           # build DB from disk each cycle (needs ccl_chromium_reader)

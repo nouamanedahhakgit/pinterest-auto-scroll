@@ -7,12 +7,13 @@ importing the scraper engine directly from C:\\Users\\leno\\Documents\\GitHub\\s
 without duplicating any files. It connects to Google Sheets via your Apps Script
 Web App to fetch websites and update rows in-place.
 
-Run as Flask API:
-  python 10_domain_quick_scrape_api.py
-
-Run as CLI Bulk Scraper:
-  python 10_domain_quick_scrape_api.py --run             # Scrape only pending websites
+Run as CLI Bulk Scraper (default — no flags needed):
+  python 10_domain_quick_scrape_api.py                   # Same as --run: scrape only pending websites
+  python 10_domain_quick_scrape_api.py --run              # Explicit, identical to no-flags default
   python 10_domain_quick_scrape_api.py --runjobforall    # Scrape all websites
+
+Run as Flask API (must be requested explicitly):
+  python 10_domain_quick_scrape_api.py --serve
 """
 from __future__ import annotations
 
@@ -624,11 +625,17 @@ def is_marketplace_or_social(domain: str) -> bool:
             return True
     return False
 
-def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str]:
+def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
     """
     Check if the URL is blocked by Cloudflare, Captcha, or access restriction.
-    Returns (is_blocked, reason, homepage_html)
+    Returns (is_blocked, reason, homepage_html, final_url)
     homepage_html is the raw response text on success, empty string on block/error.
+    final_url is the URL actually reached after following redirects (requests'
+    response.url) — falls back to the original `url` if no request ever
+    completed. Callers use this to catch domains that redirect straight to a
+    known mega-platform (e.g. a typo'd domain like pintrest.com 301-ing to the
+    real www.pinterest.com) so they can fast-track that instead of running the
+    full sitemap/post-discovery crawl against the platform's real site.
     """
     import requests
 
@@ -654,22 +661,23 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str]:
         try:
             r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         except requests.exceptions.Timeout:
-            return True, "Connection Timeout", ""
+            return True, "Connection Timeout", "", url
         except requests.exceptions.RequestException as e:
-            return True, f"Connection Failed: {str(e)}", ""
+            return True, f"Connection Failed: {str(e)}", "", url
 
+    final_url = getattr(r, "url", None) or url
     try:
         # Check HTTP status codes commonly used for blocking
         if r.status_code in (403, 429, 503):
             text_lower = r.text.lower()
             if "cloudflare" in text_lower:
-                return True, "Cloudflare Block", ""
+                return True, "Cloudflare Block", "", final_url
             elif "captcha" in text_lower or "recaptcha" in text_lower or "hcaptcha" in text_lower:
-                return True, "Captcha Block", ""
+                return True, "Captcha Block", "", final_url
             elif "access denied" in text_lower or "permission denied" in text_lower:
-                return True, "Access Denied", ""
+                return True, "Access Denied", "", final_url
             else:
-                return True, f"HTTP Blocked ({r.status_code})", ""
+                return True, f"HTTP Blocked ({r.status_code})", "", final_url
 
         # Even on 200, it could show a Cloudflare challenge page or Captcha page
         if r.status_code == 200:
@@ -677,7 +685,7 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str]:
             content_len = len(r.text)
             # Real Cloudflare challenge pages are short and have specific markers
             if content_len < 30000 and "cloudflare" in text_lower and ("challenge" in text_lower or "enable javascript" in text_lower or "checking your browser" in text_lower):
-                return True, "Cloudflare Challenge", ""
+                return True, "Cloudflare Challenge", "", final_url
             # Real captcha CHALLENGE pages are short (<15KB) and have specific
             # blocking phrases. Normal sites often include reCAPTCHA scripts for
             # contact forms or have "captcha" in JS bundle names — those are NOT blocks.
@@ -693,11 +701,11 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str]:
                     "security check",
                 ]
                 if any(phrase in text_lower for phrase in challenge_phrases):
-                    return True, "Captcha Challenge Page", ""
+                    return True, "Captcha Challenge Page", "", final_url
 
-        return False, "", r.text
+        return False, "", r.text, final_url
     except Exception as e:
-        return True, f"Parsing Block Page Failed: {str(e)}", ""
+        return True, f"Parsing Block Page Failed: {str(e)}", "", final_url
 
 
 # Definitive HTML fingerprints for store platforms — zero false-positives on blogs
@@ -865,95 +873,103 @@ def _sheets_update_async(url: str, updates: dict):
 
 # ─── Scraper Core & Post Comparison ───────────────────────────────────────────
 
+def _fast_track_marketplace_result(site: dict, domain: str, site_type: str, log_cb: Any) -> dict:
+    """Write a fast-tracked Store/Social Media/Link-in-Bio classification without
+    running the full scrape/sitemap-discovery pipeline. Shared by the upfront
+    domain check and the post-redirect check in run_single_scrape (e.g. a
+    typo'd/defensively-registered domain that 301s straight to the real
+    platform — pintrest.com -> www.pinterest.com)."""
+    result = {
+        "url": site["url"],
+        "is_wordpress": False,
+        "posts": [],
+        "site_info": {
+            "name": f"{site_type} Profile",
+            "description": f"Fast-tracked {site_type.lower()} domain.",
+            "stack": {"cms": site_type},
+            "stack_summary": site_type
+        }
+    }
+    # Save JSON snapshot locally
+    write_json(os.path.join(RESULTS_DIR, f"{safe_folder(domain)}.json"), result)
+
+    db = get_db_connection()
+    use_lock = not db.is_mysql
+    if use_lock:
+        db_write_lock.acquire()
+    try:
+        init_bulk_tables(db)
+
+        cat_name = "General & Other"
+        db.execute(
+            "INSERT INTO scraped_categories (name) VALUES (?) ON DUPLICATE KEY UPDATE name=name" if db.is_mysql else
+            "INSERT OR IGNORE INTO scraped_categories (name) VALUES (?)",
+            [cat_name]
+        )
+        db.commit()
+
+        cur_cat = db.execute("SELECT id FROM scraped_categories WHERE name = ?", [cat_name])
+        cat_row = cur_cat.fetchone()
+        category_id = cat_row["id"] if cat_row else None
+
+        now_ts = db_now()
+        db.execute(
+            """
+            INSERT INTO scraped_websites
+            (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'done', 0, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                url = VALUES(url),
+                title = VALUES(title),
+                description = VALUES(description),
+                cms = VALUES(cms),
+                tech_stack = VALUES(tech_stack),
+                status = 'done',
+                post_count = 0,
+                last_scraped_at = VALUES(last_scraped_at),
+                site_type = VALUES(site_type)
+            """ if db.is_mysql else
+            """
+            INSERT OR REPLACE INTO scraped_websites
+            (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'done', 0, ?, ?)
+            """,
+            [domain, site["url"], f"{site_type} Profile", f"Fast-tracked {site_type.lower()} domain.", site_type, site_type, category_id, now_ts, site_type]
+        )
+        db.execute(
+            """
+            INSERT INTO scraped_websites_history
+            (domain, run_date, status, posts_count, posts_added, posts_removed, log)
+            VALUES (?, ?, 'done', 0, 0, 0, ?)
+            """,
+            [domain, now_ts, f"Fast-tracked {site_type.lower()} domain"]
+        )
+        db.commit()
+
+        log_cb(f"Syncing fast-track results to Google Sheets Row...")
+        sheet_updates = {
+            "scrapped": "Yes",
+            "name": f"{site_type} Profile",
+            "categories": "General & Other",
+            "scraped_pins": 0,
+            "site_type": site_type
+        }
+        _sheets_update_async(site["url"], sheet_updates)
+        log_cb(f"Database and Google Sheets updated successfully.")
+    finally:
+        db.close()
+        if use_lock:
+            db_write_lock.release()
+    return result
+
+
 def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dict:
     domain = extract_domain(site.get("url", ""))
-    
+
     if is_marketplace_or_social(domain):
         site_type = classify_site_type(domain, False, 0)
         log_cb(f"Fast-tracking marketplace/social domain: {domain} ({site_type})")
-        
-        result = {
-            "url": site["url"],
-            "is_wordpress": False,
-            "posts": [],
-            "site_info": {
-                "name": f"{site_type} Profile",
-                "description": f"Fast-tracked {site_type.lower()} domain.",
-                "stack": {"cms": site_type},
-                "stack_summary": site_type
-            }
-        }
-        # Save JSON snapshot locally
-        write_json(os.path.join(RESULTS_DIR, f"{safe_folder(domain)}.json"), result)
-        
-        db = get_db_connection()
-        use_lock = not db.is_mysql
-        if use_lock:
-            db_write_lock.acquire()
-        try:
-            init_bulk_tables(db)
-            
-            cat_name = "General & Other"
-            db.execute(
-                "INSERT INTO scraped_categories (name) VALUES (?) ON DUPLICATE KEY UPDATE name=name" if db.is_mysql else
-                "INSERT OR IGNORE INTO scraped_categories (name) VALUES (?)",
-                [cat_name]
-            )
-            db.commit()
-            
-            cur_cat = db.execute("SELECT id FROM scraped_categories WHERE name = ?", [cat_name])
-            cat_row = cur_cat.fetchone()
-            category_id = cat_row["id"] if cat_row else None
-            
-            now_ts = db_now()
-            db.execute(
-                """
-                INSERT INTO scraped_websites
-                (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'done', 0, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    url = VALUES(url),
-                    title = VALUES(title),
-                    description = VALUES(description),
-                    cms = VALUES(cms),
-                    tech_stack = VALUES(tech_stack),
-                    status = 'done',
-                    post_count = 0,
-                    last_scraped_at = VALUES(last_scraped_at),
-                    site_type = VALUES(site_type)
-                """ if db.is_mysql else
-                """
-                INSERT OR REPLACE INTO scraped_websites
-                (domain, url, title, description, cms, tech_stack, category_id, status, post_count, last_scraped_at, site_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'done', 0, ?, ?)
-                """,
-                [domain, site["url"], f"{site_type} Profile", f"Fast-tracked {site_type.lower()} domain.", site_type, site_type, category_id, now_ts, site_type]
-            )
-            db.execute(
-                """
-                INSERT INTO scraped_websites_history
-                (domain, run_date, status, posts_count, posts_added, posts_removed, log)
-                VALUES (?, ?, 'done', 0, 0, 0, ?)
-                """,
-                [domain, now_ts, f"Fast-tracked {site_type.lower()} domain"]
-            )
-            db.commit()
-            
-            log_cb(f"Syncing fast-track results to Google Sheets Row...")
-            sheet_updates = {
-                "scrapped": "Yes",
-                "name": f"{site_type} Profile",
-                "categories": "General & Other",
-                "scraped_pins": 0,
-                "site_type": site_type
-            }
-            _sheets_update_async(site["url"], sheet_updates)
-            log_cb(f"Database and Google Sheets updated successfully.")
-        finally:
-            db.close()
-            if use_lock:
-                db_write_lock.release()
-        return result
+        return _fast_track_marketplace_result(site, domain, site_type, log_cb)
 
     # Immediately set status to 'Running' in Google Sheets and Database for crash recovery
     log_cb(f"Setting site status to 'Running'...")
@@ -985,7 +1001,23 @@ def run_single_scrape(site: dict, provider: str, model: str, log_cb: Any) -> dic
             db_write_lock.release()
 
     # Check for Captcha/Cloudflare blocks (also returns homepage HTML for reuse)
-    is_blocked, block_reason, homepage_html = check_for_blocks(site["url"], log_cb)
+    is_blocked, block_reason, homepage_html, final_url = check_for_blocks(site["url"], log_cb)
+
+    # ── Redirect escape check ───────────────────────────────────────────────
+    # The is_marketplace_or_social() check above only matches the ORIGINAL input
+    # domain string. A typo'd or defensively-registered domain (e.g. pintrest.com,
+    # missing the 'e') can still 301/302 straight to a known mega-platform's real
+    # domain (www.pinterest.com) without ever matching that string check. Left
+    # unguarded, this falls through into the full sitemap/post-discovery crawl
+    # run against the PLATFORM's real site — e.g. Pinterest's own multi-GB pin
+    # sitemaps — which is both pointless (a Social Media platform is never a
+    # "blog") and extremely slow. Re-check whatever domain we actually landed on.
+    final_domain = extract_domain(final_url) if final_url else domain
+    if final_domain != domain and is_marketplace_or_social(final_domain):
+        site_type = classify_site_type(final_domain, False, 0)
+        log_cb(f"{domain} redirects to {final_domain} — fast-tracking as {site_type} instead of crawling it")
+        return _fast_track_marketplace_result(site, domain, site_type, log_cb)
+
     if is_blocked:
         log_cb(f"Blocked by security system: {block_reason}")
         result = {
@@ -2207,8 +2239,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Standalone Local API for Domain Quick Scrape.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5050)
-    parser.add_argument("--run", action="store_true", help="Bulk scan pending domains listed in Google Sheets and exit")
+    parser.add_argument("--run", action="store_true", help="Bulk scan pending domains listed in Google Sheets and exit (this is also the default when no flags are given)")
     parser.add_argument("--runjobforall", action="store_true", help="Bulk scan all domains listed in Google Sheets and exit")
+    parser.add_argument("--serve", action="store_true", help="Start the Flask API server instead of bulk-scanning")
     parser.add_argument("--reset-running", action="store_true",
                         help="Reset all 'Running' sites to 'Not Yet' in DB and Google Sheets, then exit")
     parser.add_argument("--fix-site-types", action="store_true",
@@ -2243,24 +2276,26 @@ def main() -> int:
         recheck_blogs()
         return 0
 
-    # Run in CLI Mode
-    if args.run or args.runjobforall:
-        print(f"Starting Bulk Scraper CLI Mode (run_all={args.runjobforall})...")
-        run_bulk_scrape_job(run_all=args.runjobforall)
+    # Start Flask API server (must be requested explicitly via --serve)
+    if args.serve:
+        print(f"Domain Quick Scrape API: http://{args.host}:{args.port}")
+        print("Running independently using local scraper engine.")
+
+        # Initialize DB tables once at start
+        db = get_db_connection()
+        try:
+            init_bulk_tables(db)
+        finally:
+            db.close()
+
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)
         return 0
-        
-    # Start Flask API server
-    print(f"Domain Quick Scrape API: http://{args.host}:{args.port}")
-    print("Running independently using local scraper engine.")
-    
-    # Initialize DB tables once at start
-    db = get_db_connection()
-    try:
-        init_bulk_tables(db)
-    finally:
-        db.close()
-        
-    app.run(host=args.host, port=args.port, debug=False, threaded=True)
+
+    # Run in CLI Mode — default when no flags given (same as --run), or --runjobforall for a full sweep
+    if not args.run and not args.runjobforall:
+        print("No flags given — defaulting to --run (bulk scan pending domains). Use --serve to start the API server instead.")
+    print(f"Starting Bulk Scraper CLI Mode (run_all={args.runjobforall})...")
+    run_bulk_scrape_job(run_all=args.runjobforall)
     return 0
 
 if __name__ == "__main__":
