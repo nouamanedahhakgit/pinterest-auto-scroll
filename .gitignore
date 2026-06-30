@@ -7,6 +7,8 @@ _SORTPIN_ARCHIVE/
 
 # Ignore local databases and flat viewer data
 sortpin.db
+sortpin.db-wal
+sortpin.db-shm
 sortpin_data.json
 IMPORTANT_DATABASE/sortpin.db
 IMPORTANT_DATABASE/sortpin_mysql.sql
