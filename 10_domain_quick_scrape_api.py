@@ -256,8 +256,23 @@ def get_db_connection():
     """Get a DB connection from the shared MySQL pool, or fall back to SQLite."""
     pool = _get_mysql_pool()
     if pool is not None:
-        try:
-            conn = pool.get_connection()
+        # mysql.connector raises PoolError immediately when all slots are busy —
+        # it does NOT block. Retry with short sleeps for up to 30 s so workers
+        # wait for a free slot instead of instantly falling back to SQLite.
+        conn = None
+        deadline = time.time() + 30
+        last_err = None
+        while time.time() < deadline:
+            try:
+                conn = pool.get_connection()
+                break
+            except Exception as e:
+                last_err = e
+                if "pool exhausted" in str(e).lower():
+                    time.sleep(0.05)
+                    continue
+                break   # non-pool error — don't retry
+        if conn is not None:
             try:
                 cursor = conn.cursor()
                 cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -268,8 +283,7 @@ def get_db_connection():
             except Exception:
                 pass
             return DBWrapper(is_mysql=True, conn=conn)
-        except Exception as e:
-            print(f"  Warning: MySQL pool get_connection failed: {e}. Falling back to SQLite.")
+        print(f"  Warning: MySQL pool get_connection failed: {last_err}. Falling back to SQLite.")
 
     import sqlite3
     sqlite_path = os.path.join(BASE, "sortpin.db")
