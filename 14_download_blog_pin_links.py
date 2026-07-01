@@ -367,6 +367,7 @@ def fetch_eligible_units(conn, limit, retry_failed: bool) -> list:
 
 
 def write_unit_result(conn, pin_ids: list, status: str, html_: str, css_: str, js_: str):
+    status = status[:64]  # VARCHAR(64) column — truncate to avoid Data too long error
     with _db_lock:
         placeholders = ",".join("?" for _ in pin_ids)
         conn.execute(
@@ -732,6 +733,7 @@ def fetch_eligible_units_mysql(mysql_conn, limit, retry_failed: bool) -> list:
 
 
 def write_unit_result_mysql(mysql_conn, pin_ids: list, status: str, html_: str, css_: str, js_: str):
+    status = status[:64]  # VARCHAR(64) column — truncate to avoid Data too long error
     placeholders = ",".join(["%s"] * len(pin_ids))
     sql = (f"UPDATE pins SET link_download_status=%s, link_downloaded_at=%s, "
            f"link_html=%s, link_css=%s, link_js=%s WHERE id IN ({placeholders})")
