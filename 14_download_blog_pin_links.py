@@ -1034,10 +1034,22 @@ def main():
             sys.exit(1)
 
     if mysql_conn is not None:
+        env = load_env()
         ensure_mysql_pin_columns(mysql_conn)
         ensure_mysql_pinner_columns(mysql_conn)
         print(f"  14_download_blog_pin_links.py — workers={args.workers}, source=mysql (all PCs' data)")
         while True:
+            # Reconnect if the connection dropped (idle timeout after 10+ min polls)
+            try:
+                mysql_conn.ping(reconnect=True, attempts=3, delay=2)
+            except Exception:
+                print("  MySQL connection lost — reconnecting...")
+                mysql_conn = get_mysql_connection(env)
+                if mysql_conn is None:
+                    print("  Reconnect failed. Retrying next poll...")
+                    time.sleep(60)
+                    continue
+
             # Sync site_type directly from scraped_websites (written by step 10) — no Sheet needed
             updated = sync_site_types_from_db(mysql_conn)
             if updated > 0:
