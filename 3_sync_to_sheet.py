@@ -10,6 +10,9 @@ ONE-TIME SETUP (pick one):
   A) google_service_account.json  — Google Cloud service account (silent)
   B) google_credentials.json    — OAuth (browser once, then silent)
   C) google_sheets_webapp.json    — Apps Script web app (easiest, see SETUP_MSG)
+
+
+  .
 """
 
 import os
