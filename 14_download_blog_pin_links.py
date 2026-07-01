@@ -92,6 +92,7 @@ Run:
   python 14_download_blog_pin_links.py --limit 20 --once --dry-run   # quick test, no writes
 """
 from __future__ import annotations
+import db_logger  # logs every print() to MySQL bot_logs table — dashboard reads from there
 
 import argparse
 import html

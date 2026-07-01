@@ -64,6 +64,7 @@ PINNER MODE — same "magic" loop, but deep-scrapes PINNERS instead of keywords:
   python magic_scroll.py --pinner 10 --blog-only --min-reach 100000  # blog sites AND Reach > 100k
 """
 
+import db_logger  # logs every print() to MySQL bot_logs table — dashboard reads from there
 import os, sys, time, socket, subprocess, re, json, datetime, platform, sqlite3
 
 BASE       = os.path.dirname(os.path.abspath(__file__))

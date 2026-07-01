@@ -16,6 +16,7 @@ Run as Flask API (must be requested explicitly):
   python 10_domain_quick_scrape_api.py --serve
 """
 from __future__ import annotations
+import db_logger  # logs every print() to MySQL bot_logs table — dashboard reads from there
 
 import argparse
 import hashlib

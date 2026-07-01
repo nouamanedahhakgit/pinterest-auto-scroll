@@ -4,19 +4,14 @@ Pinterest Scan — Live Bot Dashboard
 Run:  python dashboard.py
 Open: http://localhost:8765   (auto-refreshes every 15 s)
 
-Start your bots WITH logging so this dashboard can tail them:
-  python magic_scroll.py --15m     2>&1 | tee logs/magic_scroll.log
-  python 10_domain_quick_scrape_api.py  2>&1 | tee logs/bot10.log
-  python 14_download_blog_pin_links.py  2>&1 | tee logs/bot14.log
+Logs are read from MySQL bot_logs table (written by db_logger.py).
+No log files, no restart needed — bots log to DB automatically.
 """
 
 import html as _html
 import json
 import os
 import re
-import shutil
-import sqlite3
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -24,26 +19,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ── paths ──────────────────────────────────────────────────────────────────────
-BASE         = Path(__file__).parent
-LOGS_DIR     = BASE / "logs"
+BASE          = Path(__file__).parent
 PROGRESS_JSON = BASE / "progress.json"
-MAGIC_LOG    = BASE / "magic_log.jsonl"
-SORTPIN_DB   = BASE / "sortpin.db"
-ENV_FILE     = BASE / ".env"
-
-LOG_FILES = {
-    "magic_scroll": LOGS_DIR / "magic_scroll.log",
-    "bot10":        LOGS_DIR / "bot10.log",
-    "bot14":        LOGS_DIR / "bot14.log",
-}
+MAGIC_LOG     = BASE / "magic_log.jsonl"
+ENV_FILE      = BASE / ".env"
 
 BOT_SCRIPTS = {
     "magic_scroll": "magic_scroll.py",
     "bot10":        "10_domain_quick_scrape_api.py",
     "bot14":        "14_download_blog_pin_links.py",
 }
-
-LOGS_DIR.mkdir(exist_ok=True)
 
 # ── load .env ──────────────────────────────────────────────────────────────────
 def load_env():
@@ -74,31 +59,31 @@ def get_running_bots():
         pass
     return result
 
-# ── log tail ───────────────────────────────────────────────────────────────────
-def tail_log(path: Path, n=120):
-    """Return last n lines of a log file, or None if missing."""
-    if not path.exists():
-        return None
+# ── MySQL log reader ───────────────────────────────────────────────────────────
+def get_bot_logs_from_mysql(conn, bot_key, n=150):
+    """Return last n log rows for a bot from the bot_logs MySQL table.
+    Returns list of (ts, level, message) or None if table doesn't exist yet."""
     try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            chunk = min(size, 80_000)
-            f.seek(-chunk, 2)
-            raw = f.read().decode("utf-8", errors="replace")
-        lines = raw.splitlines()
-        return lines[-n:]
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT ts, level, message FROM bot_logs
+                   WHERE bot = %s ORDER BY id DESC LIMIT %s""",
+                (bot_key, n),
+            )
+            rows = c.fetchall()
+        return list(reversed(rows))  # oldest first for display
     except Exception:
-        return []
+        return None  # table not yet created (bots haven't started with db_logger)
 
-def log_stats(lines):
-    """Count errors/warnings in log lines."""
-    if not lines:
-        return 0, 0, 0
-    errors   = sum(1 for l in lines if re.search(r'\berror\b|\bexception\b|\btraceback\b', l, re.I))
-    warnings = sum(1 for l in lines if re.search(r'\bwarn\b|\bwarning\b', l, re.I))
-    recent_errors = [l for l in lines[-300:] if re.search(r'\berror\b|\bexception\b|\btraceback\b|\bfailed\b', l, re.I)]
-    return errors, warnings, recent_errors
+def log_stats_from_rows(rows):
+    """Count errors/warnings in log rows."""
+    if not rows:
+        return 0, 0
+    errors   = sum(1 for _, lvl, msg in rows if lvl == "ERROR" or
+                   re.search(r'\berror\b|\bexception\b|\btraceback\b', str(msg), re.I))
+    warnings = sum(1 for _, lvl, msg in rows if lvl == "WARN" or
+                   re.search(r'\bwarn\b', str(msg), re.I))
+    return errors, warnings
 
 # ── keyword stats ──────────────────────────────────────────────────────────────
 def get_keyword_stats():
@@ -129,7 +114,7 @@ def get_magic_log():
     except Exception:
         return []
 
-# ── mysql stats ────────────────────────────────────────────────────────────────
+# ── mysql stats + logs ─────────────────────────────────────────────────────────
 def get_mysql_stats(env):
     try:
         import pymysql
@@ -209,12 +194,18 @@ def get_mysql_stats(env):
             dl_recent = c.fetchall()
         except Exception: dl_recent = []
 
+        # ── bot logs from MySQL bot_logs table ─────────────────────────────────
+        bot_logs = {}
+        for key in ("magic_scroll", "bot10", "bot14"):
+            bot_logs[key] = get_bot_logs_from_mysql(conn, key, n=150)
+
         conn.close()
         return {"ok": True, "totals": totals, "sw_status": sw_status,
                 "sw_types": sw_types, "ia_rows": ia_rows, "ai_scan": ai_scan,
                 "sw_recent": sw_recent, "sw_failed": sw_failed,
                 "dl_status": dl_status, "blog_pinners": blog_pinners,
-                "blog_pins_total": blog_pins_total, "dl_recent": dl_recent}
+                "blog_pins_total": blog_pins_total, "dl_recent": dl_recent,
+                "bot_logs": bot_logs}
     except ImportError:
         return {"ok": False, "error": "pymysql not installed — pip install pymysql"}
     except Exception as e:
@@ -227,12 +218,11 @@ _lock  = threading.Lock()
 def refresh_cache():
     env   = load_env()
     bots  = get_running_bots()
-    logs  = {k: tail_log(p) for k, p in LOG_FILES.items()}
     kw    = get_keyword_stats()
     ml    = get_magic_log()
     mysql = get_mysql_stats(env)
     with _lock:
-        _cache.update({"bots": bots, "logs": logs, "kw": kw,
+        _cache.update({"bots": bots, "kw": kw,
                         "ml": ml, "mysql": mysql,
                         "ts": datetime.now().strftime("%H:%M:%S")})
 
@@ -255,37 +245,40 @@ def pct_bar(val, total, color="#22c55e"):
     return (f'<div class="bar-wrap"><div class="bar-fill" style="width:{p}%;background:{color}"></div></div>'
             f'<small class="muted">{int(val):,} / {int(total):,} &nbsp;({p} %)</small>')
 
-def render_log(lines, bot_key):
-    """Render log lines with colour coding + error highlighting."""
-    if lines is None:
-        # log file doesn't exist yet — show start command
+def render_log(rows, bot_key):
+    """Render log rows (ts, level, message) from MySQL with colour coding."""
+    if rows is None:
+        # bot_logs table not yet created — bots haven't been restarted with db_logger yet
         cmds = {
-            "magic_scroll": "python magic_scroll.py --15m 2>&1 | tee logs/magic_scroll.log",
-            "bot10":        "python 10_domain_quick_scrape_api.py 2>&1 | tee logs/bot10.log",
-            "bot14":        "python 14_download_blog_pin_links.py 2>&1 | tee logs/bot14.log",
+            "magic_scroll": "python magic_scroll.py --15m",
+            "bot10":        "python 10_domain_quick_scrape_api.py",
+            "bot14":        "python 14_download_blog_pin_links.py",
         }
         return (f'<div class="no-log">'
-                f'<b>No log file yet.</b> Start the bot like this so logs are captured:<br><br>'
+                f'<b>No DB logs yet.</b> Restart the bot once — logs save to MySQL automatically from then on:<br><br>'
                 f'<code>{e(cmds.get(bot_key, ""))}</code>'
                 f'</div>')
 
-    if not lines:
-        return '<div class="no-log muted">Log file is empty.</div>'
+    if not rows:
+        return '<div class="no-log muted">No log entries in database yet.</div>'
 
     out = ['<div class="log-box">']
-    for line in lines:
-        lw = line.lower()
-        if re.search(r'traceback|exception|error\b', lw):
+    for ts_val, level, message in rows:
+        msg = str(message or "")
+        lw  = msg.lower()
+        lvl = (level or "INFO").upper()
+        if lvl == "ERROR" or re.search(r'traceback|exception|error\b', lw):
             cls = "ll-err"
-        elif re.search(r'\bwarn\b|\bwarning\b', lw):
+        elif lvl == "WARN" or re.search(r'\bwarn\b', lw):
             cls = "ll-warn"
-        elif re.search(r'\bdone\b|✓|✅|success|complete', lw):
+        elif lvl == "OK" or re.search(r'\bdone\b|✓|✅|success|complete', lw):
             cls = "ll-ok"
         elif re.search(r'running|starting|pass #|cycle|batch|worker', lw):
             cls = "ll-info"
         else:
             cls = "ll-dim"
-        out.append(f'<div class="{cls}">{e(line)}</div>')
+        ts_str = str(ts_val)[:19] if ts_val else ""
+        out.append(f'<div class="{cls}"><span class="ll-ts">{e(ts_str)}</span>  {e(msg)}</div>')
     out.append('</div>')
     return "".join(out)
 
@@ -298,11 +291,11 @@ def stat_box(n, label, color="#e2e8f0"):
 def build_page():
     with _lock:
         bots  = dict(_cache.get("bots", {}))
-        logs  = dict(_cache.get("logs", {}))
         kw    = dict(_cache.get("kw",   {}))
         ml    = list(_cache.get("ml",   []))
         mysql = dict(_cache.get("mysql",{}))
         ts    = _cache.get("ts", "…")
+    bot_logs = mysql.get("bot_logs", {}) if mysql.get("ok") else {}
 
     # ── process status bar ─────────────────────────────────────────────────────
     b1r, b1p = bots.get("magic_scroll", (False, None))
@@ -473,29 +466,34 @@ def build_page():
 
     # ── log panels ─────────────────────────────────────────────────────────────
     def log_panel(key, title, dot_color):
-        lines = logs.get(key)
-        errs, warns, _ = log_stats(lines or [])
+        rows = bot_logs.get(key)  # list of (ts, level, message) or None
         badges = ""
-        if lines is not None:
-            sz = LOG_FILES[key].stat().st_size if LOG_FILES[key].exists() else 0
-            sz_kb = sz // 1024
-            age_s = int(time.time() - LOG_FILES[key].stat().st_mtime) if LOG_FILES[key].exists() else 0
-            age = f"{age_s}s ago" if age_s < 120 else f"{age_s//60}m ago"
-            badges = (f'<span class="pill pill-info">{len(lines or [])} lines shown</span> '
-                      f'<span class="pill pill-info">{sz_kb} KB</span> '
-                      f'<span class="pill pill-info">updated {age}</span> ')
+        if rows is not None:
+            errs, warns = log_stats_from_rows(rows)
+            # find age from last row
+            last_ts = rows[-1][0] if rows else None
+            age_str = ""
+            if last_ts:
+                try:
+                    diff = int(time.time() - last_ts.timestamp())
+                    age_str = f"{diff}s ago" if diff < 120 else f"{diff//60}m ago"
+                except Exception:
+                    age_str = str(last_ts)[:16]
+            badges = f'<span class="pill pill-info">{len(rows)} lines</span> '
+            if age_str:
+                badges += f'<span class="pill pill-info">last: {age_str}</span> '
             if errs:
-                badges += f'<span class="pill pill-err">{errs} errors</span> '
+                badges += f'<span class="pill pill-err">⚠ {errs} errors</span> '
             if warns:
                 badges += f'<span class="pill pill-warn">{warns} warnings</span>'
         return f'''
         <div class="card" style="margin-bottom:20px">
           <div class="card-title">
             <div class="dot" style="background:{dot_color};box-shadow:0 0 6px {dot_color}"></div>
-            {title} — live log
+            {title} — live log (MySQL)
             <span style="margin-left:auto;font-weight:400;font-size:12px">{badges}</span>
           </div>
-          {render_log(lines, key)}
+          {render_log(rows, key)}
         </div>'''
 
     log_panels = (
@@ -567,6 +565,7 @@ def build_page():
     .ll-ok   {{ color:#4ade80 }}
     .ll-info {{ color:#60a5fa }}
     .ll-dim  {{ color:#475569 }}
+    .ll-ts   {{ color:#334155; font-size:10px; user-select:none }}
     .no-log  {{ background:#020617; border-radius:8px; padding:14px; font-size:12px; color:#64748b;
                 border:1px solid #0f172a }}
     .no-log code {{ display:block; margin-top:8px; color:#a78bfa; font-family:monospace; font-size:12px;
@@ -653,11 +652,8 @@ if __name__ == "__main__":
     refresh_cache()
     threading.Thread(target=bg_refresh, daemon=True).start()
     print(f"\n✅  http://localhost:{PORT}\n")
-    print("   Logs are tailed from:  logs/magic_scroll.log  /  logs/bot10.log  /  logs/bot14.log")
-    print("   Start bots like this to capture logs:\n")
-    print("     python magic_scroll.py --15m 2>&1 | tee logs/magic_scroll.log")
-    print("     python 10_domain_quick_scrape_api.py 2>&1 | tee logs/bot10.log")
-    print("     python 14_download_blog_pin_links.py 2>&1 | tee logs/bot14.log\n")
+    print("   Logs are read from MySQL bot_logs table (via db_logger.py).")
+    print("   Restart each bot once — after that logs save to MySQL automatically forever.\n")
     print("   Ctrl+C to stop.\n")
     try:
         HTTPServer(("", PORT), Handler).serve_forever()
