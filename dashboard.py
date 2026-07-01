@@ -27,6 +27,7 @@ ENV_FILE      = BASE / ".env"
 BOT_SCRIPTS = {
     "magic_scroll": "magic_scroll.py",
     "bot10":        "10_domain_quick_scrape_api.py",
+    "bot13":        "13_scan-website-interface-by-ia.py",
     "bot14":        "14_download_blog_pin_links.py",
 }
 
@@ -42,8 +43,8 @@ def load_env():
     return env
 
 # ── process detection ──────────────────────────────────────────────────────────
-def get_running_bots():
-    """Returns dict of bot_key -> (True/False, pid or None)"""
+def get_running_bots_local():
+    """Check LOCAL processes on this machine via psutil."""
     result = {k: (False, None) for k in BOT_SCRIPTS}
     try:
         import psutil
@@ -57,6 +58,33 @@ def get_running_bots():
                 pass
     except ImportError:
         pass
+    return result
+
+def get_running_bots_from_logs(conn):
+    """Detect RUNNING bots from MySQL bot_logs recency (works across machines).
+    If last log entry < 3 min ago → RUNNING. Between 3-10 min → IDLE. Older → STOPPED."""
+    result = {}
+    now = time.time()
+    for key in BOT_SCRIPTS:
+        try:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT ts FROM bot_logs WHERE bot=%s ORDER BY id DESC LIMIT 1",
+                    (key,)
+                )
+                row = c.fetchone()
+            if row and row[0]:
+                diff = now - row[0].timestamp()
+                if diff < 180:
+                    result[key] = ("running", None)
+                elif diff < 600:
+                    result[key] = ("idle", int(diff // 60))
+                else:
+                    result[key] = ("stopped", None)
+            else:
+                result[key] = ("no_logs", None)
+        except Exception:
+            result[key] = ("unknown", None)
     return result
 
 # ── MySQL log reader ───────────────────────────────────────────────────────────
@@ -85,27 +113,68 @@ def log_stats_from_rows(rows):
                    re.search(r'\bwarn\b', str(msg), re.I))
     return errors, warnings
 
-# ── keyword stats ──────────────────────────────────────────────────────────────
+# ── keyword stats — reads from Google Sheet (source of truth for magic_scroll) ─
 def get_keyword_stats():
+    """Primary: Google Sheet webapp get_keywords action.
+    Fallback: keywords.txt (total) + progress.json (done count)."""
     try:
-        data = json.loads(PROGRESS_JSON.read_text(errors="replace"))
-    except Exception as e:
-        return {"error": str(e)}
-    done, not_yet, running = 0, 0, 0
-    recent = []
-    for kw, v in data.items():
-        s  = v.get("status", "") if isinstance(v, dict) else str(v)
-        ts = v.get("done_at", "") if isinstance(v, dict) else ""
-        if s == "done":
-            done += 1
-            if ts: recent.append((ts, kw))
-        elif s in ("not_yet", "Not Yet"): not_yet += 1
-        elif s == "running": running += 1
-    recent.sort(reverse=True)
-    total = len(data)
-    return {"total": total, "done": done, "not_yet": not_yet, "running": running,
-            "pct": round(done/total*100,1) if total else 0,
-            "recent": [{"ts": t, "kw": k} for t, k in recent[:6]]}
+        webapp = json.loads((BASE / "google_sheets_webapp.json").read_text())
+        url    = webapp["url"]
+        secret = webapp.get("secret", "")
+        import requests as _req
+        resp = _req.post(
+            url,
+            json={"action": "get_keywords", "secret": secret},
+            timeout=20,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            raise ValueError(data.get("error", "sheet error"))
+
+        keywords = data.get("keywords", [])
+        done, not_yet, pending, other = 0, 0, 0, 0
+        recent = []
+        for item in keywords:
+            s = (item.get("status") or "").strip().lower()
+            if s == "done":
+                done += 1
+                recent.append(item["keyword"])
+            elif s in ("not yet", "not_yet", ""):
+                not_yet += 1
+            elif s == "pending":
+                pending += 1
+            else:
+                other += 1
+
+        total = len(keywords)
+        return {
+            "total":   total,
+            "done":    done,
+            "not_yet": not_yet,
+            "pending": pending,
+            "other":   other,
+            "pct":     round(done / total * 100, 1) if total else 0,
+            "recent":  [{"ts": "—", "kw": k} for k in recent[-6:]],
+            "source":  "Google Sheet",
+        }
+    except Exception as sheet_err:
+        # fallback: keywords.txt count + progress.json done
+        try:
+            kws  = [l.strip() for l in open(BASE / "keywords.txt", errors="replace")
+                    if l.strip() and not l.startswith("#")]
+            prog = json.loads(PROGRESS_JSON.read_text(errors="replace"))
+            done = sum(1 for v in prog.values()
+                       if (v.get("status") if isinstance(v, dict) else v) == "done")
+            total = len(kws)
+            return {
+                "total": total, "done": done,
+                "not_yet": total - done, "pending": 0, "other": 0,
+                "pct": round(done / total * 100, 1) if total else 0,
+                "recent": [],
+                "source": f"keywords.txt (Sheet unavailable: {sheet_err})",
+            }
+        except Exception as e2:
+            return {"error": str(e2)}
 
 def get_magic_log():
     try:
@@ -194,10 +263,54 @@ def get_mysql_stats(env):
             dl_recent = c.fetchall()
         except Exception: dl_recent = []
 
+        # ── step 13: AI scanner stats ──────────────────────────────────────────
+        try:
+            c.execute("""SELECT status_website_scaned_by_ia, COUNT(*) FROM scraped_websites
+                         GROUP BY status_website_scaned_by_ia""")
+            ai13_status = {str(k): v for k, v in c.fetchall()}
+        except Exception: ai13_status = {}
+
+        try:
+            c.execute("""SELECT type_website_scaned_by_ia, COUNT(*) FROM scraped_websites
+                         WHERE status_website_scaned_by_ia LIKE 'Done%'
+                         GROUP BY type_website_scaned_by_ia ORDER BY COUNT(*) DESC LIMIT 12""")
+            ai13_types = c.fetchall()
+        except Exception: ai13_types = []
+
+        try:
+            c.execute("""SELECT domain, type_website_scaned_by_ia, category_website_scaned_by_ia,
+                                status_website_scaned_by_ia
+                         FROM scraped_websites
+                         WHERE status_website_scaned_by_ia IS NOT NULL
+                           AND status_website_scaned_by_ia != ''
+                         ORDER BY id DESC LIMIT 8""")
+            ai13_recent = c.fetchall()
+        except Exception: ai13_recent = []
+
+        try:
+            c.execute("""SELECT domain, status_website_scaned_by_ia FROM scraped_websites
+                         WHERE status_website_scaned_by_ia LIKE 'Failed%'
+                            OR status_website_scaned_by_ia LIKE 'Blocked%'
+                         ORDER BY id DESC LIMIT 6""")
+            ai13_failed = c.fetchall()
+        except Exception: ai13_failed = []
+
+        # eligible for step 13 (not yet scanned by AI)
+        try:
+            c.execute("""SELECT COUNT(*) FROM scraped_websites
+                         WHERE (status_website_scaned_by_ia IS NULL OR status_website_scaned_by_ia = '')
+                           AND status = 'done'
+                           AND site_type NOT IN ('Store','Social Media','Link-in-Bio')""")
+            ai13_pending = c.fetchone()[0]
+        except Exception: ai13_pending = "?"
+
         # ── bot logs from MySQL bot_logs table ─────────────────────────────────
         bot_logs = {}
-        for key in ("magic_scroll", "bot10", "bot14"):
+        for key in ("magic_scroll", "bot10", "bot13", "bot14"):
             bot_logs[key] = get_bot_logs_from_mysql(conn, key, n=150)
+
+        # ── bot running status from log recency ────────────────────────────────
+        bot_status = get_running_bots_from_logs(conn)
 
         conn.close()
         return {"ok": True, "totals": totals, "sw_status": sw_status,
@@ -205,7 +318,13 @@ def get_mysql_stats(env):
                 "sw_recent": sw_recent, "sw_failed": sw_failed,
                 "dl_status": dl_status, "blog_pinners": blog_pinners,
                 "blog_pins_total": blog_pins_total, "dl_recent": dl_recent,
-                "bot_logs": bot_logs}
+                "bot_logs": bot_logs,
+                "bot_status": bot_status,
+                "ai13_status": ai13_status,
+                "ai13_types": ai13_types,
+                "ai13_recent": ai13_recent,
+                "ai13_failed": ai13_failed,
+                "ai13_pending": ai13_pending}
     except ImportError:
         return {"ok": False, "error": "pymysql not installed — pip install pymysql"}
     except Exception as e:
@@ -216,13 +335,13 @@ _cache = {}
 _lock  = threading.Lock()
 
 def refresh_cache():
-    env   = load_env()
-    bots  = get_running_bots()
-    kw    = get_keyword_stats()
-    ml    = get_magic_log()
-    mysql = get_mysql_stats(env)
+    env        = load_env()
+    local_bots = get_running_bots_local()
+    kw         = get_keyword_stats()
+    ml         = get_magic_log()
+    mysql      = get_mysql_stats(env)
     with _lock:
-        _cache.update({"bots": bots, "kw": kw,
+        _cache.update({"local_bots": local_bots, "kw": kw,
                         "ml": ml, "mysql": mysql,
                         "ts": datetime.now().strftime("%H:%M:%S")})
 
@@ -252,6 +371,7 @@ def render_log(rows, bot_key):
         cmds = {
             "magic_scroll": "python magic_scroll.py --15m",
             "bot10":        "python 10_domain_quick_scrape_api.py",
+            "bot13":        "python 13_scan-website-interface-by-ia.py",
             "bot14":        "python 14_download_blog_pin_links.py",
         }
         return (f'<div class="no-log">'
@@ -282,6 +402,13 @@ def render_log(rows, bot_key):
     out.append('</div>')
     return "".join(out)
 
+def _ai13_pill(st):
+    st = str(st or "")
+    if st.startswith("Done"):   return '<span class="pill pill-run" style="font-size:10px">Done</span>'
+    if "Fail" in st:            return '<span class="pill pill-err" style="font-size:10px">Failed</span>'
+    if "Block" in st:           return '<span class="pill pill-warn" style="font-size:10px">Blocked</span>'
+    return f'<span class="pill pill-info" style="font-size:10px">{e(st[:20])}</span>'
+
 def stat_box(n, label, color="#e2e8f0"):
     return (f'<div class="stat-box">'
             f'<div class="stat-n" style="color:{color}">{n}</div>'
@@ -290,54 +417,68 @@ def stat_box(n, label, color="#e2e8f0"):
 # ── full page ──────────────────────────────────────────────────────────────────
 def build_page():
     with _lock:
-        bots  = dict(_cache.get("bots", {}))
-        kw    = dict(_cache.get("kw",   {}))
-        ml    = list(_cache.get("ml",   []))
-        mysql = dict(_cache.get("mysql",{}))
-        ts    = _cache.get("ts", "…")
-    bot_logs = mysql.get("bot_logs", {}) if mysql.get("ok") else {}
+        local_bots = dict(_cache.get("local_bots", {}))
+        kw         = dict(_cache.get("kw",   {}))
+        ml         = list(_cache.get("ml",   []))
+        mysql      = dict(_cache.get("mysql",{}))
+        ts         = _cache.get("ts", "…")
+    bot_logs   = mysql.get("bot_logs",  {}) if mysql.get("ok") else {}
+    bot_status = mysql.get("bot_status",{}) if mysql.get("ok") else {}
 
     # ── process status bar ─────────────────────────────────────────────────────
-    b1r, b1p = bots.get("magic_scroll", (False, None))
-    b2r, b2p = bots.get("bot10", (False, None))
-    b3r, b3p = bots.get("bot14", (False, None))
+    def bot_pill(key, label):
+        """Show running status: MySQL log recency first, local psutil as fallback."""
+        db_st, db_extra = bot_status.get(key, ("unknown", None))
+        local_running, local_pid = local_bots.get(key, (False, None))
+
+        if db_st == "running":
+            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
+                    f'<span class="pill pill-run">● RUNNING</span></div>')
+        elif db_st == "idle":
+            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
+                    f'<span class="pill pill-idle">◑ IDLE ({db_extra}m ago)</span></div>')
+        elif db_st == "no_logs":
+            # no DB logs yet — fall back to local psutil
+            if local_running:
+                return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
+                        f'<span class="pill pill-run">● RUNNING (local pid {local_pid})</span></div>')
+            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
+                    f'<span class="pill pill-stop">○ STOPPED <small style="font-weight:400">(restart to enable DB logs)</small></span></div>')
+        else:
+            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
+                    f'<span class="pill pill-stop">○ STOPPED</span></div>')
 
     status_bar = f'''
     <div class="status-bar">
-      <div class="sb-item">
-        <span class="sb-name">magic_scroll</span>
-        {status_pill(b1r, b1p)}
-      </div>
-      <div class="sb-item">
-        <span class="sb-name">Step 10 (classifier)</span>
-        {status_pill(b2r, b2p)}
-      </div>
-      <div class="sb-item">
-        <span class="sb-name">Step 14 (downloader)</span>
-        {status_pill(b3r, b3p)}
-      </div>
+      {bot_pill("magic_scroll", "magic_scroll (hp)")}
+      {bot_pill("bot10",        "Step 10 — classifier")}
+      {bot_pill("bot13",        "Step 13 — AI scanner")}
+      {bot_pill("bot14",        "Step 14 — downloader")}
     </div>'''
 
     # ── keyword card ───────────────────────────────────────────────────────────
     if "error" in kw:
         kw_body = f'<p class="err">Error: {e(kw["error"])}</p>'
     else:
-        done = kw.get("done", 0); total = kw.get("total", 1)
-        not_yet = kw.get("not_yet", 0); running = kw.get("running", 0)
+        done    = kw.get("done", 0)
+        total   = kw.get("total", 1)
+        not_yet = kw.get("not_yet", 0)
+        pending = kw.get("pending", 0)
+        source  = kw.get("source", "")
         recent_rows = "".join(
             f'<tr><td class="muted">{e(r["ts"])}</td><td>{e(r["kw"])}</td></tr>'
             for r in kw.get("recent", [])
         )
         kw_body = f'''
         <div class="stat-row">
-          {stat_box(f'{done:,}',    "Done ✓",   "#22c55e")}
-          {stat_box(f'{not_yet:,}', "Not Yet",   "#94a3b8")}
-          {stat_box(running,        "Running",   "#3b82f6")}
-          {stat_box(f'{total:,}',   "Total kw",  "#a78bfa")}
+          {stat_box(f'{done:,}',    "Done ✓",    "#22c55e")}
+          {stat_box(f'{not_yet:,}', "Not Yet",    "#94a3b8")}
+          {stat_box(f'{pending:,}', "Pending/Running", "#3b82f6")}
+          {stat_box(f'{total:,}',   "Total kw",   "#a78bfa")}
         </div>
         {pct_bar(done, total)}
-        <div class="sub-title" style="margin-top:14px">Recently done</div>
-        <table class="mini-table">{recent_rows}</table>'''
+        <div class="muted" style="font-size:11px;margin-top:6px">Source: {e(source)}</div>
+        {'<div class="sub-title" style="margin-top:12px">Recently done</div><table class="mini-table">' + recent_rows + '</table>' if recent_rows else ''}'''
 
     # ── magic_log card ─────────────────────────────────────────────────────────
     if ml:
@@ -464,6 +605,57 @@ def build_page():
           {'<div><div class="sub-title">Recently downloaded</div><table class="mini-table">' + dl_recent_rows + '</table></div>' if dl_recent_rows else '<div></div>'}
         </div>'''
 
+        # ── step 13 card body ──────────────────────────────────────────────────
+        ai13  = mysql.get("ai13_status", {})
+        ai13_done    = ai13.get("Done", 0)
+        ai13_failed  = sum(v for k,v in ai13.items() if k and "fail"  in k.lower())
+        ai13_blocked = sum(v for k,v in ai13.items() if k and "block" in k.lower())
+        ai13_null    = ai13.get("None", 0) + ai13.get("", 0)
+        ai13_tot     = ai13_done + ai13_failed + ai13_blocked + ai13_null or 1
+        ai13_pend    = mysql.get("ai13_pending", "?")
+
+        ai13_type_rows = "".join(
+            f'<tr><td>{e(t or "—")}</td><td class="blue"><b>{n:,}</b></td></tr>'
+            for t, n in mysql.get("ai13_types", [])
+        )
+        ai13_recent_rows = "".join(
+            f'<tr><td class="blue" style="font-size:12px">{e(d)}</td>'
+            f'<td style="font-size:12px;color:#a3e635">{e(tp or "—")}</td>'
+            f'<td class="muted" style="font-size:11px">{e(cat or "")}</td>'
+            f'<td>{_ai13_pill(st)}</td></tr>'
+            for d, tp, cat, st in mysql.get("ai13_recent", [])
+        )
+        ai13_failed_rows = "".join(
+            f'<tr><td class="err" style="font-size:12px">{e(d)}</td>'
+            f'<td style="font-size:11px;color:#f97316">{e((st or "")[:60])}</td></tr>'
+            for d, st in mysql.get("ai13_failed", [])
+        )
+
+        # "never run" only if bot13 has no DB logs AND no MySQL results
+        bot13_db_status, _ = bot_status.get("bot13", ("unknown", None))
+        not_started = (ai13_done == 0 and ai13_failed == 0 and ai13_blocked == 0
+                       and bot13_db_status in ("no_logs", "unknown", "stopped"))
+        step13_body = f'''
+        {"<div class='no-log' style='margin-bottom:10px'>⚠ Step 13 has never run. Start it: <code>python 13_scan-website-interface-by-ia.py</code></div>" if not_started else ""}
+        <div class="stat-row">
+          {stat_box(f'{ai13_done:,}',    "Done ✓",        "#22c55e")}
+          {stat_box(str(ai13_pend),      "Eligible/Pending","#94a3b8")}
+          {stat_box(f'{ai13_failed:,}',  "Failed",         "#ef4444")}
+          {stat_box(f'{ai13_blocked:,}', "Blocked",        "#f97316")}
+        </div>
+        {pct_bar(ai13_done, int(ai13_pend) + ai13_done if str(ai13_pend).isdigit() else ai13_done or 1)}
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">
+          <div>
+            <div class="sub-title">AI-detected types (done)</div>
+            <table class="mini-table">{ai13_type_rows if ai13_type_rows else "<tr><td class='muted'>none yet</td></tr>"}</table>
+          </div>
+          <div>
+            {"<div class='sub-title'>Recently scanned</div><table class='mini-table'>" + ai13_recent_rows + "</table>" if ai13_recent_rows else ""}
+          </div>
+        </div>
+        {"<div class='sub-title err' style='margin-top:10px'>Recent failures</div><table class='mini-table'>" + ai13_failed_rows + "</table>" if ai13_failed_rows else ""}
+        '''
+
     # ── log panels ─────────────────────────────────────────────────────────────
     def log_panel(key, title, dot_color):
         rows = bot_logs.get(key)  # list of (ts, level, message) or None
@@ -497,9 +689,10 @@ def build_page():
         </div>'''
 
     log_panels = (
-        log_panel("magic_scroll", "Bot 1 · magic_scroll", "#22c55e") +
-        log_panel("bot10",        "Bot 2 · Step 10 (domain classifier)", "#f97316") +
-        log_panel("bot14",        "Bot 3 · Step 14 (link downloader)",   "#3b82f6")
+        log_panel("magic_scroll", "Bot 1 · magic_scroll",           "#22c55e") +
+        log_panel("bot10",        "Bot 2 · Step 10 (classifier)",   "#f97316") +
+        log_panel("bot13",        "Bot 3 · Step 13 (AI scanner)",   "#a78bfa") +
+        log_panel("bot14",        "Bot 4 · Step 14 (link downloader)", "#3b82f6")
     )
 
     # ── assemble ───────────────────────────────────────────────────────────────
@@ -525,6 +718,7 @@ def build_page():
     .pill {{ display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:700 }}
     .pill-run  {{ background:#14532d; color:#4ade80; border:1px solid #166534 }}
     .pill-stop {{ background:#1e293b; color:#64748b; border:1px solid #334155 }}
+    .pill-idle {{ background:#1c1917; color:#fb923c; border:1px solid #7c2d12 }}
     .pill-err  {{ background:#450a0a; color:#f87171; border:1px solid #7f1d1d }}
     .pill-warn {{ background:#422006; color:#fb923c; border:1px solid #7c2d12 }}
     .pill-info {{ background:#0f172a; color:#64748b; border:1px solid #1e293b }}
@@ -611,12 +805,17 @@ def build_page():
   </div>
 
   <div class="card">
-    <div class="card-title"><div class="dot" style="background:#f97316;box-shadow:0 0 6px #f97316"></div>Bot 2 — Step 10 (classifier) + Step 13 (AI scanner) — MySQL stats</div>
+    <div class="card-title"><div class="dot" style="background:#f97316;box-shadow:0 0 6px #f97316"></div>Bot 2 — Step 10 — classifier — MySQL stats</div>
     {step10_body}
   </div>
 
   <div class="card">
-    <div class="card-title"><div class="dot" style="background:#3b82f6;box-shadow:0 0 6px #3b82f6"></div>Bot 3 — Step 14 (blog link downloader) — MySQL stats</div>
+    <div class="card-title"><div class="dot" style="background:#a78bfa;box-shadow:0 0 6px #a78bfa"></div>Bot 3 — Step 13 — AI website scanner — MySQL stats</div>
+    {step13_body}
+  </div>
+
+  <div class="card">
+    <div class="card-title"><div class="dot" style="background:#3b82f6;box-shadow:0 0 6px #3b82f6"></div>Bot 4 — Step 14 — blog link downloader — MySQL stats</div>
     {step14_body}
   </div>
 

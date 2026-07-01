@@ -44,6 +44,7 @@ Run:
   QUICK_SCRAPE_OPENROUTER_MODEL=openai/gpt-4.1-nano    (optional — this is the default if unset)
 """
 from __future__ import annotations
+import db_logger  # logs every print() to MySQL bot_logs table — dashboard reads from there
 
 import argparse
 import html
@@ -211,21 +212,101 @@ def local_rows(conn) -> list[dict]:
 
 def write_local(conn, domain: str, url: str, status: str, type_: str, category: str, description: str):
     with _db_lock:
-        conn.execute(
-            """
-            INSERT INTO scraped_websites (domain, url, status_website_scaned_by_ia,
-                type_website_scaned_by_ia, category_website_scaned_by_ia, description_website_scaned_by_ia)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(domain) DO UPDATE SET
-                url=excluded.url,
-                status_website_scaned_by_ia=excluded.status_website_scaned_by_ia,
-                type_website_scaned_by_ia=excluded.type_website_scaned_by_ia,
-                category_website_scaned_by_ia=excluded.category_website_scaned_by_ia,
-                description_website_scaned_by_ia=excluded.description_website_scaned_by_ia
-            """,
-            (domain, url, status, type_, category, description),
+        try:
+            conn.execute(
+                """
+                INSERT INTO scraped_websites (domain, url, status_website_scaned_by_ia,
+                    type_website_scaned_by_ia, category_website_scaned_by_ia, description_website_scaned_by_ia)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(domain) DO UPDATE SET
+                    url=excluded.url,
+                    status_website_scaned_by_ia=excluded.status_website_scaned_by_ia,
+                    type_website_scaned_by_ia=excluded.type_website_scaned_by_ia,
+                    category_website_scaned_by_ia=excluded.category_website_scaned_by_ia,
+                    description_website_scaned_by_ia=excluded.description_website_scaned_by_ia
+                """,
+                (domain, url, status, type_, category, description),
+            )
+            conn.commit()
+        except Exception as _sqlite_err:
+            print(f"  [db_local] write failed for {domain}: {_sqlite_err}")
+    # Also write to MySQL so dashboard + other PCs see results even if sortpin.db is broken
+    _write_mysql(domain, url, status, type_, category, description)
+
+
+# ── MySQL writer for step-13 results ──────────────────────────────────────────
+_mysql_conn_13 = None
+_mysql_lock_13 = __import__("threading").Lock()
+
+def _get_mysql_conn_13():
+    global _mysql_conn_13
+    try:
+        import pymysql
+        env = {}
+        if os.path.exists(ENV_PATH):
+            for line in open(ENV_PATH, errors="replace"):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+        pw = env.get("MYSQL_PASSWORD", "")
+        if not pw:
+            return None
+        if _mysql_conn_13:
+            try:
+                _mysql_conn_13.ping(reconnect=True)
+                return _mysql_conn_13
+            except Exception:
+                pass
+        _mysql_conn_13 = pymysql.connect(
+            host=env.get("MYSQL_HOST", "72.61.197.144"),
+            port=int(env.get("MYSQL_PORT", 3306)),
+            db=env.get("MYSQL_DB", "data_pint"),
+            user=env.get("MYSQL_USER", "data_pint_user"),
+            password=pw,
+            charset="utf8mb4",
+            connect_timeout=6,
+            autocommit=True,
         )
-        conn.commit()
+        # Ensure columns exist in MySQL scraped_websites
+        with _mysql_conn_13.cursor() as _c:
+            for col, coltype in [
+                ("status_website_scaned_by_ia",      "VARCHAR(100)"),
+                ("type_website_scaned_by_ia",         "VARCHAR(100)"),
+                ("category_website_scaned_by_ia",     "VARCHAR(200)"),
+                ("description_website_scaned_by_ia",  "TEXT"),
+            ]:
+                try:
+                    _c.execute(f"ALTER TABLE scraped_websites ADD COLUMN {col} {coltype}")
+                except Exception:
+                    pass  # column already exists
+        return _mysql_conn_13
+    except Exception:
+        return None
+
+def _write_mysql(domain: str, url: str, status: str, type_: str, category: str, description: str):
+    with _mysql_lock_13:
+        try:
+            mc = _get_mysql_conn_13()
+            if not mc:
+                return
+            with mc.cursor() as c:
+                c.execute(
+                    """INSERT INTO scraped_websites
+                           (domain, url, status_website_scaned_by_ia,
+                            type_website_scaned_by_ia, category_website_scaned_by_ia,
+                            description_website_scaned_by_ia)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                           status_website_scaned_by_ia      = VALUES(status_website_scaned_by_ia),
+                           type_website_scaned_by_ia         = VALUES(type_website_scaned_by_ia),
+                           category_website_scaned_by_ia     = VALUES(category_website_scaned_by_ia),
+                           description_website_scaned_by_ia  = VALUES(description_website_scaned_by_ia)
+                    """,
+                    (domain, url or "", status or "", type_ or "", category or "", description or ""),
+                )
+        except Exception as _me:
+            print(f"  [db_mysql] write failed for {domain}: {_me}")
 
 
 # ─── Eligibility ─────────────────────────────────────────────────────────────
