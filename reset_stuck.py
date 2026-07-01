@@ -118,6 +118,7 @@ def reset_mysql():
         c.execute("UPDATE scraped_websites SET status=NULL WHERE status='running'")
         print(f"MySQL: reset {c.rowcount} running websites → NULL")
 
+
         # reset running keywords (if keywords table exists)
         try:
             c.execute("UPDATE keywords SET status='Not Yet' WHERE status='pending'")
@@ -128,6 +129,51 @@ def reset_mysql():
         conn.close()
     except Exception as e:
         print(f"MySQL reset failed: {e}")
+
+def reset_mysql_blocked():
+    """Reset blocked websites in MySQL → NULL so step 10 retries them."""
+    try:
+        import pymysql
+        env = load_env()
+        conn = pymysql.connect(
+            host=env["MYSQL_HOST"], port=int(env.get("MYSQL_PORT", 3306)),
+            db=env["MYSQL_DB"], user=env["MYSQL_USER"], password=env["MYSQL_PASSWORD"],
+            charset="utf8mb4", connect_timeout=10, autocommit=True,
+        )
+        c = conn.cursor()
+        c.execute("UPDATE scraped_websites SET status=NULL WHERE status='blocked'")
+        print(f"MySQL: reset {c.rowcount} blocked websites → NULL")
+        conn.close()
+    except Exception as e:
+        print(f"MySQL blocked reset failed: {e}")
+
+def reset_sheet_blocked():
+    """Reset Blocked (...) rows in Sheet websites tab → not yet."""
+    try:
+        import requests
+        cfg = load_webapp()
+        print("Sheet: loading all websites to find blocked rows...")
+        r = requests.post(cfg["url"],
+                          json={"action": "get_websites", "secret": cfg.get("secret", "")},
+                          timeout=60)
+        websites = r.json().get("websites", [])
+        to_reset = [w for w in websites
+                    if (w.get("scrapped") or "").strip().startswith("Blocked")]
+        print(f"  Found {len(to_reset)} blocked rows in Sheet")
+        if not to_reset:
+            return
+        updates = [{"website": w["website"], "updates": {"scrapped": "not yet"}}
+                   for w in to_reset if w.get("website")]
+        for i in range(0, len(updates), 50):
+            batch = updates[i:i+50]
+            r2 = requests.post(cfg["url"],
+                               json={"action": "batch_update_websites",
+                                     "secret": cfg.get("secret", ""),
+                                     "updates": batch},
+                               timeout=60)
+            print(f"  batch {i//50+1}: {r2.json()}")
+    except Exception as e:
+        print(f"  Sheet blocked reset failed: {e}")
 
 # ── captcha reset ──────────────────────────────────────────────────────────────
 def reset_captcha():
@@ -155,6 +201,17 @@ def reset_captcha():
 # ── main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
+
+    if "--retry-blocked" in sys.argv:
+        print("=" * 55)
+        print("  Reset blocked websites → retry with captcha solver")
+        print("=" * 55)
+        reset_mysql_blocked()
+        print()
+        reset_sheet_blocked()
+        print()
+        print("Done. Step 10 will retry all previously-blocked sites.")
+        sys.exit(0)
 
     if "--reset-captcha" in sys.argv:
         print("=" * 55)
