@@ -479,12 +479,35 @@ def fetch_homepage(url: str, timeout=(5, 10), hard_deadline: float = 15.0):
 
     if r.status_code in (403, 429, 503):
         r.close()
+        # 1) curl_cffi Chrome impersonation
+        curl_html = ""
         try:
             from curl_cffi import requests as curl_cffi_requests
             r2 = curl_cffi_requests.get(target, impersonate="chrome120", headers=HEADERS, timeout=timeout[1])
             if r2.status_code < 400:
-                return True, r2.text, ""
+                curl_html = r2.text
         except Exception:
+            pass
+        if curl_html:
+            return True, curl_html, ""
+        # 2) Playwright stealth + captcha API solver
+        try:
+            import captcha_solver as _cs
+            pw_ok, pw_html = _cs.try_playwright(target)
+            if pw_ok and pw_html:
+                return True, pw_html, ""
+            # still blocked — try API solver
+            if pw_html:
+                try:
+                    token = _cs.solve(target, pw_html)
+                    if token:
+                        ctype, _ = _cs.detect_captcha(pw_html)
+                        pw_ok2, pw_html2 = _cs.try_playwright(target, inject_token=token, captcha_type=ctype)
+                        if pw_ok2 and pw_html2:
+                            return True, pw_html2, ""
+                except _cs.CaptchaGiveUp:
+                    pass
+        except ImportError:
             pass
         return False, "", f"Blocked (HTTP {r.status_code})"
 
@@ -515,6 +538,35 @@ def fetch_homepage(url: str, timeout=(5, 10), hard_deadline: float = 15.0):
         text = content.decode(r.encoding or "utf-8", errors="replace")
     except (LookupError, TypeError):
         text = content.decode("utf-8", errors="replace")
+
+    # Check if 200 response is actually a Cloudflare/captcha challenge page
+    lw = text.lower()
+    is_challenge = (
+        len(text) < 30_000 and
+        ("cloudflare" in lw or "captcha" in lw or "hcaptcha" in lw) and
+        any(p in lw for p in ["verify you are human", "checking your browser",
+                               "just a moment", "are you a robot", "security check",
+                               "challenge-platform"])
+    )
+    if is_challenge:
+        try:
+            import captcha_solver as _cs
+            pw_ok, pw_html = _cs.try_playwright(target)
+            if pw_ok and pw_html:
+                return True, pw_html, ""
+            if pw_html:
+                try:
+                    token = _cs.solve(target, pw_html)
+                    if token:
+                        ctype, _ = _cs.detect_captcha(pw_html)
+                        pw_ok2, pw_html2 = _cs.try_playwright(target, inject_token=token, captcha_type=ctype)
+                        if pw_ok2 and pw_html2:
+                            return True, pw_html2, ""
+                except _cs.CaptchaGiveUp:
+                    pass
+        except ImportError:
+            pass
+        return False, "", "Blocked (challenge page)"
 
     return True, text, ""
 

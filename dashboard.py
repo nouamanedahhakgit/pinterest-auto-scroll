@@ -304,6 +304,47 @@ def get_mysql_stats(env):
             ai13_pending = c.fetchone()[0]
         except Exception: ai13_pending = "?"
 
+        # ── captcha solver stats ───────────────────────────────────────────────
+        try:
+            c.execute("""
+                SELECT service,
+                       COUNT(*)             AS total,
+                       SUM(success)         AS successes,
+                       COUNT(*)-SUM(success) AS failures,
+                       ROUND(AVG(success)*100,1) AS success_rate,
+                       ROUND(AVG(solve_time_ms)/1000,1) AS avg_solve_s
+                FROM captcha_stats
+                GROUP BY service
+            """)
+            cap_by_service = c.fetchall()
+        except Exception: cap_by_service = []
+
+        try:
+            c.execute("""
+                SELECT COUNT(*) AS total, SUM(success) AS ok
+                FROM captcha_stats
+                WHERE ts >= CURDATE()
+            """)
+            row = c.fetchone()
+            cap_today = {"total": int(row[0] or 0), "ok": int(row[1] or 0)}
+        except Exception: cap_today = {"total": 0, "ok": 0}
+
+        try:
+            c.execute("""
+                SELECT service, captcha_type, url, success, solve_time_ms, error
+                FROM captcha_stats ORDER BY ts DESC LIMIT 12
+            """)
+            cap_recent = c.fetchall()
+        except Exception: cap_recent = []
+
+        try:
+            c.execute("""
+                SELECT message, ts FROM captcha_warnings
+                WHERE resolved=0 ORDER BY ts DESC LIMIT 5
+            """)
+            cap_warnings = c.fetchall()
+        except Exception: cap_warnings = []
+
         # ── bot logs from MySQL bot_logs table ─────────────────────────────────
         bot_logs = {}
         for key in ("magic_scroll", "bot10", "bot13", "bot14"):
@@ -324,7 +365,11 @@ def get_mysql_stats(env):
                 "ai13_types": ai13_types,
                 "ai13_recent": ai13_recent,
                 "ai13_failed": ai13_failed,
-                "ai13_pending": ai13_pending}
+                "ai13_pending": ai13_pending,
+                "cap_by_service": cap_by_service,
+                "cap_today": cap_today,
+                "cap_recent": cap_recent,
+                "cap_warnings": cap_warnings}
     except ImportError:
         return {"ok": False, "error": "pymysql not installed — pip install pymysql"}
     except Exception as e:
@@ -656,6 +701,102 @@ def build_page():
         {"<div class='sub-title err' style='margin-top:10px'>Recent failures</div><table class='mini-table'>" + ai13_failed_rows + "</table>" if ai13_failed_rows else ""}
         '''
 
+    # ── captcha solver card ────────────────────────────────────────────────────
+    cap_by_service = mysql.get("cap_by_service", []) if mysql.get("ok") else []
+    cap_today      = mysql.get("cap_today", {})      if mysql.get("ok") else {}
+    cap_recent     = mysql.get("cap_recent", [])     if mysql.get("ok") else []
+    cap_warnings   = mysql.get("cap_warnings", [])   if mysql.get("ok") else []
+
+    # warning banner (20 consecutive failures)
+    cap_warn_html = ""
+    for msg, wts in cap_warnings:
+        cap_warn_html += (
+            f'<div class="no-log" style="background:#450a0a;border-left:4px solid #ef4444;'
+            f'margin-bottom:8px;font-size:12px">'
+            f'⚠ <b>CAPTCHA WARNING</b> [{e(str(wts)[:16])}]: {e(str(msg))}'
+            f'<br><small style="color:#94a3b8">Run <code>python reset_stuck.py --reset-captcha</code> on HP to resume.</small>'
+            f'</div>'
+        )
+
+    # per-service table
+    svc_rows = ""
+    for row in cap_by_service:
+        svc, total, ok, fail, rate, avg_s = row
+        rate_color = "#22c55e" if (rate or 0) >= 70 else "#f97316" if (rate or 0) >= 40 else "#ef4444"
+        svc_rows += (
+            f'<tr>'
+            f'<td class="blue"><b>{e(svc)}</b></td>'
+            f'<td>{int(total or 0):,}</td>'
+            f'<td class="green">{int(ok or 0):,}</td>'
+            f'<td class="err">{int(fail or 0):,}</td>'
+            f'<td style="color:{rate_color}"><b>{rate or 0}%</b></td>'
+            f'<td class="muted">{avg_s or "—"}s</td>'
+            f'</tr>'
+        )
+
+    # recent attempts
+    recent_cap_rows = ""
+    for svc, ctype, url, success, ms, err in cap_recent:
+        icon = "✓" if success else "✗"
+        color = "#22c55e" if success else "#ef4444"
+        recent_cap_rows += (
+            f'<tr>'
+            f'<td style="color:{color}"><b>{icon}</b></td>'
+            f'<td class="blue" style="font-size:11px">{e(svc)}</td>'
+            f'<td class="muted" style="font-size:11px">{e(ctype or "—")}</td>'
+            f'<td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+            f'{e((url or "")[:60])}</td>'
+            f'<td class="muted" style="font-size:11px">{int(ms or 0)/1000:.1f}s</td>'
+            f'<td class="err" style="font-size:11px">{e((err or "")[:40])}</td>'
+            f'</tr>'
+        )
+
+    today_total = cap_today.get("total", 0)
+    today_ok    = cap_today.get("ok", 0)
+    today_fail  = today_total - today_ok
+
+    if cap_by_service or cap_warnings:
+        cap_card = f'''
+        <div class="card" style="margin-bottom:20px">
+          <div class="card-title">
+            <div class="dot" style="background:#f59e0b;box-shadow:0 0 6px #f59e0b"></div>
+            🔓 Captcha Solver — AntiCaptcha / CapSolver / 2captcha
+            <span style="margin-left:auto;font-size:12px;font-weight:400;color:#94a3b8">
+              Today: <b class="{'green' if today_ok else 'muted'}">{today_ok} solved</b>
+              / {today_total} total
+            </span>
+          </div>
+          {cap_warn_html}
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+            <div>
+              <div class="sub-title">Per-service stats (all time)</div>
+              <table class="mini-table">
+                <tr><th>Service</th><th>Total</th><th>OK</th><th>Fail</th><th>Rate</th><th>Avg</th></tr>
+                {svc_rows if svc_rows else "<tr><td colspan='6' class='muted'>No attempts yet</td></tr>"}
+              </table>
+            </div>
+            <div>
+              <div class="sub-title">Recent attempts</div>
+              <table class="mini-table">
+                <tr><th></th><th>Service</th><th>Type</th><th>URL</th><th>Time</th><th>Error</th></tr>
+                {recent_cap_rows if recent_cap_rows else "<tr><td colspan='6' class='muted'>None yet</td></tr>"}
+              </table>
+            </div>
+          </div>
+        </div>'''
+    else:
+        cap_card = f'''
+        <div class="card" style="margin-bottom:20px;border:1px dashed #334155">
+          <div class="card-title">
+            <div class="dot" style="background:#475569"></div>
+            🔓 Captcha Solver — AntiCaptcha / CapSolver / 2captcha
+          </div>
+          <p class="muted" style="font-size:12px">
+            No captcha attempts yet. Solver activates automatically when step 10 hits a captcha/Cloudflare block.
+            Services will rotate: AntiCaptcha → CapSolver → 2captcha (best success rate preferred after 15 attempts).
+          </p>
+        </div>'''
+
     # ── log panels ─────────────────────────────────────────────────────────────
     def log_panel(key, title, dot_color):
         rows = bot_logs.get(key)  # list of (ts, level, message) or None
@@ -818,6 +959,8 @@ def build_page():
     <div class="card-title"><div class="dot" style="background:#3b82f6;box-shadow:0 0 6px #3b82f6"></div>Bot 4 — Step 14 — blog link downloader — MySQL stats</div>
     {step14_body}
   </div>
+
+  {cap_card}
 
   <hr style="border:none;border-top:1px solid #1e293b;margin:4px 0 20px">
   <h2 style="font-size:14px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px">

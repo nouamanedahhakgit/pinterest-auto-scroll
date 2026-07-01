@@ -735,38 +735,76 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
         # Check HTTP status codes commonly used for blocking
         if r.status_code in (403, 429, 503):
             text_lower = r.text.lower()
-            if "cloudflare" in text_lower:
-                return True, "Cloudflare Block", "", final_url
-            elif "captcha" in text_lower or "recaptcha" in text_lower or "hcaptcha" in text_lower:
-                return True, "Captcha Block", "", final_url
-            elif "access denied" in text_lower or "permission denied" in text_lower:
-                return True, "Access Denied", "", final_url
-            else:
-                return True, f"HTTP Blocked ({r.status_code})", "", final_url
+            block_reason = (
+                "Cloudflare Block" if "cloudflare" in text_lower else
+                "Captcha Block"    if any(k in text_lower for k in ("captcha","recaptcha","hcaptcha")) else
+                "Access Denied"    if ("access denied" in text_lower or "permission denied" in text_lower) else
+                f"HTTP Blocked ({r.status_code})"
+            )
+            # try Playwright stealth before giving up
+            try:
+                import captcha_solver as _cs
+                log_cb(f"[captcha] {block_reason} (HTTP {r.status_code}) — trying Playwright stealth...")
+                pw_ok, pw_html = _cs.try_playwright(url)
+                if pw_ok and pw_html:
+                    log_cb(f"[captcha] ✓ Playwright stealth bypassed {block_reason}")
+                    return False, "", pw_html, final_url
+                if pw_html and _cs.detect_captcha(pw_html)[1]:
+                    try:
+                        token = _cs.solve(url, pw_html)
+                        if token:
+                            ctype, _ = _cs.detect_captcha(pw_html)
+                            pw_ok2, pw_html2 = _cs.try_playwright(url, inject_token=token, captcha_type=ctype)
+                            if pw_ok2 and pw_html2:
+                                log_cb(f"[captcha] ✓ API solve succeeded for {block_reason}")
+                                return False, "", pw_html2, final_url
+                    except _cs.CaptchaGiveUp as cgu:
+                        log_cb(f"[captcha] ⚠ GAVE UP: {cgu}")
+            except ImportError:
+                pass
+            return True, block_reason, "", final_url
 
         # Even on 200, it could show a Cloudflare challenge page or Captcha page
         if r.status_code == 200:
             text_lower = r.text.lower()
             content_len = len(r.text)
-            # Real Cloudflare challenge pages are short and have specific markers
-            if content_len < 30000 and "cloudflare" in text_lower and ("challenge" in text_lower or "enable javascript" in text_lower or "checking your browser" in text_lower):
-                return True, "Cloudflare Challenge", "", final_url
-            # Real captcha CHALLENGE pages are short (<15KB) and have specific
-            # blocking phrases. Normal sites often include reCAPTCHA scripts for
-            # contact forms or have "captcha" in JS bundle names — those are NOT blocks.
+            is_cloudflare = (content_len < 30000 and "cloudflare" in text_lower and
+                             ("challenge" in text_lower or "enable javascript" in text_lower or
+                              "checking your browser" in text_lower))
+            is_captcha = False
             if content_len < 15000 and ("captcha" in text_lower or "recaptcha" in text_lower or "hcaptcha" in text_lower):
                 challenge_phrases = [
-                    "verify you are human",
-                    "please verify",
-                    "challenge-platform",
-                    "just a moment",
-                    "checking your browser",
-                    "are you a robot",
-                    "bot verification",
-                    "security check",
+                    "verify you are human", "please verify", "challenge-platform",
+                    "just a moment", "checking your browser", "are you a robot",
+                    "bot verification", "security check",
                 ]
-                if any(phrase in text_lower for phrase in challenge_phrases):
-                    return True, "Captcha Challenge Page", "", final_url
+                is_captcha = any(phrase in text_lower for phrase in challenge_phrases)
+
+            if is_cloudflare or is_captcha:
+                block_type = "Cloudflare Challenge" if is_cloudflare else "Captcha Challenge Page"
+                # ── Step 1: Try Playwright stealth (handles JS challenges without API) ──
+                try:
+                    import captcha_solver as _cs
+                    log_cb(f"[captcha] {block_type} detected — trying Playwright stealth...")
+                    pw_ok, pw_html = _cs.try_playwright(url)
+                    if pw_ok and pw_html:
+                        log_cb(f"[captcha] ✓ Playwright stealth bypassed {block_type}")
+                        return False, "", pw_html, final_url
+                    log_cb(f"[captcha] Playwright still blocked — trying API solver...")
+                    # ── Step 2: API captcha solver ──────────────────────────────────
+                    try:
+                        token = _cs.solve(url, pw_html or r.text)
+                        if token:
+                            ctype, _ = _cs.detect_captcha(pw_html or r.text)
+                            pw_ok2, pw_html2 = _cs.try_playwright(url, inject_token=token, captcha_type=ctype)
+                            if pw_ok2 and pw_html2:
+                                log_cb(f"[captcha] ✓ API solve + Playwright injection succeeded")
+                                return False, "", pw_html2, final_url
+                    except _cs.CaptchaGiveUp as cgu:
+                        log_cb(f"[captcha] ⚠ GAVE UP after {_cs.STOP_THRESHOLD} failures: {cgu}")
+                except ImportError:
+                    pass  # captcha_solver not available — fall through to blocked
+                return True, block_type, "", final_url
 
         return False, "", r.text, final_url
     except Exception as e:

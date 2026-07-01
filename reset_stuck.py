@@ -129,8 +129,41 @@ def reset_mysql():
     except Exception as e:
         print(f"MySQL reset failed: {e}")
 
+# ── captcha reset ──────────────────────────────────────────────────────────────
+def reset_captcha():
+    """Resolve active captcha warnings in MySQL + reset in-memory pause state."""
+    try:
+        import pymysql
+        env = load_env()
+        conn = pymysql.connect(
+            host=env["MYSQL_HOST"], port=int(env.get("MYSQL_PORT", 3306)),
+            db=env["MYSQL_DB"], user=env["MYSQL_USER"], password=env["MYSQL_PASSWORD"],
+            charset="utf8mb4", connect_timeout=10, autocommit=True,
+        )
+        c = conn.cursor()
+        c.execute("UPDATE captcha_warnings SET resolved=1 WHERE resolved=0")
+        print(f"MySQL: resolved {c.rowcount} captcha warning(s)")
+        conn.close()
+    except Exception as ex:
+        print(f"  captcha warning reset failed: {ex}")
+    try:
+        import captcha_solver
+        captcha_solver.reset_pause()
+    except Exception:
+        print("  captcha_solver not imported (restart step 10 to apply in-process)")
+
 # ── main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import sys
+
+    if "--reset-captcha" in sys.argv:
+        print("=" * 55)
+        print("  Reset captcha solver pause + warnings")
+        print("=" * 55)
+        reset_captcha()
+        print("\nDone. Captcha solving resumes on next blocked site.")
+        sys.exit(0)
+
     print("=" * 55)
     print("  Reset stuck/crashed statuses — Sheet + MySQL")
     print("=" * 55)
