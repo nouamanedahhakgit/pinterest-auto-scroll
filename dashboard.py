@@ -366,7 +366,7 @@ def get_mysql_stats(env):
 
         try:
             c.execute("""SELECT pinner_username, content_type, category, post_score,
-                                best_posting_days, scanned_at
+                                best_posting_days, scanned_at, pin_url
                          FROM pin_content_analysis
                          ORDER BY scanned_at DESC LIMIT 10""")
             plan_recent = c.fetchall()
@@ -861,9 +861,10 @@ def build_page():
         f'<td style="font-size:12px;color:{"#4ade80" if (sc or 0)>=8 else "#f97316" if (sc or 0)>=5 else "#94a3b8"}">{sc}/10</td>' +
         f'<td class="muted" style="font-size:11px">{e(str(days or "")[:30])}</td>' +
         f'<td class="muted" style="font-size:10px">{e(str(ts4 or "")[:16])}</td>' +
+        (f'<td><a href="{e(str(pu or ""))}" target="_blank" style="color:#60a5fa;font-size:11px">🔗 open</a></td>' if pu else '<td class="muted">—</td>') +
         '</tr>'
-        for u, ct, cat, sc, days, ts4 in mysql.get("plan_recent", [])
-    ) or "<tr><td colspan=\'6\' class=\'muted\'>No classifications yet — run python 15_post_planner.py</td></tr>"
+        for u, ct, cat, sc, days, ts4, pu in mysql.get("plan_recent", [])
+    ) or "<tr><td colspan=\'7\' class=\'muted\'>No classifications yet — run python 15_post_planner.py</td></tr>"
 
     from datetime import date as _date, timedelta as _td
     _today2 = _date.today()
@@ -875,7 +876,7 @@ def build_page():
             days_list = list(range(1, 16, 2))
         for d in days_list:
             if 1 <= d <= 15 and len(_cal[d]) < 4:
-                _cal[d].append((ct, cat, sc))
+                _cal[d].append((ct, cat, sc, pu))
 
     cal_cells = ""
     for i, dt in enumerate(_DAYS15, 1):
@@ -884,11 +885,12 @@ def build_page():
         day_label = dt.strftime("%a %d")
         badge_style = "background:#1e3a5f;border:1px solid #3b82f6;" if is_today2 else "background:#0f172a;border:1px solid #1e293b;"
         pin_lines = ""
-        for ct, cat, sc in pins_here:
+        for ct, cat, sc, pu in pins_here:
             em  = _TYPE_EMOJI.get(ct, "📌")
             col = _TYPE_COLOR.get(ct, "#94a3b8")
+            link_open = f'href="{e(pu)}" target="_blank" ' if pu else ""
             pin_lines += (f'<div style="font-size:10px;margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
-                          f'{em} <span style="color:{col}">{e(cat or ct)}</span> ' +
+                          f'{em} <a {link_open}style="color:{col};text-decoration:none">{e(cat or ct)}</a> ' +
                           f'<span style="color:#475569">{sc}/10</span></div>')
         if not pin_lines:
             pin_lines = '<div style="font-size:10px;color:#1e293b">·</div>'
@@ -920,7 +922,7 @@ def build_page():
           </div>
           <div class="sub-title">Recently classified pins</div>
           <table class="mini-table">
-            <tr><th>Pinner</th><th>Type</th><th>Category</th><th>Score</th><th>Days</th><th>Scanned</th></tr>
+            <tr><th>Pinner</th><th>Type</th><th>Category</th><th>Score</th><th>Days</th><th>Scanned</th><th>Pin</th></tr>
             {plan_recent_rows}
           </table>
         </div>'''
