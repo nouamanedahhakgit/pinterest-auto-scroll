@@ -714,6 +714,13 @@ def main():
             # step 4 handles: read disk → build DB → sync to MySQL → clear SortPin extension
             run_step(f"build database ({len(scrolled_kws)} keywords)", BUILD_ARGS)
 
+            # ── Mark scrolled keywords as Done on Google Sheet ────────────────
+            try:
+                mark_done(gsc, cfg, scrolled_kws)
+                print(f"  ✅ Marked {len(scrolled_kws)} keyword(s) as Done on Google Sheet.")
+            except Exception as _me:
+                print(f"  ⚠ mark_done failed: {_me} — keywords may stay 'pending' in sheet.")
+
             # read stats from local DB after build
             db_path = os.path.join(BASE, "sortpin.db")
             db_pins_after = db_created_after = db_saved_after = 0
