@@ -345,6 +345,40 @@ def get_mysql_stats(env):
             cap_warnings = c.fetchall()
         except Exception: cap_warnings = []
 
+        # ── step 15: post planner stats ────────────────────────────────────────
+        try:
+            c.execute("SELECT content_type, COUNT(*) FROM pin_content_analysis GROUP BY content_type ORDER BY COUNT(*) DESC")
+            plan_by_type = c.fetchall()
+        except Exception: plan_by_type = []
+
+        try:
+            c.execute("SELECT COUNT(*) FROM pin_content_analysis")
+            plan_total = c.fetchone()[0]
+        except Exception: plan_total = 0
+
+        try:
+            c.execute("""SELECT COUNT(*) FROM pins
+                         WHERE link_download_status='Done'
+                           AND link_html IS NOT NULL AND link_html != ''
+                           AND id NOT IN (SELECT pin_id FROM pin_content_analysis)""")
+            plan_pending = c.fetchone()[0]
+        except Exception: plan_pending = "?"
+
+        try:
+            c.execute("""SELECT pinner_username, content_type, category, post_score,
+                                best_posting_days, scanned_at
+                         FROM pin_content_analysis
+                         ORDER BY scanned_at DESC LIMIT 10""")
+            plan_recent = c.fetchall()
+        except Exception: plan_recent = []
+
+        try:
+            c.execute("""SELECT best_posting_days, content_type, category, description, post_score, pin_url
+                         FROM pin_content_analysis WHERE post_score >= 5
+                         ORDER BY post_score DESC LIMIT 300""")
+            plan_schedule_rows = c.fetchall()
+        except Exception: plan_schedule_rows = []
+
         # ── bot logs from MySQL bot_logs table ─────────────────────────────────
         bot_logs = {}
         for key in ("magic_scroll", "bot10", "bot13", "bot14"):
@@ -369,7 +403,12 @@ def get_mysql_stats(env):
                 "cap_by_service": cap_by_service,
                 "cap_today": cap_today,
                 "cap_recent": cap_recent,
-                "cap_warnings": cap_warnings}
+                "cap_warnings": cap_warnings,
+                "plan_by_type": plan_by_type,
+                "plan_total": plan_total,
+                "plan_pending": plan_pending,
+                "plan_recent": plan_recent,
+                "plan_schedule_rows": plan_schedule_rows}
     except ImportError:
         return {"ok": False, "error": "pymysql not installed — pip install pymysql"}
     except Exception as e:
@@ -541,7 +580,8 @@ def build_page():
     # ── mysql / step10 / step14 ────────────────────────────────────────────────
     if not mysql.get("ok"):
         err = e(mysql.get("error", "unknown"))
-        mysql_body = step10_body = step14_body = f'<p class="err">⚠ MySQL: {err}</p>'
+        mysql_body = step10_body = step13_body = step14_body = f'<p class="err">⚠ MySQL: {err}</p>'
+        cap_card = plan_card = f'<div class="card" style="border:1px dashed #334155"><p class="err">⚠ MySQL unavailable: {err}</p></div>'
     else:
         t = mysql["totals"]
         mysql_body = f'''
@@ -797,6 +837,94 @@ def build_page():
           </p>
         </div>'''
 
+
+    # ── Post Planner card ──────────────────────────────────────────────────────
+    _TYPE_EMOJI = {"Seasonal":"🌸","Trend":"🔥","Shopping":"🛍️","Lifestyle":"✨",
+                   "Recipe":"🍴","DIY":"🔨","Other":"📌"}
+    _TYPE_COLOR = {"Seasonal":"#22d3ee","Trend":"#f97316","Shopping":"#a78bfa",
+                   "Lifestyle":"#4ade80","Recipe":"#fb923c","DIY":"#60a5fa","Other":"#94a3b8"}
+
+    plan_total   = int(mysql.get("plan_total", 0) or 0)
+    plan_pending = mysql.get("plan_pending", "?")
+
+    plan_type_rows = "".join(
+        f'<tr><td>{_TYPE_EMOJI.get(t,"📌")} <span style="color:{_TYPE_COLOR.get(t,"#94a3b8")}">' +
+        f'{e(t or "Other")}</span></td><td class="blue"><b>{n:,}</b></td></tr>'
+        for t, n in mysql.get("plan_by_type", [])
+    ) or "<tr><td colspan=\'2\' class=\'muted\'>No pins classified yet</td></tr>"
+
+    plan_recent_rows = "".join(
+        f'<tr>' +
+        f'<td class="blue" style="font-size:12px">{e(str(u or ""))}</td>' +
+        f'<td style="font-size:12px;color:{_TYPE_COLOR.get(ct,"#94a3b8")}">{_TYPE_EMOJI.get(ct,"📌")} {e(ct or "")}</td>' +
+        f'<td class="muted" style="font-size:11px">{e(cat or "")}</td>' +
+        f'<td style="font-size:12px;color:{"#4ade80" if (sc or 0)>=8 else "#f97316" if (sc or 0)>=5 else "#94a3b8"}">{sc}/10</td>' +
+        f'<td class="muted" style="font-size:11px">{e(str(days or "")[:30])}</td>' +
+        f'<td class="muted" style="font-size:10px">{e(str(ts4 or "")[:16])}</td>' +
+        '</tr>'
+        for u, ct, cat, sc, days, ts4 in mysql.get("plan_recent", [])
+    ) or "<tr><td colspan=\'6\' class=\'muted\'>No classifications yet — run python 15_post_planner.py</td></tr>"
+
+    from datetime import date as _date, timedelta as _td
+    _today2 = _date.today()
+    _DAYS15 = [_today2 + _td(days=i) for i in range(15)]
+    _cal: dict = {d: [] for d in range(1, 16)}
+    for days_str, ct, cat, desc, sc, pu in mysql.get("plan_schedule_rows", []):
+        days_list = [int(x) for x in str(days_str or "").split(",") if x.strip().isdigit()]
+        if not days_list:
+            days_list = list(range(1, 16, 2))
+        for d in days_list:
+            if 1 <= d <= 15 and len(_cal[d]) < 4:
+                _cal[d].append((ct, cat, sc))
+
+    cal_cells = ""
+    for i, dt in enumerate(_DAYS15, 1):
+        pins_here = _cal[i]
+        is_today2 = (dt == _today2)
+        day_label = dt.strftime("%a %d")
+        badge_style = "background:#1e3a5f;border:1px solid #3b82f6;" if is_today2 else "background:#0f172a;border:1px solid #1e293b;"
+        pin_lines = ""
+        for ct, cat, sc in pins_here:
+            em  = _TYPE_EMOJI.get(ct, "📌")
+            col = _TYPE_COLOR.get(ct, "#94a3b8")
+            pin_lines += (f'<div style="font-size:10px;margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+                          f'{em} <span style="color:{col}">{e(cat or ct)}</span> ' +
+                          f'<span style="color:#475569">{sc}/10</span></div>')
+        if not pin_lines:
+            pin_lines = '<div style="font-size:10px;color:#1e293b">·</div>'
+        cal_cells += f'<div style="{badge_style}border-radius:6px;padding:6px 8px;min-height:70px">' + \
+                     f'<div style="font-size:11px;font-weight:700;color:{"#60a5fa" if is_today2 else "#475569"};margin-bottom:4px">' + \
+                     f'{"★ " if is_today2 else ""}{day_label}</div>' + pin_lines + "</div>"
+
+    if mysql.get("ok"):
+        plan_card = f'''
+        <div class="card" style="margin-bottom:20px">
+          <div class="card-title">
+            <div class="dot" style="background:#22d3ee;box-shadow:0 0 6px #22d3ee"></div>
+            📅 Post Planner — 15-Day Schedule (Step 15)
+            <span style="margin-left:auto;font-size:12px;font-weight:400;color:#94a3b8">
+              <b class="blue">{plan_total:,}</b> classified &nbsp;·&nbsp;
+              <span class="muted">{plan_pending} pending</span>
+            </span>
+          </div>
+          {'<p class="muted" style="font-size:12px">No pins classified yet — run <code style="color:#a78bfa">python 15_post_planner.py</code> to start.</p>' if not plan_total else ''}
+          <div style="display:grid;grid-template-columns:200px 1fr;gap:16px;margin-bottom:14px">
+            <div>
+              <div class="sub-title">Content types</div>
+              <table class="mini-table">{plan_type_rows}</table>
+            </div>
+            <div>
+              <div class="sub-title">15-day calendar ({_today2.strftime("%b %d")} → {(_today2+_td(days=14)).strftime("%b %d")})</div>
+              <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">{cal_cells}</div>
+            </div>
+          </div>
+          <div class="sub-title">Recently classified pins</div>
+          <table class="mini-table">
+            <tr><th>Pinner</th><th>Type</th><th>Category</th><th>Score</th><th>Days</th><th>Scanned</th></tr>
+            {plan_recent_rows}
+          </table>
+        </div>'''
+
     # ── log panels ─────────────────────────────────────────────────────────────
     def log_panel(key, title, dot_color):
         rows = bot_logs.get(key)  # list of (ts, level, message) or None
@@ -961,6 +1089,8 @@ def build_page():
   </div>
 
   {cap_card}
+
+  {plan_card}
 
   <hr style="border:none;border-top:1px solid #1e293b;margin:4px 0 20px">
   <h2 style="font-size:14px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px">

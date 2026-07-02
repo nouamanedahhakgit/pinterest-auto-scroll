@@ -490,7 +490,21 @@ def fetch_homepage(url: str, timeout=(5, 10), hard_deadline: float = 15.0):
             pass
         if curl_html:
             return True, curl_html, ""
-        # 2) Playwright stealth + captcha API solver
+        # 2) cloudscraper (handles old-style CF JS challenges)
+        cs_html = ""
+        try:
+            import cloudscraper
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            cs_r = scraper.get(target, timeout=20, allow_redirects=True)
+            if cs_r.status_code < 400 and len(cs_r.text) > 5000:
+                cs_html = cs_r.text
+        except Exception:
+            pass
+        if cs_html:
+            return True, cs_html, ""
+        # 3) Playwright stealth + captcha API solver
         try:
             import captcha_solver as _cs
             pw_ok, pw_html = _cs.try_playwright(target)
@@ -549,6 +563,21 @@ def fetch_homepage(url: str, timeout=(5, 10), hard_deadline: float = 15.0):
                                "challenge-platform"])
     )
     if is_challenge:
+        # 1) cloudscraper
+        cs_html2 = ""
+        try:
+            import cloudscraper
+            scraper2 = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            cs_r2 = scraper2.get(target, timeout=20, allow_redirects=True)
+            if cs_r2.status_code < 400 and len(cs_r2.text) > 5000:
+                cs_html2 = cs_r2.text
+        except Exception:
+            pass
+        if cs_html2:
+            return True, cs_html2, ""
+        # 2) Playwright stealth + API solver
         try:
             import captcha_solver as _cs
             pw_ok, pw_html = _cs.try_playwright(target)

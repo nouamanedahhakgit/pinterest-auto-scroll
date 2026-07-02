@@ -741,7 +741,22 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
                 "Access Denied"    if ("access denied" in text_lower or "permission denied" in text_lower) else
                 f"HTTP Blocked ({r.status_code})"
             )
-            # try Playwright stealth before giving up
+            # Layer 1: cloudscraper (handles old-style CF JS challenges)
+            cs_html = ""
+            try:
+                import cloudscraper
+                scraper = cloudscraper.create_scraper(
+                    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                )
+                cs_r = scraper.get(url, timeout=20, allow_redirects=True)
+                if cs_r.status_code < 400 and len(cs_r.text) > 5000:
+                    cs_html = cs_r.text
+            except Exception:
+                pass
+            if cs_html:
+                log_cb(f"[captcha] ✓ cloudscraper bypassed {block_reason}")
+                return False, "", cs_html, final_url
+            # Layer 2: Playwright stealth
             try:
                 import captcha_solver as _cs
                 log_cb(f"[captcha] {block_reason} (HTTP {r.status_code}) — trying Playwright stealth...")
@@ -749,6 +764,7 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
                 if pw_ok and pw_html:
                     log_cb(f"[captcha] ✓ Playwright stealth bypassed {block_reason}")
                     return False, "", pw_html, final_url
+                # Layer 3: API captcha solver (needs visible sitekey in page)
                 if pw_html and _cs.detect_captcha(pw_html)[1]:
                     try:
                         token = _cs.solve(url, pw_html)
@@ -782,7 +798,22 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
 
             if is_cloudflare or is_captcha:
                 block_type = "Cloudflare Challenge" if is_cloudflare else "Captcha Challenge Page"
-                # ── Step 1: Try Playwright stealth (handles JS challenges without API) ──
+                # Layer 1: cloudscraper
+                cs_html2 = ""
+                try:
+                    import cloudscraper
+                    scraper2 = cloudscraper.create_scraper(
+                        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                    )
+                    cs_r2 = scraper2.get(url, timeout=20, allow_redirects=True)
+                    if cs_r2.status_code < 400 and len(cs_r2.text) > 5000:
+                        cs_html2 = cs_r2.text
+                except Exception:
+                    pass
+                if cs_html2:
+                    log_cb(f"[captcha] ✓ cloudscraper bypassed {block_type}")
+                    return False, "", cs_html2, final_url
+                # Layer 2: Playwright stealth
                 try:
                     import captcha_solver as _cs
                     log_cb(f"[captcha] {block_type} detected — trying Playwright stealth...")
@@ -791,7 +822,7 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
                         log_cb(f"[captcha] ✓ Playwright stealth bypassed {block_type}")
                         return False, "", pw_html, final_url
                     log_cb(f"[captcha] Playwright still blocked — trying API solver...")
-                    # ── Step 2: API captcha solver ──────────────────────────────────
+                    # Layer 3: API captcha solver
                     try:
                         token = _cs.solve(url, pw_html or r.text)
                         if token:
@@ -803,7 +834,7 @@ def check_for_blocks(url: str, log_cb: Any) -> tuple[bool, str, str, str]:
                     except _cs.CaptchaGiveUp as cgu:
                         log_cb(f"[captcha] ⚠ GAVE UP after {_cs.STOP_THRESHOLD} failures: {cgu}")
                 except ImportError:
-                    pass  # captcha_solver not available — fall through to blocked
+                    pass
                 return True, block_type, "", final_url
 
         return False, "", r.text, final_url
