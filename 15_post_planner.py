@@ -272,6 +272,15 @@ def _fetch_eligible_sqlite(limit: int) -> list[dict]:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     _ensure_table_sqlite(con)
+    # Check step-14 columns exist (they're added lazily by 14_download_blog_pin_links.py)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(pins)").fetchall()}
+    if "link_html" not in cols:
+        con.close()
+        print("[planner] ℹ  No link_html column in local sortpin.db — "
+              "step 14 (14_download_blog_pin_links.py) hasn't run on this machine yet.\n"
+              "         Run step 14 first to download blog post HTML, "
+              "or use --source mysql if another PC has already run it.")
+        return []
     rows = con.execute(f"""
         SELECT p.id, p.pin_url, p.title, p.description, p.pinner_username,
                p.board_name, p.link, p.link_html, p.link_css, p.link_js
