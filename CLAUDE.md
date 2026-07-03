@@ -70,6 +70,10 @@ python 13_scan-website-interface-by-ia.py --once            # single pass then e
 python 13_scan-website-interface-by-ia.py --workers 100     # more parallel threads (default 60)
 python 13_scan-website-interface-by-ia.py --poll-minutes 5  # check more often than 10 min
 python 13_scan-website-interface-by-ia.py --limit 20 --once --dry-run  # quick test, no writes
+python 13_scan-website-interface-by-ia.py --slow            # gentle mode: 3 workers + 1s delay (good for slow internet)
+python 13_scan-website-interface-by-ia.py --workers 1       # fully sequential, one site at a time
+python 13_scan-website-interface-by-ia.py --workers 5 --delay 0.5  # 5 parallel, 0.5s pause between each submission
+python 13_scan-website-interface-by-ia.py --retry-failed    # re-attempt sites that previously failed (unreachable/timeout) — run this after a bad internet session
 python 14_download_blog_pin_links.py                       # download bot: mysql by default, sync site_type, download all eligible pin links, then poll every 10 min forever
 python 14_download_blog_pin_links.py --once                # single pass then exit (no polling)
 python 14_download_blog_pin_links.py --workers 120         # more parallel threads (default 80)

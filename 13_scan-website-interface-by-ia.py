@@ -311,8 +311,13 @@ def _write_mysql(domain: str, url: str, status: str, type_: str, category: str, 
 
 # ─── Eligibility ─────────────────────────────────────────────────────────────
 
-def fetch_eligible_rows(gsc, cfg, conn, limit) -> list:
-    """Sheet first (cross-PC source of truth), local DB as fallback/merge."""
+def fetch_eligible_rows(gsc, cfg, conn, limit, retry_failed: bool = False) -> list:
+    """Sheet first (cross-PC source of truth), local DB as fallback/merge.
+
+    retry_failed=True: also include sites whose status starts with "Failed"
+    (e.g. Failed (unreachable), Failed (timeout)) so internet-blip failures
+    get another attempt. Sites marked "Done" or "Blocked (...)" are never retried.
+    """
     rows = []
     seen_domains = set()
     # Diagnostic counters — printed every run so "0 eligible" is never a mystery.
@@ -323,9 +328,14 @@ def fetch_eligible_rows(gsc, cfg, conn, limit) -> list:
         if not (website or "").strip():
             stats["no_website"] += 1
             return False
-        if (already_scanned or "").strip():
-            stats["already_scanned"] += 1
-            return False
+        scanned_val = (already_scanned or "").strip()
+        if scanned_val:
+            # --retry-failed: treat "Failed (...)" entries as eligible again
+            if retry_failed and scanned_val.startswith("Failed"):
+                pass  # fall through to site_type check
+            else:
+                stats["already_scanned"] += 1
+                return False
         if (site_type or "").strip().lower() in SKIP_SITE_TYPES:
             stats["skip_site_type"] += 1
             return False
@@ -346,7 +356,7 @@ def fetch_eligible_rows(gsc, cfg, conn, limit) -> list:
         last_err = None
         for attempt in range(3):
             try:
-                data = gsc.post_webapp(cfg, {"action": "get_websites"})
+                data = gsc.post_webapp(cfg, {"action": "get_websites"}, timeout=(10, 180))
                 last_err = None
                 if data.get("websites"):
                     break
@@ -777,10 +787,11 @@ def flush_sheet_batch(gsc, cfg, buffer: list):
 
 # ─── Main pass ────────────────────────────────────────────────────────────────
 
-def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int, dry_run: bool) -> int:
+def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int, dry_run: bool, delay: float = 0.0) -> int:
     total = len(rows)
     pass_t0 = time.time()
-    print(f"  Scanning {total} website(s) with {workers} threads (model={model})...")
+    delay_note = f", {delay}s delay between tasks" if delay > 0 else ""
+    print(f"  Scanning {total} website(s) with {workers} thread(s) (model={model}{delay_note})...")
 
     if gsc and cfg and not dry_run:
         ensure_sheet_columns(gsc, cfg, rows[0]["website"])
@@ -788,6 +799,8 @@ def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int,
     done = 0
     sheet_buffer = []
     buffer_lock = threading.Lock()
+    # Flush the Sheet more often when running slow (small batches = less data lost on crash)
+    sheet_flush_every = max(1, min(25, workers * 3))
 
     # Heartbeat watchdog: every 4s, print any site that's been sitting in the
     # same phase (pinging/fetching homepage/asking AI) for 5s+, so a stuck
@@ -825,13 +838,17 @@ def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int,
             flush_now = None
             with buffer_lock:
                 sheet_buffer.append(res)
-                if len(sheet_buffer) >= 25:
+                if len(sheet_buffer) >= sheet_flush_every:
                     flush_now, sheet_buffer[:] = sheet_buffer[:], []
             if flush_now:
                 flush_sheet_batch(gsc, cfg, flush_now)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(scan_one, row, api_key, model, progress, progress_lock): row for row in rows}
+        futures = {}
+        for row in rows:
+            futures[ex.submit(scan_one, row, api_key, model, progress, progress_lock)] = row
+            if delay > 0:
+                time.sleep(delay)
         for fut in as_completed(futures):
             try:
                 handle_result(fut.result())
@@ -846,7 +863,7 @@ def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int,
 
     wall = time.time() - pass_t0
     avg = wall / total if total else 0
-    print(f"  Pass done: {total} site(s) in {wall:.1f}s (avg {avg:.1f}s/site, {workers} threads in parallel).")
+    print(f"  Pass done: {total} site(s) in {wall:.1f}s (avg {avg:.1f}s/site, {workers} thread(s) in parallel).")
     return done
 
 
@@ -854,12 +871,24 @@ def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int,
 
 def main():
     ap = argparse.ArgumentParser(description="Fast AI website type/category/description scanner (bot).")
-    ap.add_argument("--workers", type=int, default=60, help="parallel threads (default 60)")
+    ap.add_argument("--workers", type=int, default=None, help="parallel threads (default 60, or 3 with --slow)")
+    ap.add_argument("--delay", type=float, default=0.0, help="seconds to wait between starting each task (default 0). Use e.g. --delay 1 on a slow connection.")
+    ap.add_argument("--slow", action="store_true", help="gentle mode: --workers 3 --delay 1 (good for slow internet)")
     ap.add_argument("--poll-minutes", type=int, default=10, help="idle check interval after backlog clears (default 10)")
     ap.add_argument("--once", action="store_true", help="single pass then exit (no polling loop)")
     ap.add_argument("--limit", type=int, default=None, help="cap rows scanned this run (testing)")
     ap.add_argument("--dry-run", action="store_true", help="scan + print only, write nothing")
+    ap.add_argument("--retry-failed", action="store_true", help="also re-attempt sites previously marked Failed (unreachable/timeout) — good for re-running after a bad internet session")
     args = ap.parse_args()
+
+    # --slow sets gentle defaults unless the user also passed explicit values
+    if args.slow:
+        if args.workers is None:
+            args.workers = 3
+        if args.delay == 0.0:
+            args.delay = 1.0
+    if args.workers is None:
+        args.workers = 60
 
     env = load_env()
     api_key = env.get("OPENROUTER_API_KEY", "").strip()
@@ -872,11 +901,11 @@ def main():
     cfg = gsc.resolve_webapp() if gsc else None
     conn = connect_db()
 
-    print(f"  13_scan-website-interface-by-ia.py — model={model}, workers={args.workers}")
+    print(f"  13_scan-website-interface-by-ia.py — model={model}, workers={args.workers}, delay={args.delay}s")
     while True:
-        rows = fetch_eligible_rows(gsc, cfg, conn, args.limit)
+        rows = fetch_eligible_rows(gsc, cfg, conn, args.limit, retry_failed=args.retry_failed)
         if rows:
-            run_pass(rows, conn, gsc, cfg, api_key, model, args.workers, args.dry_run)
+            run_pass(rows, conn, gsc, cfg, api_key, model, args.workers, args.dry_run, delay=args.delay)
         else:
             print("  No eligible websites right now (all scanned, or none synced yet).")
 

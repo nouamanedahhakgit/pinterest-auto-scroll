@@ -137,10 +137,16 @@ def _parse_webapp_response(response):
     raise RuntimeError(f"Web app returned HTML, not JSON: {snippet}")
 
 
-def post_webapp_raw(cfg, payload, timeout=180):
+def post_webapp_raw(cfg, payload, timeout=None):
     if requests is None:
         print("  requests package required.")
         sys.exit(1)
+
+    # (connect_timeout, read_timeout): 10s to connect, 60s to receive the response.
+    # Apps Script can be slow on large payloads but should never take >60s to respond.
+    # Old default was 180s flat — that blocked every failed write for 3 full minutes.
+    if timeout is None:
+        timeout = (10, 60)
 
     payload = dict(payload)
     payload.setdefault("secret", cfg.get("secret", "pinterest-scan-2026"))
@@ -194,7 +200,9 @@ def probe_webapp(cfg):
     return "sync-only"
 
 
-def post_webapp(cfg, payload, timeout=180):
+def post_webapp(cfg, payload, timeout=None):
+    # timeout=None → post_webapp_raw uses its own default (10s connect, 60s read).
+    # Pass an explicit value (e.g. timeout=180) only for known-slow calls like get_websites.
     data = post_webapp_raw(cfg, payload, timeout=timeout)
     if not data.get("ok"):
         raise RuntimeError(data.get("error", "web app error"))
