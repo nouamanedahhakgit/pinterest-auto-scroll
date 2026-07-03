@@ -225,7 +225,7 @@ def write_local(conn, domain: str, url: str, status: str, type_: str, category: 
                     category_website_scaned_by_ia=excluded.category_website_scaned_by_ia,
                     description_website_scaned_by_ia=excluded.description_website_scaned_by_ia
                 """,
-                (domain, url, status, type_, category, description),
+                (domain, url, (status or "")[:95], type_, category, description),
             )
             conn.commit()
         except Exception as _sqlite_err:
@@ -303,7 +303,7 @@ def _write_mysql(domain: str, url: str, status: str, type_: str, category: str, 
                            category_website_scaned_by_ia     = VALUES(category_website_scaned_by_ia),
                            description_website_scaned_by_ia  = VALUES(description_website_scaned_by_ia)
                     """,
-                    (domain, url or "", status or "", type_ or "", category or "", description or ""),
+                    (domain, url or "", (status or "")[:95], type_ or "", category or "", description or ""),
                 )
         except Exception as _me:
             print(f"  [db_mysql] write failed for {domain}: {_me}")
@@ -430,6 +430,14 @@ HEADERS = {
 _PING_POOL = ThreadPoolExecutor(max_workers=300)
 _PING_TIMEOUT = 2.5  # seconds per port attempt
 
+# Detect system proxy once at startup (reads Windows registry / env vars).
+# If a proxy is configured, raw TCP sockets bypass it but requests doesn't —
+# which causes sites to look unreachable to the ping while the browser works fine.
+import urllib.request as _ureq
+_SYSTEM_PROXIES = _ureq.getproxies()   # e.g. {'https': 'http://127.0.0.1:8080'}
+if _SYSTEM_PROXIES:
+    print(f"[net] System proxy detected: {_SYSTEM_PROXIES} — ping will use requests (not raw TCP)")
+
 
 def _tcp_probe(host: str, port: int, timeout: float) -> bool:
     try:
@@ -440,10 +448,23 @@ def _tcp_probe(host: str, port: int, timeout: float) -> bool:
 
 
 def quick_ping(domain: str, timeout: float = _PING_TIMEOUT) -> bool:
-    """Fast reachability pre-check. Dead domains fail in ~timeout*2 seconds instead
-    of stalling on a slow/non-responsive DNS lookup or a full HTTP request+timeout."""
+    """Fast reachability pre-check.
+    If a system proxy is configured, uses requests.head() so it goes through
+    the same path as the browser (raw sockets bypass proxies).
+    Otherwise uses raw TCP (faster, no overhead)."""
     if not domain:
         return False
+    if _SYSTEM_PROXIES:
+        # Go through system proxy — same path as the browser
+        for scheme in ("https", "http"):
+            try:
+                r = requests.head(f"{scheme}://{domain}", timeout=timeout,
+                                  allow_redirects=False)
+                return True  # any HTTP response = reachable
+            except Exception:
+                pass
+        return False
+    # No system proxy: raw TCP is faster
     fut = _PING_POOL.submit(lambda: _tcp_probe(domain, 443, timeout) or _tcp_probe(domain, 80, timeout))
     try:
         return fut.result(timeout=timeout * 2 + 1)
@@ -465,13 +486,12 @@ def fetch_homepage(url: str, timeout=(5, 10), hard_deadline: float = 15.0):
     target = url if url.startswith("http") else "https://" + url
     t0 = time.time()
     try:
-        # requests respects system/env proxy settings by default; the ping
-        # pre-check is a raw socket and never goes through one. If Windows or
-        # an antivirus/VPN has a local proxy configured, ping passes (fast,
-        # no proxy) while this GET silently routes through that proxy and
-        # stalls — bypass it explicitly so both checks see the same path.
+        # If a system proxy is configured, use it (same path as the browser).
+        # If no proxy: bypass any accidental env-var proxy so raw-socket ping
+        # and this fetch see the same network path.
+        _proxies = _SYSTEM_PROXIES if _SYSTEM_PROXIES else {"http": None, "https": None}
         r = requests.get(target, headers=HEADERS, timeout=timeout, allow_redirects=True,
-                          proxies={"http": None, "https": None}, stream=True)
+                          proxies=_proxies, stream=True)
     except requests.exceptions.Timeout:
         return False, "", "Failed (timeout)"
     except requests.exceptions.RequestException as e:

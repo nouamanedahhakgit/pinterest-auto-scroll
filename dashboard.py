@@ -516,21 +516,17 @@ def build_page():
         local_running, local_pid = local_bots.get(key, (False, None))
 
         if db_st == "running":
-            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
-                    f'<span class="pill pill-run">● RUNNING</span></div>')
+            pill = '<span class="pill pill-run">● RUNNING</span>'
         elif db_st == "idle":
-            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
-                    f'<span class="pill pill-idle">◑ IDLE ({db_extra}m ago)</span></div>')
+            pill = f'<span class="pill pill-idle">◑ IDLE ({db_extra}m ago)</span>'
         elif db_st == "no_logs":
-            # no DB logs yet — fall back to local psutil
             if local_running:
-                return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
-                        f'<span class="pill pill-run">● RUNNING (local pid {local_pid})</span></div>')
-            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
-                    f'<span class="pill pill-stop">○ STOPPED <small style="font-weight:400">(restart to enable DB logs)</small></span></div>')
+                pill = f'<span class="pill pill-run">● RUNNING (local pid {local_pid})</span>'
+            else:
+                pill = '<span class="pill pill-stop">○ STOPPED <small style="font-weight:400">(restart to enable DB logs)</small></span>'
         else:
-            return (f'<div class="sb-item"><span class="sb-name">{label}</span>'
-                    f'<span class="pill pill-stop">○ STOPPED</span></div>')
+            pill = '<span class="pill pill-stop">○ STOPPED</span>'
+        return (f'<div class="sb-item" id="bot-{key}"><span class="sb-name">{label}</span>{pill}</div>')
 
     status_bar = f'''
     <div class="status-bar">
@@ -903,10 +899,10 @@ def build_page():
         <div class="card" style="margin-bottom:20px">
           <div class="card-title">
             <div class="dot" style="background:#22d3ee;box-shadow:0 0 6px #22d3ee"></div>
-            📅 Post Planner — 15-Day Schedule (Step 15)
+            📅 Post Planner — Distribute &amp; Schedule (Step 15)
             <span style="margin-left:auto;font-size:12px;font-weight:400;color:#94a3b8">
-              <b class="blue">{plan_total:,}</b> classified &nbsp;·&nbsp;
-              <span class="muted">{plan_pending} pending</span>
+              <b class="blue" id="plan-total">{plan_total:,}</b> classified &nbsp;·&nbsp;
+              <span class="muted"><span id="plan-pending">{plan_pending}</span> pending</span>
             </span>
           </div>
           {'<p class="muted" style="font-size:12px">No pins classified yet — run <code style="color:#a78bfa">python 15_post_planner.py</code> to start.</p>' if not plan_total else ''}
@@ -916,16 +912,271 @@ def build_page():
               <table class="mini-table">{plan_type_rows}</table>
             </div>
             <div>
-              <div class="sub-title">15-day calendar ({_today2.strftime("%b %d")} → {(_today2+_td(days=14)).strftime("%b %d")})</div>
+              <div class="sub-title">Auto-preview ({_today2.strftime("%b %d")} → {(_today2+_td(days=14)).strftime("%b %d")})</div>
               <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">{cal_cells}</div>
             </div>
           </div>
-          <div class="sub-title">Recently classified pins</div>
-          <table class="mini-table">
-            <tr><th>Pinner</th><th>Type</th><th>Category</th><th>Score</th><th>Days</th><th>Scanned</th><th>Pin</th></tr>
-            {plan_recent_rows}
-          </table>
-        </div>'''
+
+          <!-- ── Distribute form ── -->
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:14px 18px;margin-bottom:14px">
+            <div class="sub-title" style="margin-bottom:10px">📤 Generate posting schedule</div>
+            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+              <label style="font-size:12px;color:#94a3b8">Total posts:
+                <input id="sched-total" type="number" value="45" min="1" max="500"
+                  style="width:70px;margin-left:6px;background:#1e293b;border:1px solid #334155;
+                         border-radius:4px;color:#e2e8f0;padding:4px 8px;font-size:12px">
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Over:
+                <input id="sched-days" type="number" value="15" min="1" max="60"
+                  style="width:60px;margin-left:6px;background:#1e293b;border:1px solid #334155;
+                         border-radius:4px;color:#e2e8f0;padding:4px 8px;font-size:12px">
+                <span style="margin-left:4px;color:#64748b">days</span>
+              </label>
+              <button onclick="generateSchedule()"
+                style="background:#22d3ee;color:#0f172a;font-weight:700;border:none;
+                       border-radius:6px;padding:6px 18px;cursor:pointer;font-size:13px">
+                ▶ Distribute
+              </button>
+              <button onclick="copySchedule()"
+                style="background:#1e293b;color:#94a3b8;border:1px solid #334155;
+                       border-radius:6px;padding:6px 14px;cursor:pointer;font-size:12px">
+                📋 Copy
+              </button>
+              <span id="sched-status" style="font-size:12px;color:#64748b"></span>
+            </div>
+          </div>
+
+          <!-- ── Schedule output ── -->
+          <div id="sched-out" style="display:none;margin-bottom:14px"></div>
+
+          <!-- ── Browse / filter pins ── -->
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:14px 18px;margin-bottom:14px">
+            <div class="sub-title" style="margin-bottom:10px">🔍 Browse classified pins</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+              <label style="font-size:12px;color:#94a3b8" title="Filter by original pin creation date (pins.created_at)">Pin created from:
+                <input id="pins-from" type="date" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+              </label>
+              <label style="font-size:12px;color:#94a3b8" title="Filter by original pin creation date (pins.created_at)">to:
+                <input id="pins-to" type="date" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Type:
+                <select id="pins-type" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+                  <option value="">All</option>
+                  <option>Seasonal</option><option>Trend</option><option>Shopping</option>
+                  <option>Lifestyle</option><option>Recipe</option><option>DIY</option><option>Other</option>
+                </select>
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Min score:
+                <input id="pins-minscore" type="number" value="1" min="1" max="10"
+                  style="width:52px;margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Sort:
+                <select id="pins-sort" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+                  <option value="score">Score ↓</option>
+                  <option value="followers">Followers ↓</option>
+                  <option value="repins">Repins ↓</option>
+                  <option value="date">Date ↓</option>
+                  <option value="type">Type</option>
+                </select>
+              </label>
+              <button onclick="loadPins(1)"
+                style="background:#22d3ee;color:#0f172a;font-weight:700;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px">
+                🔍 Load
+              </button>
+            </div>
+            <div id="pins-status" style="font-size:12px;color:#64748b;margin-bottom:6px"></div>
+            <div id="pins-table" style="max-height:480px;overflow-y:auto;border:1px solid #1e293b;border-radius:8px;display:none"></div>
+            <div id="pins-pager" style="display:flex;gap:10px;align-items:center;margin-top:8px;display:none">
+              <button id="pins-prev" onclick="loadPins(_pinsPage-1)"
+                style="background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px">◀ Prev</button>
+              <span id="pins-pageinfo" style="font-size:12px;color:#64748b"></span>
+              <button id="pins-next" onclick="loadPins(_pinsPage+1)"
+                style="background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px">Next ▶</button>
+            </div>
+          </div>
+
+        </div>
+
+        <script>
+        const TYPE_EMOJI = {{Seasonal:"🌸",Trend:"🔥",Shopping:"🛍️",Lifestyle:"✨",Recipe:"🍴",DIY:"🔨",Other:"📌"}};
+        const TYPE_COLOR = {{Seasonal:"#22d3ee",Trend:"#f97316",Shopping:"#a78bfa",Lifestyle:"#4ade80",Recipe:"#fb923c",DIY:"#60a5fa",Other:"#94a3b8"}};
+        let _lastSchedule = null;
+        let _pinsPage = 1, _pinsTotal = 0, _pinsPerPage = 50;
+
+        function _fmt(n) {{
+          if (!n) return "—";
+          if (n >= 1000000) return (n/1000000).toFixed(1)+"M";
+          if (n >= 1000) return (n/1000).toFixed(1)+"k";
+          return n;
+        }}
+
+        // ── persist filter state in URL hash so meta-refresh doesn't wipe it ──
+        function _saveFilters(page) {{
+          const f = {{
+            from:     document.getElementById("pins-from").value,
+            to:       document.getElementById("pins-to").value,
+            type:     document.getElementById("pins-type").value,
+            sort:     document.getElementById("pins-sort").value,
+            minscore: document.getElementById("pins-minscore").value,
+            page:     page || _pinsPage
+          }};
+          history.replaceState(null, "", "#pins=" + encodeURIComponent(JSON.stringify(f)));
+        }}
+
+        function _restoreFilters() {{
+          try {{
+            const hash = location.hash;
+            if (!hash.startsWith("#pins=")) return null;
+            const f = JSON.parse(decodeURIComponent(hash.slice(6)));
+            if (f.from)     document.getElementById("pins-from").value     = f.from;
+            if (f.to)       document.getElementById("pins-to").value       = f.to;
+            if (f.type)     document.getElementById("pins-type").value     = f.type;
+            if (f.sort)     document.getElementById("pins-sort").value     = f.sort;
+            if (f.minscore) document.getElementById("pins-minscore").value = f.minscore;
+            return f.page || 1;
+          }} catch(e) {{ return null; }}
+        }}
+
+        document.addEventListener("DOMContentLoaded", function() {{
+          const page = _restoreFilters();
+          if (page !== null) loadPins(page);
+        }});
+
+        async function loadPins(page) {{
+          page = Math.max(1, page || 1);
+          _pinsPage = page;
+          const from  = document.getElementById("pins-from").value;
+          const to    = document.getElementById("pins-to").value;
+          const type  = document.getElementById("pins-type").value;
+          const sort  = document.getElementById("pins-sort").value;
+          const minscore = document.getElementById("pins-minscore").value || 1;
+          const status = document.getElementById("pins-status");
+          status.textContent = "⏳ Loading…";
+          _saveFilters(page);
+          let url = `/api/pins?page=${{page}}&sort=${{sort}}&minscore=${{minscore}}`;
+          if (from) url += `&from=${{from}}`;
+          if (to)   url += `&to=${{to}}`;
+          if (type) url += `&type=${{encodeURIComponent(type)}}`;
+          try {{
+            const r = await fetch(url);
+            const data = await r.json();
+            if (!data.ok) {{ status.textContent = "⚠ " + (data.error || "error"); return; }}
+            _pinsTotal = data.total;
+            const pages = Math.ceil(data.total / _pinsPerPage) || 1;
+            if (data.total === 0) {{
+              status.textContent = "0 pins found — run python 15_post_planner.py --source mysql to classify pins";
+              document.getElementById("pins-table").style.display = "none";
+              document.getElementById("pins-pager").style.display = "none";
+              return;
+            }}
+            status.textContent = `${{data.total.toLocaleString()}} pins — showing ${{(page-1)*_pinsPerPage+1}}–${{Math.min(page*_pinsPerPage, data.total)}} · "Pin created" = original pin date`;
+            renderPinsTable(data.pins);
+            // pager
+            const pager = document.getElementById("pins-pager");
+            pager.style.display = data.total > _pinsPerPage ? "flex" : "none";
+            document.getElementById("pins-prev").disabled = page <= 1;
+            document.getElementById("pins-next").disabled = page >= pages;
+            document.getElementById("pins-pageinfo").textContent = `Page ${{page}} / ${{pages}}`;
+          }} catch(ex) {{
+            status.textContent = "⚠ " + ex;
+          }}
+        }}
+
+        function renderPinsTable(pins) {{
+          const wrap = document.getElementById("pins-table");
+          wrap.style.display = "";
+          if (!pins.length) {{ wrap.innerHTML = '<p class="muted" style="padding:12px">No pins match.</p>'; return; }}
+          let html = `<table class="mini-table" style="width:100%">
+            <tr>
+              <th>Type</th><th>Category</th><th>Score</th><th>Seasonal</th>
+              <th>Pinner</th><th>Followers</th><th>Reach</th><th>Repins</th>
+              <th>Pin created</th><th>Best days</th><th>Caption</th><th>Pin</th><th>Blog</th>
+            </tr>`;
+          for (const p of pins) {{
+            const em  = TYPE_EMOJI[p.type] || "📌";
+            const col = TYPE_COLOR[p.type]  || "#94a3b8";
+            const sc  = p.score >= 8 ? "#4ade80" : p.score >= 5 ? "#f97316" : "#94a3b8";
+            html += `<tr>
+              <td style="color:${{col}};white-space:nowrap">${{em}} ${{p.type}}</td>
+              <td style="font-size:11px">${{p.category||"—"}}</td>
+              <td style="color:${{sc}};font-weight:700">${{p.score}}/10</td>
+              <td style="font-size:11px;color:#94a3b8">${{p.seasonal||"—"}}</td>
+              <td style="font-size:11px"><a href="https://pinterest.com/${{p.pinner}}/" target="_blank" style="color:#60a5fa">${{p.pinner}}</a></td>
+              <td style="font-size:11px;color:#4ade80">${{_fmt(p.followers)}}</td>
+              <td style="font-size:11px;color:#22d3ee">${{_fmt(p.reach)}}</td>
+              <td style="font-size:11px">${{_fmt(p.repins)}}</td>
+              <td style="font-size:11px;color:#64748b;white-space:nowrap">${{p.created_at||"—"}}</td>
+              <td style="font-size:11px;color:#64748b">${{p.days||"—"}}</td>
+              <td style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.desc||""}}">${{p.desc||"—"}}</td>
+              <td>${{p.pin_url ? `<a href="${{p.pin_url}}" target="_blank" style="color:#a78bfa;font-size:11px">🔗 pin</a>` : "—"}}</td>
+              <td>${{p.blog_url ? `<a href="${{p.blog_url}}" target="_blank" style="color:#f97316;font-size:11px">🌐 blog</a>` : "—"}}</td>
+            </tr>`;
+          }}
+          html += `</table>`;
+          wrap.innerHTML = html;
+        }}
+
+        // ── Schedule ──────────────────────────────────────────────────────────
+        async function generateSchedule() {{
+          const total = document.getElementById("sched-total").value;
+          const days  = document.getElementById("sched-days").value;
+          const status = document.getElementById("sched-status");
+          status.textContent = "⏳ Loading…";
+          try {{
+            const r = await fetch(`/api/schedule?total=${{total}}&days=${{days}}`);
+            const data = await r.json();
+            if (!data.ok) {{ status.textContent = "⚠ " + data.error; return; }}
+            _lastSchedule = data;
+            status.textContent = `✓ ${{data.total}} posts across ${{data.days}} days`;
+            renderSchedule(data);
+          }} catch(ex) {{
+            status.textContent = "⚠ " + ex;
+          }}
+        }}
+
+        function renderSchedule(data) {{
+          const out = document.getElementById("sched-out");
+          out.style.display = "";
+          let html = `<div class="sub-title" style="margin-bottom:8px">Generated schedule — ${{data.total}} posts over ${{data.days}} days</div>`;
+          html += `<div style="max-height:420px;overflow-y:auto;border:1px solid #1e293b;border-radius:8px">`;
+          html += `<table class="mini-table" style="width:100%">`;
+          html += `<tr><th>Day</th><th>Date</th><th>Type</th><th>Category</th><th>Score</th><th>Pinner</th><th>Caption</th><th>Pin</th></tr>`;
+          for (const day of data.schedule) {{
+            for (let i=0; i < day.pins.length; i++) {{
+              const p = day.pins[i];
+              const em = TYPE_EMOJI[p.type] || "📌";
+              const col = TYPE_COLOR[p.type] || "#94a3b8";
+              html += `<tr>`;
+              if (i === 0) html += `<td rowspan="${{day.pins.length}}" style="font-weight:700;color:#60a5fa;white-space:nowrap;vertical-align:top">#${{day.day}}</td><td rowspan="${{day.pins.length}}" style="font-size:11px;color:#94a3b8;white-space:nowrap;vertical-align:top">${{day.date}}</td>`;
+              html += `<td style="color:${{col}}">${{em}} ${{p.type}}</td>`;
+              html += `<td style="font-size:11px">${{p.category}}</td>`;
+              html += `<td style="color:${{p.score>=8?"#4ade80":p.score>=5?"#f97316":"#94a3b8"}}">${{p.score}}/10</td>`;
+              html += `<td style="font-size:11px"><a href="https://pinterest.com/${{p.pinner}}/" target="_blank" style="color:#60a5fa">${{p.pinner}}</a></td>`;
+              html += `<td style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.desc}}">${{p.desc}}</td>`;
+              html += `<td>${{p.url ? `<a href="${{p.url}}" target="_blank" style="color:#a78bfa;font-size:11px">🔗 open</a>` : "—"}}</td>`;
+              html += `</tr>`;
+            }}
+          }}
+          html += `</table></div>`;
+          out.innerHTML = html;
+        }}
+
+        function copySchedule() {{
+          if (!_lastSchedule) {{ alert("Generate a schedule first."); return; }}
+          let txt = "";
+          for (const day of _lastSchedule.schedule) {{
+            txt += `\\n=== Day ${{day.day}} — ${{day.date}} ===\\n`;
+            for (const p of day.pins) {{
+              txt += `[${{p.type}}] ${{p.category}} (${{p.score}}/10) — ${{p.pinner}}\\n`;
+              if (p.desc) txt += `  Caption: ${{p.desc}}\\n`;
+              if (p.url)  txt += `  Pin: ${{p.url}}\\n`;
+            }}
+          }}
+          navigator.clipboard.writeText(txt.trim()).then(() => {{
+            document.getElementById("sched-status").textContent = "✓ Copied to clipboard!";
+          }});
+        }}
+        </script>'''
 
     # ── log panels ─────────────────────────────────────────────────────────────
     def log_panel(key, title, dot_color):
@@ -971,7 +1222,7 @@ def build_page():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="15">
+  <!-- no meta-refresh: live updates via /api/live JS polling -->
   <title>Pinterest Scan — Dashboard</title>
   <style>
     *, *::before, *::after {{ box-sizing:border-box; margin:0; padding:0 }}
@@ -1051,13 +1302,13 @@ def build_page():
 </head>
 <body>
   <h1>🚀 Pinterest Scan — Bot Dashboard</h1>
-  <div class="subtitle">Auto-refreshes every 15 s · <a href="/" style="color:#3b82f6">Refresh now</a></div>
+  <div class="subtitle">Live updates every 15 s · <a href="/" style="color:#3b82f6">Force reload</a></div>
 
   {status_bar}
 
   <div class="rbar">
-    <span>Last updated: <b style="color:#60a5fa">{ts}</b></span>
-    <span class="muted">Data from MySQL + local progress.json + log files</span>
+    <span>Last updated: <b id="last-updated" style="color:#60a5fa">{ts}</b></span>
+    <span class="muted">Data from MySQL + local progress.json + log files · <span id="live-ticker" style="color:#4ade80"></span></span>
   </div>
 
   <div class="grid2">
@@ -1102,15 +1353,275 @@ def build_page():
   {log_panels}
 
   <div style="text-align:center;color:#1e293b;font-size:11px;margin-top:4px">dashboard.py</div>
+
+<script>
+// ── Live polling — updates bot pills + stats without reloading the page ────
+const BOT_KEYS = ["magic_scroll","bot10","bot13","bot14","bot15"];
+const PILL_CLS = {{run:"pill-run", idle:"pill-idle", stop:"pill-stop"}};
+
+let _liveCountdown = 15;
+
+async function _livePoll() {{
+  try {{
+    const r = await fetch("/api/live");
+    const d = await r.json();
+    if (!d.ok) return;
+
+    // timestamp
+    const lu = document.getElementById("last-updated");
+    if (lu) lu.textContent = d.ts || "";
+
+    // bot pills
+    for (const key of BOT_KEYS) {{
+      const el = document.getElementById("bot-" + key);
+      if (!el || !d.bots[key]) continue;
+      const b = d.bots[key];
+      const pill = el.querySelector("span.pill, span[class^=pill], span[class*=' pill']")
+                || el.querySelector("span:not(.sb-name)");
+      if (pill) {{
+        pill.className = "pill " + (PILL_CLS[b.cls] || "pill-stop");
+        pill.textContent = b.txt;
+      }}
+    }}
+
+    // plan counters
+    const pt = document.getElementById("plan-total");
+    if (pt) pt.textContent = (d.plan_total || 0).toLocaleString();
+    const pp = document.getElementById("plan-pending");
+    if (pp) pp.textContent = d.plan_pending ?? "?";
+
+  }} catch(e) {{ /* ignore network errors during poll */ }}
+}}
+
+function _startLiveTicker() {{
+  const tick = document.getElementById("live-ticker");
+  setInterval(async () => {{
+    _liveCountdown--;
+    if (tick) tick.textContent = `next update in ${{_liveCountdown}}s`;
+    if (_liveCountdown <= 0) {{
+      _liveCountdown = 15;
+      if (tick) tick.textContent = "updating…";
+      await _livePoll();
+      if (tick) tick.textContent = "✓ updated";
+      setTimeout(() => {{ if (tick) tick.textContent = ""; }}, 2000);
+    }}
+  }}, 1000);
+}}
+
+document.addEventListener("DOMContentLoaded", _startLiveTicker);
+</script>
+
 </body>
 </html>'''
 
 # ── server ─────────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/favicon.ico":
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/favicon.ico":
             self.send_response(204); self.end_headers(); return
-        if self.path not in ("/", ""):
+
+        # ── /api/schedule?total=N&days=M ──────────────────────────────────────
+        if parsed.path == "/api/schedule":
+            import json as _json
+            qs = parse_qs(parsed.query)
+            total = max(1, min(500, int(qs.get("total", ["45"])[0])))
+            days  = max(1, min(60,  int(qs.get("days",  ["15"])[0])))
+            try:
+                env2 = load_env()
+                import pymysql as _pm
+                conn2 = _pm.connect(
+                    host=env2.get("MYSQL_HOST","72.61.197.144"),
+                    port=int(env2.get("MYSQL_PORT",3306)),
+                    db=env2.get("MYSQL_DB","data_pint"),
+                    user=env2.get("MYSQL_USER","data_pint_user"),
+                    password=env2.get("MYSQL_PASSWORD",""),
+                    charset="utf8mb4", connect_timeout=6,
+                )
+                cur2 = conn2.cursor()
+                cur2.execute("""
+                    SELECT pin_id, pin_url, pinner_username, content_type, category,
+                           description, post_score, seasonal_context, best_posting_days
+                    FROM pin_content_analysis
+                    WHERE post_score >= 5
+                    ORDER BY post_score DESC, content_type
+                    LIMIT %s
+                """, (total * 3,))
+                cols2 = [d[0] for d in cur2.description]
+                all_pins = [dict(zip(cols2, r)) for r in cur2.fetchall()]
+                conn2.close()
+            except Exception as ex:
+                body2 = _json.dumps({"error": str(ex)}).encode()
+                self.send_response(500)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length", str(len(body2)))
+                self.end_headers(); self.wfile.write(body2); return
+
+            # distribute: round-robin content types, capped at total
+            from collections import defaultdict
+            by_type = defaultdict(list)
+            for p in all_pins:
+                by_type[p["content_type"]].append(p)
+            type_order = sorted(by_type.keys(), key=lambda t: -len(by_type[t]))
+            schedule = []   # list of lists (one per day)
+            per_day  = max(1, -(-total // days))  # ceil division
+            pool = []
+            idx_map = {t: 0 for t in type_order}
+            while len(pool) < total:
+                added = 0
+                for t in type_order:
+                    i = idx_map[t]
+                    if i < len(by_type[t]):
+                        pool.append(by_type[t][i])
+                        idx_map[t] += 1
+                        added += 1
+                    if len(pool) >= total:
+                        break
+                if added == 0:
+                    break
+            pool = pool[:total]
+            from datetime import date as _d2, timedelta as _td2
+            today2 = _d2.today()
+            for day_i in range(days):
+                start = day_i * per_day
+                day_pins = pool[start:start + per_day]
+                if not day_pins:
+                    break
+                schedule.append({
+                    "day": day_i + 1,
+                    "date": (today2 + _td2(days=day_i)).strftime("%A, %b %d"),
+                    "pins": [
+                        {"type": p["content_type"], "category": p["category"],
+                         "score": p["post_score"], "url": p["pin_url"] or "",
+                         "pinner": p["pinner_username"] or "",
+                         "desc": (p["description"] or "")[:120]}
+                        for p in day_pins
+                    ]
+                })
+            body2 = _json.dumps({"ok": True, "schedule": schedule,
+                                 "total": len(pool), "days": days}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body2)))
+            self.end_headers(); self.wfile.write(body2); return
+
+        # ── /api/pins?from=&to=&type=&sort=&minscore=&page= ──────────────────
+        if parsed.path == "/api/pins":
+            import json as _json
+            qs = parse_qs(parsed.query)
+            page      = max(1, int(qs.get("page",     ["1"])[0]))
+            per_pg    = 50
+            sort_key  = qs.get("sort",     ["score"])[0]
+            from_dt   = qs.get("from",     [""])[0]
+            to_dt     = qs.get("to",       [""])[0]
+            ftype     = qs.get("type",     [""])[0]
+            minscore  = max(1, min(10, int(qs.get("minscore", ["1"])[0])))
+            order_sql = {
+                "score":     "pca.post_score DESC, pca.scanned_at DESC",
+                "followers": "pi.follower_count DESC, pca.post_score DESC",
+                "repins":    "p.repin_count DESC, pca.post_score DESC",
+                "date":      "pca.scanned_at DESC",
+                "type":      "pca.content_type ASC, pca.post_score DESC",
+            }.get(sort_key, "pca.post_score DESC")
+            where, params = ["pca.post_score >= %s"], [minscore]
+            if from_dt:  where.append("p.created_at >= %s");         params.append(from_dt)
+            if to_dt:    where.append("p.created_at <= %s");          params.append(to_dt + " 23:59:59")
+            if ftype:    where.append("pca.content_type = %s");       params.append(ftype)
+            where_str = " AND ".join(where)
+            try:
+                env3 = load_env()
+                import pymysql as _pm3
+                conn3 = _pm3.connect(
+                    host=env3.get("MYSQL_HOST","72.61.197.144"),
+                    port=int(env3.get("MYSQL_PORT",3306)),
+                    db=env3.get("MYSQL_DB","data_pint"),
+                    user=env3.get("MYSQL_USER","data_pint_user"),
+                    password=env3.get("MYSQL_PASSWORD",""),
+                    charset="utf8mb4", connect_timeout=6,
+                )
+                cur3 = conn3.cursor()
+                cur3.execute(f"""
+                    SELECT COUNT(*)
+                    FROM pin_content_analysis pca
+                    LEFT JOIN pins p ON p.id = pca.pin_id
+                    WHERE {where_str}
+                """, params)
+                total3 = cur3.fetchone()[0]
+                cur3.execute(f"""
+                    SELECT pca.pin_id, pca.pin_url, pca.pinner_username,
+                           pca.content_type, pca.category, pca.description,
+                           pca.post_score, pca.seasonal_context, pca.best_posting_days,
+                           pca.scanned_at,
+                           COALESCE(pi.follower_count,0), COALESCE(pi.profile_reach,0),
+                           COALESCE(p.repin_count,0),     COALESCE(p.link,''),
+                           COALESCE(p.created_at,'')
+                    FROM pin_content_analysis pca
+                    LEFT JOIN pinners pi ON pi.username = pca.pinner_username
+                    LEFT JOIN pins    p  ON p.id        = pca.pin_id
+                    WHERE {where_str}
+                    ORDER BY {order_sql}
+                    LIMIT %s OFFSET %s
+                """, params + [per_pg, (page-1)*per_pg])
+                rows3 = cur3.fetchall()
+                conn3.close()
+                pins3 = [
+                    {"pin_id": r[0], "pin_url": r[1] or "", "pinner": r[2] or "",
+                     "type": r[3] or "Other", "category": r[4] or "",
+                     "desc": (r[5] or "")[:160], "score": r[6] or 0,
+                     "seasonal": r[7] or "", "days": r[8] or "",
+                     "scanned": str(r[9] or "")[:16],
+                     "followers": r[10] or 0, "reach": r[11] or 0,
+                     "repins": r[12] or 0, "blog_url": r[13] or "",
+                     "created_at": str(r[14] or "")[:10]}
+                    for r in rows3
+                ]
+                body3 = _json.dumps({"ok": True, "total": total3,
+                                     "page": page, "per_page": per_pg,
+                                     "pins": pins3}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body3)))
+                self.end_headers(); self.wfile.write(body3); return
+            except Exception as ex3:
+                body3 = _json.dumps({"ok": False, "error": str(ex3)}).encode()
+                self.send_response(500)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length", str(len(body3)))
+                self.end_headers(); self.wfile.write(body3); return
+
+        # ── /api/live — lightweight status poll (no new DB call, reads cache) ──
+        if parsed.path == "/api/live":
+            import json as _json
+            with _lock:
+                mysql2  = dict(_cache.get("mysql", {}))
+                local2  = dict(_cache.get("local_bots", {}))
+                ts2     = _cache.get("ts", "")
+            bot_st2 = mysql2.get("bot_status", {}) if mysql2.get("ok") else {}
+            def _pill_data(key):
+                db_st, db_ex = bot_st2.get(key, ("unknown", None))
+                local_r, local_p = local2.get(key, (False, None))
+                if db_st == "running":   return {"cls": "run",  "txt": "● RUNNING"}
+                if db_st == "idle":      return {"cls": "idle", "txt": f"◑ IDLE ({db_ex}m ago)"}
+                if db_st == "no_logs":
+                    if local_r:          return {"cls": "run",  "txt": f"● RUNNING (pid {local_p})"}
+                    return {"cls": "stop", "txt": "○ STOPPED (restart for DB logs)"}
+                return {"cls": "stop", "txt": "○ STOPPED"}
+            bots2 = {k: _pill_data(k) for k in
+                     ("magic_scroll","bot10","bot13","bot14","bot15")}
+            plan_t2 = mysql2.get("plan_total",   0)  if mysql2.get("ok") else 0
+            plan_p2 = mysql2.get("plan_pending","?") if mysql2.get("ok") else "?"
+            totals2 = mysql2.get("totals", {})        if mysql2.get("ok") else {}
+            body_live = _json.dumps({"ok": True, "ts": ts2, "bots": bots2,
+                                     "plan_total": plan_t2, "plan_pending": plan_p2,
+                                     "totals": totals2}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type","application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body_live)))
+            self.end_headers(); self.wfile.write(body_live); return
+
+        if parsed.path not in ("/", ""):
             self.send_response(404); self.end_headers(); return
         body = build_page().encode("utf-8")
         self.send_response(200)
@@ -1120,11 +1631,37 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *a): pass
 
+def _start_planner():
+    """Launch 15_post_planner.py --source mysql in a background subprocess.
+    Only starts if not already running and MySQL password is configured."""
+    import subprocess, sys as _sys, os as _os
+    env = load_env()
+    if not env.get("MYSQL_PASSWORD"):
+        print("   ⚠ Planner not started — MYSQL_PASSWORD not set in .env")
+        return
+    script = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                           "15_post_planner.py")
+    if not _os.path.exists(script):
+        print("   ⚠ 15_post_planner.py not found — skipping auto-start")
+        return
+    try:
+        proc = subprocess.Popen(
+            [_sys.executable, script, "--source", "mysql"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        print(f"   🤖 Step 15 planner started in background (pid {proc.pid})")
+    except Exception as ex:
+        print(f"   ⚠ Could not start planner: {ex}")
+
+
 if __name__ == "__main__":
     PORT = 8765
     print("⏳ Loading data…")
     refresh_cache()
     threading.Thread(target=bg_refresh, daemon=True).start()
+    _start_planner()
     print(f"\n✅  http://localhost:{PORT}\n")
     print("   Logs are read from MySQL bot_logs table (via db_logger.py).")
     print("   Restart each bot once — after that logs save to MySQL automatically forever.\n")
