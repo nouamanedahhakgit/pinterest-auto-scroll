@@ -690,9 +690,31 @@ def ai_classify(api_key: str, model: str, url: str, title: str, desc: str, body:
         raise
 
 
+# ─── Rate limiter (for --delay) ───────────────────────────────────────────────
+# Lives here so scan_one can call it. The lock serialises entry so only one new
+# task starts per `delay` seconds, regardless of how many workers are running.
+# delay=0 → no-op (default fast mode unchanged).
+_rl_lock   = threading.Lock()
+_rl_last   = [0.0]   # mutable cell — time the last task was allowed through
+
+def _rate_limit(delay: float):
+    if delay <= 0:
+        return
+    with _rl_lock:
+        now  = time.time()
+        wait = _rl_last[0] + delay - now
+        if wait > 0:
+            time.sleep(wait)
+        _rl_last[0] = time.time()
+
+
 # ─── Worker ───────────────────────────────────────────────────────────────────
 
-def scan_one(row: dict, api_key: str, model: str, progress: dict = None, progress_lock=None) -> dict:
+def scan_one(row: dict, api_key: str, model: str, progress: dict = None, progress_lock=None, delay: float = 0.0) -> dict:
+    # Rate-limit here (inside the worker thread) so the submission loop is
+    # instant and as_completed writes results to DB as they finish — not after
+    # all submissions are queued (which would take delay×total_rows seconds).
+    _rate_limit(delay)
     t0 = time.time()
 
     def mark(phase: str):
@@ -844,11 +866,9 @@ def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int,
                 flush_sheet_batch(gsc, cfg, flush_now)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {}
-        for row in rows:
-            futures[ex.submit(scan_one, row, api_key, model, progress, progress_lock)] = row
-            if delay > 0:
-                time.sleep(delay)
+        # Submit all tasks instantly — rate limiting happens INSIDE scan_one
+        # so results are written to DB as they complete, not 11 hours later.
+        futures = {ex.submit(scan_one, row, api_key, model, progress, progress_lock, delay): row for row in rows}
         for fut in as_completed(futures):
             try:
                 handle_result(fut.result())
