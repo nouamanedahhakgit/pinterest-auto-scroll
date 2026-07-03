@@ -356,7 +356,7 @@ def fetch_eligible_rows(gsc, cfg, conn, limit, retry_failed: bool = False) -> li
         last_err = None
         for attempt in range(3):
             try:
-                data = gsc.post_webapp(cfg, {"action": "get_websites"}, timeout=(10, 180))
+                data = gsc.post_webapp(cfg, {"action": "get_websites"}, timeout=(10, 60))
                 last_err = None
                 if data.get("websites"):
                     break

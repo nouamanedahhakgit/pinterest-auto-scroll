@@ -25,13 +25,26 @@ Watchdog flags (before the script command):
     --no-git             disable all git operations
 """
 
-import subprocess, sys, os, re, time, threading
+import subprocess, sys, os, re, time, threading, shutil
 from datetime import datetime
 from collections import defaultdict
 
 BASE        = os.path.dirname(os.path.abspath(__file__))
 REPORT_PATH = os.path.join(BASE, "watchdog_report.txt")
 LOG_PATH    = os.path.join(BASE, "watchdog_run.log")
+
+# Find git once at startup using shutil.which so subprocess can locate it even
+# when the shell PATH differs from the subprocess PATH (common on Windows).
+_GIT_EXE = shutil.which("git") or shutil.which("git.exe")
+if not _GIT_EXE:
+    # Fallback: common Windows install locations
+    for _p in [
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files (x86)\Git\cmd\git.exe",
+    ]:
+        if os.path.exists(_p):
+            _GIT_EXE = _p
+            break
 
 # ─── Known error patterns ─────────────────────────────────────────────────────
 PATTERNS = [
@@ -64,12 +77,21 @@ _BACKOFF  = [30, 60, 120, 300, 600]   # restart delays (last repeats)
 
 def _git(args, timeout=30):
     """Run a git command, return (stdout, stderr, returncode). Never raises."""
+    if not _GIT_EXE:
+        return "", "git not found in PATH", 1
+    # Skip if another git process has the index locked (two watchdog instances
+    # running on the same repo can collide — just skip and retry next poll).
+    lock = os.path.join(BASE, ".git", "index.lock")
+    if os.path.exists(lock):
+        return "", "git locked (another git operation in progress)", 1
     try:
         r = subprocess.run(
-            ["git"] + args, cwd=BASE,
+            [_GIT_EXE] + args, cwd=BASE,
             capture_output=True, text=True, timeout=timeout,
         )
         return r.stdout.strip(), r.stderr.strip(), r.returncode
+    except FileNotFoundError:
+        return "", f"git executable not found ({_GIT_EXE})", 1
     except Exception as e:
         return "", str(e), 1
 
@@ -159,9 +181,13 @@ def run(cmd, max_restarts=20, stuck_minutes=10, git_poll_minutes=3, use_git=True
     git_update_evt = threading.Event()
     proc_ref       = [None]   # mutable cell so threads can access current proc
 
+    if use_git and not _GIT_EXE:
+        print("  ⚠️  git not found in PATH — git sync disabled for this instance.")
+        use_git = False
+
     print(f"  🐕 watchdog | {' '.join(cmd)}")
     print(f"     max-restarts={max_restarts}  stuck={stuck_minutes}min  "
-          f"git-poll={git_poll_minutes}min  git={'on' if use_git else 'off'}")
+          f"git-poll={git_poll_minutes}min  git={'on (' + _GIT_EXE + ')' if use_git else 'off'}")
     print(f"     log    → {LOG_PATH}")
     print(f"     report → {REPORT_PATH}")
     print()
@@ -211,11 +237,17 @@ def run(cmd, max_restarts=20, stuck_minutes=10, git_poll_minutes=3, use_git=True
                     print(summary)
 
             # ── Launch script ─────────────────────────────────────────────────
+            # PYTHONUNBUFFERED=1: force Python to flush stdout after every write.
+            # Without this, output to a pipe is block-buffered (8KB default) and
+            # the watchdog's stuck-detector never sees lines until the buffer fills
+            # — which with --slow (few prints/min) can take the full 10-min window.
+            child_env = dict(os.environ)
+            child_env["PYTHONUNBUFFERED"] = "1"
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                cwd=BASE,
+                cwd=BASE, env=child_env,
             )
             proc_ref[0] = proc
             last_output = [time.time()]
