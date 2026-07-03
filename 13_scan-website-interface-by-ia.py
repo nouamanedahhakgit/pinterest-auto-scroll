@@ -500,8 +500,16 @@ def fetch_homepage(url: str, timeout=(5, 10), hard_deadline: float = 15.0):
         # If no proxy: bypass any accidental env-var proxy so raw-socket ping
         # and this fetch see the same network path.
         _proxies = _SYSTEM_PROXIES if _SYSTEM_PROXIES else {"http": None, "https": None}
-        r = requests.get(target, headers=HEADERS, timeout=timeout, allow_redirects=True,
-                          proxies=_proxies, stream=True)
+        # Cap redirects at 5: the hard-deadline check only fires inside the chunk
+        # loop, AFTER requests.get() returns. If the server chains 30 redirects each
+        # taking up to 15s, the initial GET blocks for 30×15 = 450s before we even
+        # reach the deadline check. max_redirects=5 limits that to 5×15 = 75s max.
+        _sess = requests.Session()
+        _sess.max_redirects = 5
+        r = _sess.get(target, headers=HEADERS, timeout=timeout, allow_redirects=True,
+                      proxies=_proxies, stream=True)
+    except requests.exceptions.TooManyRedirects:
+        return False, "", "Failed (too many redirects)"
     except requests.exceptions.Timeout:
         return False, "", "Failed (timeout)"
     except requests.exceptions.RequestException as e:
