@@ -68,6 +68,8 @@ PATTERNS = [
      "critical", "out of memory — reduce --workers"),
     ("keyboard",     r"KeyboardInterrupt",
      "info",     "stopped manually (Ctrl+C)"),
+    ("stuck_killed",  r"No output for \d+ min — killing stuck process",
+     "error",    "watchdog killed the script for no output — likely heartbeat thread crashed (UnicodeEncodeError on a domain name); code fix needed"),
 ]
 _COMPILED = [(k, re.compile(p, re.I), sev, tip) for k, p, sev, tip in PATTERNS]
 _BACKOFF  = [30, 60, 120, 300, 600]   # restart delays (last repeats)

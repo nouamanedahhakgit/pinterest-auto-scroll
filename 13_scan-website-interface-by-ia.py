@@ -730,7 +730,11 @@ def scan_one(row: dict, api_key: str, model: str, progress: dict = None, progres
         # `progress` dict so the watchdog thread (in run_pass) can print a
         # heartbeat ("still fetching homepage, 12s so far") if this phase
         # runs long — answers "where is it stuck" without guessing.
-        print(f"        ...{domain}: {phase} ({time.time()-t0:.1f}s in)")
+        try:
+            d_safe = domain.encode("ascii", errors="replace").decode("ascii")
+            print(f"        ...{d_safe}: {phase} ({time.time()-t0:.1f}s in)")
+        except Exception:
+            pass
         if progress is not None:
             with progress_lock:
                 progress[domain] = (phase, time.time())
@@ -847,7 +851,13 @@ def run_pass(rows: list, conn, gsc, cfg, api_key: str, model: str, workers: int,
             for d, (phase, started) in snapshot:
                 elapsed = now - started
                 if elapsed >= 5:
-                    print(f"        ...{d}: still {phase} ({elapsed:.0f}s so far, watchdog)")
+                    try:
+                        # Use ascii-safe domain in case of non-cp1252 chars on Windows
+                        # (UnicodeEncodeError here would silently kill this thread)
+                        d_safe = d.encode("ascii", errors="replace").decode("ascii")
+                        print(f"        ...{d_safe}: still {phase} ({elapsed:.0f}s so far, watchdog)")
+                    except Exception:
+                        pass
 
     wd_thread = threading.Thread(target=watchdog, daemon=True)
     wd_thread.start()
