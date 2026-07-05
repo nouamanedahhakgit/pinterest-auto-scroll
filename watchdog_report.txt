@@ -1,0 +1,59 @@
+==============================================================
+  WATCHDOG REPORT — paste to Claude on leno to diagnose
+==============================================================
+Script   : python 14_download_blog_pin_links.py
+Started  : 2026-07-04 20:45:03
+Duration : 9h 17m
+Runs     : 13
+
+--- Detected problems ---
+  unreachable         768x  [warn]
+              → sites unreachable — internet issue; run --retry-failed after connection improves
+  timeout              36x  [warn]
+              → fetch timeouts — slow connection or slow servers
+  mysql_gone            2x  [error]
+              → MySQL disconnected — script reconnects; if repeated, check MySQL server
+
+--- Last 40 output lines before crash ---
+          ...https://reciperunner.com/korean-sloppy-joes-with-sweet-spicy: still fetching assets (34s so far, watchdog)
+          ...https://creativecanning.com/canning-sloppy-joe-filling/: still fetching assets (34s so far, watchdog)
+          ...https://keepitsimpleannasue.com/venison-sloppy-joes-how-to-m: still fetching assets (38s so far, watchdog)
+          ...https://bitejoyco.link/easy-homemade-sloppy-joe-beef-sandwic: still fetching assets (35s so far, watchdog)
+          ...https://jaynerecipes.com/30-minute-garlic-parmesan-chicken-b: still fetching assets (37s so far, watchdog)
+          ...https://homeisvibe.com/irresistible-french-onion-beef-sloppy: still fetching assets (42s so far, watchdog)
+          ...https://recipeword.com/chicken-parmesan-recipe/: still fetching assets (38s so far, watchdog)
+          ...https://www.sharedrecipe.com/healthy-sloppy-joes-for-high-pr: still fetching assets (35s so far, watchdog)
+          ...https://www.sharedrecipe.com/healthy-sloppy-joes-for-high-pr: still fetching assets (42s so far, watchdog)
+          ...https://bellyfull.net/easy-homemade-sloppy-joes/: still fetching assets (43s so far, watchdog)
+          ...https://bunnyswarmoven.net/sloppy-joe-cosmo/: still fetching assets (42s so far, watchdog)
+          ...https://reciperunner.com/korean-sloppy-joes-with-sweet-spicy: still fetching assets (38s so far, watchdog)
+          ...https://creativecanning.com/canning-sloppy-joe-filling/: still fetching assets (38s so far, watchdog)
+          ...https://keepitsimpleannasue.com/venison-sloppy-joes-how-to-m: still fetching assets (42s so far, watchdog)
+          ...https://bitejoyco.link/easy-homemade-sloppy-joe-beef-sandwic: still fetching assets (39s so far, watchdog)
+          ...https://jaynerecipes.com/30-minute-garlic-parmesan-chicken-b: still fetching assets (41s so far, watchdog)
+    [3/13] https://bitejoyco.link/easy-homemade-sloppy-joe-beef-sandwiches-quick-recipe/ -> Done (1 pin(s)) [46.2s]
+    [4/13] https://reciperunner.com/korean-sloppy-joes-with-sweet-spicy-cucumbers/ -> Done (1 pin(s)) [46.7s]
+    [5/13] https://www.sharedrecipe.com/healthy-sloppy-joes-for-high-protein-meal-prep-2 -> Done (1 pin(s)) [46.8s]
+    [6/13] https://recipeword.com/chicken-parmesan-recipe/ -> Done (1 pin(s)) [47.1s]
+    [7/13] https://jaynerecipes.com/30-minute-garlic-parmesan-chicken-bake/ -> Done (1 pin(s)) [47.6s]
+          ...https://homeisvibe.com/irresistible-french-onion-beef-sloppy: still fetching assets (46s so far, watchdog)
+          ...https://www.sharedrecipe.com/healthy-sloppy-joes-for-high-pr: still fetching assets (39s so far, watchdog)
+          ...https://bellyfull.net/easy-homemade-sloppy-joes/: still fetching assets (47s so far, watchdog)
+          ...https://bunnyswarmoven.net/sloppy-joe-cosmo/: still fetching assets (46s so far, watchdog)
+          ...https://creativecanning.com/canning-sloppy-joe-filling/: still fetching assets (42s so far, watchdog)
+          ...https://keepitsimpleannasue.com/venison-sloppy-joes-how-to-m: still fetching assets (46s so far, watchdog)
+    [8/13] https://bunnyswarmoven.net/sloppy-joe-cosmo/ -> Done (1 pin(s)) [48.3s]
+    [9/13] https://homeisvibe.com/irresistible-french-onion-beef-sloppy-joes/ -> Done (1 pin(s)) [48.3s]
+    [10/13] https://keepitsimpleannasue.com/venison-sloppy-joes-how-to-make-this-easy-recipe -> Done (1 pin(s)) [48.3s]
+    [11/13] https://creativecanning.com/canning-sloppy-joe-filling/ -> Done (1 pin(s)) [48.7s]
+    [12/13] https://www.sharedrecipe.com/healthy-sloppy-joes-for-high-protein-meal-prep -> Done (1 pin(s)) [50.8s]
+          ...https://bellyfull.net/easy-homemade-sloppy-joes/: still fetching assets (51s so far, watchdog)
+    [13/13] https://bellyfull.net/easy-homemade-sloppy-joes/ -> Done (1 pin(s)) [53.0s]
+    Pass done: 13 link(s) / 13 pin(s) in 53.7s (avg 4.1s/link, 80 threads in parallel).
+    Idling 10 min before next check... (Ctrl+C to stop)
+    Synced site_type for 16 pinner(s) from scraped_websites (DB-direct, no Sheet).
+    (pins total in MySQL: 759192, blog pinners (site_type on MySQL): 12357, pins under blog pinners: 18793, with a link: 16875, eligible (not yet attempted): 0, unique links to download: 0.)
+    No eligible pins right now in MySQL (no confirmed-blog pinners yet, or all already downloaded/running).
+    Idling 10 min before next check... (Ctrl+C to stop)
+
+==============================================================
