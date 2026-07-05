@@ -660,7 +660,7 @@ def _mysql_execute_retry(mysql_conn, sql, params=None, retries=3, delay=5):
             raise
 
 
-def fetch_eligible_units_mysql(mysql_conn, limit, retry_failed: bool) -> list:
+def fetch_eligible_units_mysql(mysql_conn, limit, retry_failed: bool, pin_id: str = "") -> list:
     """Same shape/diagnostics as fetch_eligible_units() but reads from MySQL
     directly — a plain JOIN against pinners.site_type (kept fresh every pass
     by sync_site_types_mysql, called right before this in main()), so no
@@ -670,6 +670,24 @@ def fetch_eligible_units_mysql(mysql_conn, limit, retry_failed: bool) -> list:
     lock — a crashed run can leave some pins stuck at 'Running'; rerun with
     --retry-failed to sweep those back up)."""
     cur = mysql_conn.cursor()
+    if pin_id:
+        cur.execute("SELECT id, link FROM pins WHERE id=%s AND link IS NOT NULL AND link <> ''", (pin_id,))
+        row = cur.fetchone()
+        if not row:
+            print(f"  Pin {pin_id} has no outbound link to download.")
+            cur.close()
+            return []
+        try:
+            _mysql_execute_retry(
+                mysql_conn,
+                "UPDATE pins SET link_download_status='Running' WHERE id=%s",
+                (pin_id,),
+            )
+        except Exception as e:
+            print(f"  (warning: couldn't mark pin {pin_id} Running — {e})")
+        cur.close()
+        return [{"link": (row[1] or "").strip(), "pin_ids": [row[0]]}]
+
     cur.execute("SELECT COUNT(*) FROM pins")
     total_pins = cur.fetchone()[0]
 
@@ -1019,6 +1037,7 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="cap unique links downloaded this run (testing)")
     ap.add_argument("--retry-failed", action="store_true", help="also re-attempt pins with a Failed/Blocked/Running status, not just untried ones")
     ap.add_argument("--dry-run", action="store_true", help="download + print only, write nothing")
+    ap.add_argument("--pin-id", default="", help="download one exact pin id, bypassing the bulk blog-pinner filter")
     ap.add_argument("--source", choices=["auto", "mysql", "sqlite"], default="mysql",
                      help="pin source: 'mysql' (default) = shared cloud DB (every PC's pins+pinners, "
                           "see 8_sync_to_mysql.py) — exits if .env's MYSQL_PASSWORD isn't configured/reachable, "
@@ -1059,7 +1078,7 @@ def main():
                 print(f"  Synced site_type for {updated} pinner(s) from scraped_websites (DB-direct, no Sheet).")
             else:
                 print(f"  site_type sync from DB: 0 new updates (all pinners already up to date).")
-            units = fetch_eligible_units_mysql(mysql_conn, args.limit, args.retry_failed)
+            units = fetch_eligible_units_mysql(mysql_conn, args.limit, args.retry_failed, args.pin_id)
             if units:
                 write_fn = lambda pin_ids, status, h, c, j: write_unit_result_mysql(mysql_conn, pin_ids, status, h, c, j)
                 run_pass(units, write_fn, args.workers, args.dry_run)

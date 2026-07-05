@@ -16,6 +16,7 @@ Run:
     python 15_post_planner.py --once         # single pass then exit
     python 15_post_planner.py --workers 10   # parallel AI threads (default 10)
     python 15_post_planner.py --limit 100    # cap this pass to N pins
+    python 15_post_planner.py --from 2025-07-01 --to 2025-12-12 --created-only --once
     python 15_post_planner.py --dry-run      # classify+print, no DB writes
     python 15_post_planner.py --schedule     # print 15-day calendar, no new scanning
     python 15_post_planner.py --source mysql
@@ -105,6 +106,19 @@ CREATE TABLE IF NOT EXISTS pin_content_analysis (
     post_score        INTEGER DEFAULT 0,
     seasonal_context  TEXT,
     best_posting_days TEXT,
+    content_type_generated_by_ia_scan TEXT,
+    category_generated_by_ia_scan TEXT,
+    description_generated_by_ia_scan TEXT,
+    post_score_generated_by_ia_scan INTEGER DEFAULT 0,
+    seasonal_context_generated_by_ia_scan TEXT,
+    best_posting_days_generated_by_ia_scan TEXT,
+    posting_window_generated_by_ia_scan TEXT,
+    keywords_generated_by_ia_scan TEXT,
+    hook_generated_by_ia_scan TEXT,
+    caption_generated_by_ia_scan TEXT,
+    target_audience_generated_by_ia_scan TEXT,
+    monetization_angle_generated_by_ia_scan TEXT,
+    content_json_generated_by_ia_scan TEXT,
     scanned_at        DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 """
@@ -120,18 +134,88 @@ CREATE TABLE IF NOT EXISTS pin_content_analysis (
     post_score        TINYINT DEFAULT 0,
     seasonal_context  VARCHAR(200),
     best_posting_days VARCHAR(100),
+    content_type_generated_by_ia_scan VARCHAR(50),
+    category_generated_by_ia_scan VARCHAR(100),
+    description_generated_by_ia_scan TEXT,
+    post_score_generated_by_ia_scan TINYINT DEFAULT 0,
+    seasonal_context_generated_by_ia_scan VARCHAR(200),
+    best_posting_days_generated_by_ia_scan VARCHAR(100),
+    posting_window_generated_by_ia_scan VARCHAR(255),
+    keywords_generated_by_ia_scan TEXT,
+    hook_generated_by_ia_scan VARCHAR(255),
+    caption_generated_by_ia_scan TEXT,
+    target_audience_generated_by_ia_scan VARCHAR(255),
+    monetization_angle_generated_by_ia_scan VARCHAR(100),
+    content_json_generated_by_ia_scan JSON,
     scanned_at        DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     INDEX idx_type    (content_type),
     INDEX idx_score   (post_score)
 ) CHARACTER SET utf8mb4
 """
 
+EXTRA_SQLITE_COLUMNS = {
+    "content_type_generated_by_ia_scan": "TEXT",
+    "category_generated_by_ia_scan": "TEXT",
+    "description_generated_by_ia_scan": "TEXT",
+    "post_score_generated_by_ia_scan": "INTEGER DEFAULT 0",
+    "seasonal_context_generated_by_ia_scan": "TEXT",
+    "best_posting_days_generated_by_ia_scan": "TEXT",
+    "posting_window_generated_by_ia_scan": "TEXT",
+    "keywords_generated_by_ia_scan": "TEXT",
+    "hook_generated_by_ia_scan": "TEXT",
+    "caption_generated_by_ia_scan": "TEXT",
+    "target_audience_generated_by_ia_scan": "TEXT",
+    "monetization_angle_generated_by_ia_scan": "TEXT",
+    "content_json_generated_by_ia_scan": "TEXT",
+}
+
+EXTRA_MYSQL_COLUMNS = {
+    "content_type_generated_by_ia_scan": "VARCHAR(50)",
+    "category_generated_by_ia_scan": "VARCHAR(100)",
+    "description_generated_by_ia_scan": "TEXT",
+    "post_score_generated_by_ia_scan": "TINYINT DEFAULT 0",
+    "seasonal_context_generated_by_ia_scan": "VARCHAR(200)",
+    "best_posting_days_generated_by_ia_scan": "VARCHAR(100)",
+    "posting_window_generated_by_ia_scan": "VARCHAR(255)",
+    "keywords_generated_by_ia_scan": "TEXT",
+    "hook_generated_by_ia_scan": "VARCHAR(255)",
+    "caption_generated_by_ia_scan": "TEXT",
+    "target_audience_generated_by_ia_scan": "VARCHAR(255)",
+    "monetization_angle_generated_by_ia_scan": "VARCHAR(100)",
+    "content_json_generated_by_ia_scan": "JSON",
+}
+
 def _ensure_table_sqlite(con):
     con.execute(CREATE_SQLITE)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(pin_content_analysis)").fetchall()}
+    for name, sql_type in EXTRA_SQLITE_COLUMNS.items():
+        if name not in cols:
+            con.execute(f"ALTER TABLE pin_content_analysis ADD COLUMN {name} {sql_type}")
     con.commit()
 
 def _ensure_table_mysql(conn):
-    conn.cursor().execute(CREATE_MYSQL)
+    cur = conn.cursor()
+    cur.execute(CREATE_MYSQL)
+    cur.execute("""
+        SELECT COLUMN_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'pin_content_analysis'
+    """)
+    cols = {r[0] for r in cur.fetchall()}
+    for name, sql_type in EXTRA_MYSQL_COLUMNS.items():
+        if name not in cols:
+            cur.execute(f"ALTER TABLE pin_content_analysis ADD COLUMN {name} {sql_type}")
+
+def _mysql_pin_created_expr(alias: str = "p") -> str:
+    return (
+        f"COALESCE("
+        f"STR_TO_DATE({alias}.created_at, '%%a, %%d %%b %%Y %%H:%%i:%%s +0000'),"
+        f"STR_TO_DATE({alias}.created_at, '%%Y-%%m-%%dT%%H:%%i:%%s.%%fZ'),"
+        f"STR_TO_DATE({alias}.created_at, '%%Y-%%m-%%d %%H:%%i:%%s'),"
+        f"STR_TO_DATE({alias}.created_at, '%%Y-%%m-%%d')"
+        f")"
+    )
 
 # ─── HTML → clean text ────────────────────────────────────────────────────────
 def _extract_text_from_html(html: str) -> tuple[str, str, str]:
@@ -165,6 +249,36 @@ def _extract_text_from_html(html: str) -> tuple[str, str, str]:
 
 # ─── AI classification ────────────────────────────────────────────────────────
 _CONTENT_TYPES = ["Seasonal", "Trend", "Shopping", "Lifestyle", "Recipe", "DIY", "Other"]
+
+def _as_text(value, max_len: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    return str(value)[:max_len]
+
+def _as_csv(value, max_len: int = 1000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = ", ".join(str(v) for v in value if str(v).strip())
+    return str(value)[:max_len]
+
+def _prior_json_examples_text(pin: dict, limit: int = 3) -> str:
+    examples = pin.get("prior_json_examples") or []
+    if not examples:
+        return ""
+    compact = []
+    for ex in examples[:limit]:
+        try:
+            if isinstance(ex, str):
+                obj = json.loads(ex)
+            else:
+                obj = ex
+            compact.append(obj)
+        except Exception:
+            compact.append(str(ex)[:1000])
+    return json.dumps(compact, ensure_ascii=False)[:6000]
 
 def _ask_ai(pin: dict) -> dict | None:
     """
@@ -201,7 +315,7 @@ def _ask_ai(pin: dict) -> dict | None:
         '  "category": "1-3 word theme (e.g. Summer Fashion, Home Decor)",\n'
         '  "description": "1-2 sentence social media caption for this pin",\n'
         '  "post_score": <int 1-10, relevance for posting in the schedule window>,\n'
-        '  "seasonal_context": "season/holiday/occasion or empty string",\n'
+        '  "seasonal_context": "season/holiday/occasion, or evergreen if not seasonal",\n'
         '  "best_posting_days": [<day numbers 1-15 best suited, up to 5>]\n'
         "}\n\n"
         f"Posting window: {schedule_window}. "
@@ -209,6 +323,45 @@ def _ask_ai(pin: dict) -> dict | None:
         "Score 7-8 = good fit for this window. "
         "Score 5-6 = neutral/evergreen. "
         "Score 1-4 = not relevant for this window."
+    )
+
+    system += (
+        "\n\nAdditional required fields for the same JSON object:\n"
+        '  "posting_window": {"start": "YYYY-MM-DD or empty", "end": "YYYY-MM-DD or empty", "peak_start": "YYYY-MM-DD or empty", "peak_end": "YYYY-MM-DD or empty", "reason": ""},\n'
+        '  "keywords": ["Pinterest SEO keyword"],\n'
+        '  "hook": "short high-click hook",\n'
+        '  "caption": "optimized Pinterest caption",\n'
+        '  "target_audience": "who should see this",\n'
+        '  "monetization_angle": "recipe traffic|affiliate|email signup|product|ad traffic|none",\n'
+        '  "content_angle": "beginner tutorial|holiday idea|quick dinner|gift idea|etc",\n'
+        '  "evergreen_score": <int 1-10>,\n'
+        '  "seasonal_score": <int 1-10>,\n'
+        '  "competition_level": "low|medium|high",\n'
+        '  "source_content_type": "recipe|travel|job|career|how_to|listicle|product|fashion|beauty|home|finance|health|fitness|parenting|education|business|technology|diy|craft|news|entertainment|other",\n'
+        '  "structured_content": {\n'
+        '    "detected_niche": "",\n'
+        '    "content_format": "recipe|guide|listicle|review|comparison|tutorial|itinerary|job_post|career_advice|product_page|outfit|news|story|other",\n'
+        '    "title": "", "summary": "",\n'
+        '    "main_entities": [],\n'
+        '    "key_points": [],\n'
+        '    "facts_to_preserve": [],\n'
+        '    "warnings_or_constraints": [],\n'
+        '    "source_sections": [{"heading": "", "points": []}],\n'
+        '    "type_specific": {},\n'
+        '    "rewrite_brief": {"suggested_title": "", "meta_description": "", "slug": "", "tone": "", "unique_angle": "", "search_intent": "", "recommended_word_count": ""}\n'
+        "  }\n"
+        "Dynamic type_specific examples: "
+        "Recipe: ingredients, instructions, prep_time, cook_time, servings, equipment, nutrition, tips, substitutions, storage. "
+        "Travel: destination, itinerary, attractions, costs, best_time_to_visit, transportation, lodging, map_points, safety_tips, packing_list. "
+        "Job/Career: job_title, company, location, salary, requirements, responsibilities, skills, application_steps, deadlines, remote_policy. "
+        "Product/Shopping: product_name, brand, price, features, pros, cons, use_cases, alternatives, buying_guide, affiliate_angle. "
+        "Fashion/Beauty: outfit_items, colors, occasion, body_fit_notes, styling_steps, products_used, seasonal_fit. "
+        "Finance/Business: topic, strategy_steps, risks, numbers_to_preserve, tools, examples, compliance_notes. "
+        "DIY/Craft/Home: materials, tools, steps, measurements, difficulty, time_required, safety_notes. "
+        "Never leave seasonal_context empty: use a season/holiday/occasion when relevant, otherwise use evergreen. "
+        "For seasonal content, always fill posting_window with the best period to publish before or around the event. "
+        "The structured_content.type_specific object must adapt to the actual post. Do not force recipe fields onto non-recipe posts. "
+        "Extract structured_content from the destination page, not only from the Pinterest caption."
     )
 
     user_parts = [
@@ -222,6 +375,14 @@ def _ask_ai(pin: dict) -> dict | None:
     if blog_body:    user_parts.append(f"Blog post content:\n{blog_body}")
     if css_snippet:  user_parts.append(f"CSS snippet: {css_snippet}")
     if js_snippet:   user_parts.append(f"JS snippet: {js_snippet}")
+    prior_examples = _prior_json_examples_text(pin)
+    if prior_examples:
+        user_parts.append(
+            "Previous similar generated JSON examples from this database:\n"
+            f"{prior_examples}\n"
+            "Use these examples only as schema/style guidance when relevant. "
+            "If this post is a different niche or needs a better structure, create the best dynamic structure for this post."
+        )
 
     try:
         resp = requests.post(
@@ -236,7 +397,7 @@ def _ask_ai(pin: dict) -> dict | None:
                     {"role": "system", "content": system},
                     {"role": "user",   "content": "\n".join(user_parts)},
                 ],
-                "max_tokens": 300,
+                "max_tokens": 1800,
                 "temperature": 0.2,
             },
             timeout=30,
@@ -255,13 +416,46 @@ def _ask_ai(pin: dict) -> dict | None:
             days = [int(d) for d in days if isinstance(d, (int, float)) and 1 <= int(d) <= DAYS_AHEAD]
         else:
             days = []
+        post_score = max(1, min(10, int(data.get("post_score", 5))))
+        posting_window = data.get("posting_window") if isinstance(data.get("posting_window"), dict) else {}
+        structured_content = data.get("structured_content") if isinstance(data.get("structured_content"), dict) else {}
+        seasonal_context = _as_text(data.get("seasonal_context", ""), 200).strip() or "evergreen"
+        full_generated = {
+            "schema_version": "dynamic_ia_scan_v2",
+            "schema_mode": "dynamic_by_detected_niche",
+            "content_type": ct,
+            "category": data.get("category", ""),
+            "description": data.get("description", ""),
+            "post_score": post_score,
+            "seasonal_context": seasonal_context,
+            "best_posting_days": sorted(set(days)),
+            "posting_window": posting_window,
+            "keywords": data.get("keywords", []),
+            "hook": data.get("hook", ""),
+            "caption": data.get("caption", ""),
+            "target_audience": data.get("target_audience", ""),
+            "monetization_angle": data.get("monetization_angle", ""),
+            "content_angle": data.get("content_angle", ""),
+            "evergreen_score": data.get("evergreen_score", ""),
+            "seasonal_score": data.get("seasonal_score", ""),
+            "competition_level": data.get("competition_level", ""),
+            "source_content_type": data.get("source_content_type", ""),
+            "structured_content": structured_content,
+        }
         return {
             "content_type":     ct,
             "category":         str(data.get("category", ""))[:100],
             "description":      str(data.get("description", ""))[:500],
-            "post_score":       max(1, min(10, int(data.get("post_score", 5)))),
-            "seasonal_context": str(data.get("seasonal_context", ""))[:200],
+            "post_score":       post_score,
+            "seasonal_context": seasonal_context,
             "best_posting_days": ",".join(str(d) for d in sorted(set(days))),
+            "posting_window":    _as_text(posting_window, 255),
+            "keywords":          _as_csv(data.get("keywords", []), 2000),
+            "hook":              _as_text(data.get("hook", ""), 255),
+            "caption":           _as_text(data.get("caption", ""), 2000),
+            "target_audience":   _as_text(data.get("target_audience", ""), 255),
+            "monetization_angle": _as_text(data.get("monetization_angle", ""), 100),
+            "content_json":      json.dumps(full_generated, ensure_ascii=False),
         }
     except Exception as e:
         print(f"[ai] error: {e}")
@@ -302,8 +496,15 @@ def _save_result_sqlite(pin_id: str, pin: dict, result: dict, dry_run: bool):
         INSERT OR REPLACE INTO pin_content_analysis
         (pin_id, pin_url, pinner_username, board_name,
          content_type, category, description, post_score,
-         seasonal_context, best_posting_days)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+         seasonal_context, best_posting_days,
+         content_type_generated_by_ia_scan, category_generated_by_ia_scan,
+         description_generated_by_ia_scan, post_score_generated_by_ia_scan,
+         seasonal_context_generated_by_ia_scan, best_posting_days_generated_by_ia_scan,
+         posting_window_generated_by_ia_scan, keywords_generated_by_ia_scan,
+         hook_generated_by_ia_scan, caption_generated_by_ia_scan,
+         target_audience_generated_by_ia_scan, monetization_angle_generated_by_ia_scan,
+         content_json_generated_by_ia_scan)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         pin_id,
         pin.get("pin_url", ""),
@@ -315,27 +516,75 @@ def _save_result_sqlite(pin_id: str, pin: dict, result: dict, dry_run: bool):
         result["post_score"],
         result["seasonal_context"],
         result["best_posting_days"],
+        result["content_type"],
+        result["category"],
+        result["description"],
+        result["post_score"],
+        result["seasonal_context"],
+        result["best_posting_days"],
+        result.get("posting_window", ""),
+        result.get("keywords", ""),
+        result.get("hook", ""),
+        result.get("caption", ""),
+        result.get("target_audience", ""),
+        result.get("monetization_angle", ""),
+        result.get("content_json", ""),
     ))
     con.commit()
     con.close()
 
 # ─── MySQL path ────────────────────────────────────────────────────────────────
-def _fetch_eligible_mysql(limit: int) -> list[dict]:
+def _fetch_eligible_mysql(
+    limit: int,
+    from_dt: str = "",
+    to_dt: str = "",
+    created_only: bool = False,
+    site_type: str = "",
+    pin_id: str = "",
+    force: bool = False,
+) -> list[dict]:
     conn = _get_mysql()
     if not conn:
         return []
     _ensure_table_mysql(conn)
+    created_expr = _mysql_pin_created_expr("p")
+    where = [
+        "p.link_download_status = 'Done'",
+        "p.link_html IS NOT NULL AND p.link_html != ''",
+    ]
+    if not force:
+        where.append("p.id NOT IN (SELECT pin_id FROM pin_content_analysis)")
+    params: list = []
+    if created_only:
+        where.append("p.pin_type = 'created'")
+    if pin_id:
+        where.append("p.id = %s")
+        params.append(pin_id)
+    if from_dt:
+        where.append(f"{created_expr} >= %s")
+        params.append(from_dt)
+    if to_dt:
+        where.append(f"{created_expr} <= %s")
+        params.append(to_dt + " 23:59:59")
+    join_sql = ""
+    if site_type:
+        join_sql = "LEFT JOIN pinners pi ON pi.username = p.pinner_username"
+        if site_type == "blank":
+            where.append("(pi.site_type IS NULL OR pi.site_type = '')")
+        else:
+            where.append("pi.site_type = %s")
+            params.append(site_type)
+    where_sql = " AND ".join(where)
     cur = conn.cursor()
     cur.execute(f"""
         SELECT p.id, p.pin_url, p.title, p.description, p.pinner_username,
                p.board_name, p.link, p.link_html, p.link_css, p.link_js
         FROM   pins p
-        WHERE  p.link_download_status = 'Done'
-          AND  p.link_html IS NOT NULL AND p.link_html != ''
-          AND  p.id NOT IN (SELECT pin_id FROM pin_content_analysis)
-        ORDER  BY p.id DESC
+        {join_sql}
+        WHERE  {where_sql}
+        ORDER  BY {created_expr} DESC, p.id DESC
         LIMIT  %s
-    """, (int(limit),))
+    """, params + [int(limit)])
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
@@ -349,8 +598,15 @@ def _save_result_mysql(pin_id: str, pin: dict, result: dict, dry_run: bool):
         INSERT INTO pin_content_analysis
         (pin_id, pin_url, pinner_username, board_name,
          content_type, category, description, post_score,
-         seasonal_context, best_posting_days)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+         seasonal_context, best_posting_days,
+         content_type_generated_by_ia_scan, category_generated_by_ia_scan,
+         description_generated_by_ia_scan, post_score_generated_by_ia_scan,
+         seasonal_context_generated_by_ia_scan, best_posting_days_generated_by_ia_scan,
+         posting_window_generated_by_ia_scan, keywords_generated_by_ia_scan,
+         hook_generated_by_ia_scan, caption_generated_by_ia_scan,
+         target_audience_generated_by_ia_scan, monetization_angle_generated_by_ia_scan,
+         content_json_generated_by_ia_scan)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE
             content_type=VALUES(content_type),
             category=VALUES(category),
@@ -358,6 +614,19 @@ def _save_result_mysql(pin_id: str, pin: dict, result: dict, dry_run: bool):
             post_score=VALUES(post_score),
             seasonal_context=VALUES(seasonal_context),
             best_posting_days=VALUES(best_posting_days),
+            content_type_generated_by_ia_scan=VALUES(content_type_generated_by_ia_scan),
+            category_generated_by_ia_scan=VALUES(category_generated_by_ia_scan),
+            description_generated_by_ia_scan=VALUES(description_generated_by_ia_scan),
+            post_score_generated_by_ia_scan=VALUES(post_score_generated_by_ia_scan),
+            seasonal_context_generated_by_ia_scan=VALUES(seasonal_context_generated_by_ia_scan),
+            best_posting_days_generated_by_ia_scan=VALUES(best_posting_days_generated_by_ia_scan),
+            posting_window_generated_by_ia_scan=VALUES(posting_window_generated_by_ia_scan),
+            keywords_generated_by_ia_scan=VALUES(keywords_generated_by_ia_scan),
+            hook_generated_by_ia_scan=VALUES(hook_generated_by_ia_scan),
+            caption_generated_by_ia_scan=VALUES(caption_generated_by_ia_scan),
+            target_audience_generated_by_ia_scan=VALUES(target_audience_generated_by_ia_scan),
+            monetization_angle_generated_by_ia_scan=VALUES(monetization_angle_generated_by_ia_scan),
+            content_json_generated_by_ia_scan=VALUES(content_json_generated_by_ia_scan),
             scanned_at=CURRENT_TIMESTAMP(3)
     """, (
         pin_id,
@@ -370,9 +639,62 @@ def _save_result_mysql(pin_id: str, pin: dict, result: dict, dry_run: bool):
         result["post_score"],
         result["seasonal_context"],
         result["best_posting_days"],
+        result["content_type"],
+        result["category"],
+        result["description"],
+        result["post_score"],
+        result["seasonal_context"],
+        result["best_posting_days"],
+        result.get("posting_window", ""),
+        result.get("keywords", ""),
+        result.get("hook", ""),
+        result.get("caption", ""),
+        result.get("target_audience", ""),
+        result.get("monetization_angle", ""),
+        result.get("content_json", ""),
     ))
 
 # ─── Schedule builder ─────────────────────────────────────────────────────────
+def _attach_prior_json_examples_mysql(pins: list[dict], limit_per_pin: int = 3) -> None:
+    if not pins:
+        return
+    conn = _get_mysql()
+    if not conn:
+        return
+    _ensure_table_mysql(conn)
+    cur = conn.cursor()
+    for pin in pins:
+        pinner = (pin.get("pinner_username") or "").strip()
+        board = (pin.get("board_name") or "").strip()
+        pin_id = str(pin.get("id", "") or "")
+        where = [
+            "content_json_generated_by_ia_scan IS NOT NULL",
+            "content_json_generated_by_ia_scan <> ''",
+        ]
+        params: list = []
+        if pin_id:
+            where.append("pin_id <> %s")
+            params.append(pin_id)
+        similar = []
+        if pinner:
+            similar.append("pinner_username = %s")
+            params.append(pinner)
+        if board:
+            similar.append("board_name = %s")
+            params.append(board)
+        if not similar:
+            pin["prior_json_examples"] = []
+            continue
+        where.append("(" + " OR ".join(similar) + ")")
+        cur.execute(f"""
+            SELECT content_json_generated_by_ia_scan
+            FROM pin_content_analysis
+            WHERE {" AND ".join(where)}
+            ORDER BY scanned_at DESC
+            LIMIT %s
+        """, params + [limit_per_pin])
+        pin["prior_json_examples"] = [r[0] for r in cur.fetchall() if r and r[0]]
+
 _TYPE_EMOJI = {
     "Seasonal":  "🌸",
     "Trend":     "🔥",
@@ -448,16 +770,49 @@ def _print_schedule(source: str):
 # ─── Main scan pass ────────────────────────────────────────────────────────────
 _write_lock = threading.Lock()
 
-def _run_pass(source: str, limit: int, workers: int, dry_run: bool) -> int:
+def _run_pass(
+    source: str,
+    limit: int,
+    workers: int,
+    dry_run: bool,
+    from_dt: str = "",
+    to_dt: str = "",
+    created_only: bool = False,
+    site_type: str = "",
+    pin_id: str = "",
+    force: bool = False,
+) -> int:
     if source == "mysql":
-        pins = _fetch_eligible_mysql(limit)
+        pins = _fetch_eligible_mysql(limit, from_dt, to_dt, created_only, site_type, pin_id, force)
+        _attach_prior_json_examples_mysql(pins)
     else:
+        if from_dt or to_dt or created_only:
+            print("[planner] date range / --created-only filters are only supported for --source mysql")
         pins = _fetch_eligible_sqlite(limit)
 
     if not pins:
         return 0
 
-    print(f"[planner] {len(pins)} pins to classify (source={source})")
+    extra = ""
+    if from_dt or to_dt:
+        extra += f", date={from_dt or '...'} to {to_dt or '...'}"
+    if created_only:
+        extra += ", created-only"
+    if site_type:
+        extra += f", site={site_type}"
+    if pin_id:
+        extra += f", pin_id={pin_id}"
+    if force:
+        extra += ", force"
+    print(f"[planner] {len(pins)} pins to classify (source={source}{extra})")
+    for pin in pins:
+        html_len = len(pin.get("link_html") or "")
+        css_len = len(pin.get("link_css") or "")
+        js_len = len(pin.get("link_js") or "")
+        print(
+            f"[planner] pin {pin.get('id')} Step 14 content: "
+            f"html={html_len:,} chars, css={css_len:,} chars, js={js_len:,} chars"
+        )
     done = 0
 
     def handle(pin: dict):
@@ -475,7 +830,8 @@ def _run_pass(source: str, limit: int, workers: int, dry_run: bool) -> int:
                 done += 1
             emoji = _TYPE_EMOJI.get(result["content_type"], "📌")
             label = f"[{result['content_type']}] [{result['category']}] score={result['post_score']}"
-            print(f"  {emoji} {pin.get('pinner_username','?')} | {label} | {elapsed:.1f}s"
+            prior_count = len(pin.get("prior_json_examples") or [])
+            print(f"  {emoji} {pin.get('pinner_username','?')} | {label} | prior_json_examples={prior_count} | {elapsed:.1f}s"
                   + (" (dry)" if dry_run else ""))
         else:
             print(f"  ✗ {pin.get('pinner_username','?')} — AI failed ({elapsed:.1f}s)")
@@ -500,6 +856,13 @@ def main():
     ap.add_argument("--dry-run",  action="store_true")
     ap.add_argument("--schedule", action="store_true", help="Print 15-day calendar and exit")
     ap.add_argument("--poll-minutes", type=int, default=POLL_MINUTES)
+    ap.add_argument("--from", dest="from_dt", default="", help="Only classify pins created on/after YYYY-MM-DD (MySQL)")
+    ap.add_argument("--to", dest="to_dt", default="", help="Only classify pins created on/before YYYY-MM-DD (MySQL)")
+    ap.add_argument("--created-only", action="store_true", help="Only classify pins with pin_type='created' (MySQL)")
+    ap.add_argument("--site-type", default="", help="Only classify pinners with this pinners.site_type value; use blank for empty site_type (MySQL)")
+    ap.add_argument("--pin-id", default="", help="Only classify one pin id (MySQL)")
+    ap.add_argument("--force", action="store_true", help="Re-scan pins even if they already exist in pin_content_analysis")
+    ap.add_argument("--no-calendar", action="store_true", help="Do not print the global 15-day schedule after scanning")
     args = ap.parse_args()
 
     # Resolve source
@@ -519,10 +882,21 @@ def main():
     while True:
         pass_num += 1
         print(f"\n[planner] ── Pass #{pass_num} ── {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        classified = _run_pass(source, args.limit, args.workers, args.dry_run)
+        classified = _run_pass(
+            source,
+            args.limit,
+            args.workers,
+            args.dry_run,
+            args.from_dt,
+            args.to_dt,
+            args.created_only,
+            args.site_type,
+            args.pin_id,
+            args.force,
+        )
         print(f"[planner] Pass #{pass_num} done — {classified} pins classified")
 
-        if classified > 0:
+        if classified > 0 and not args.no_calendar:
             _print_schedule(source)
 
         if args.once:

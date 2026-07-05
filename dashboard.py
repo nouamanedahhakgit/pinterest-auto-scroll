@@ -12,6 +12,7 @@ import html as _html
 import json
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime
@@ -29,7 +30,10 @@ BOT_SCRIPTS = {
     "bot10":        "10_domain_quick_scrape_api.py",
     "bot13":        "13_scan-website-interface-by-ia.py",
     "bot14":        "14_download_blog_pin_links.py",
+    "bot15":        "15_post_planner.py",
 }
+
+_scan_jobs = {}
 
 # ── load .env ──────────────────────────────────────────────────────────────────
 def load_env():
@@ -967,8 +971,40 @@ def build_page():
                 </select>
               </label>
               <label style="font-size:12px;color:#94a3b8">Min score:
-                <input id="pins-minscore" type="number" value="1" min="1" max="10"
+                <input id="pins-minscore" type="number" value="0" min="0" max="10"
                   style="width:52px;margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Status:
+                <select id="pins-status-filter" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+                  <option value="all">All created</option>
+                  <option value="with_link">With link</option>
+                  <option value="classified">Classified</option>
+                  <option value="unclassified">Unclassified ready</option>
+                  <option value="ready">All ready</option>
+                  <option value="not_downloaded">Not downloaded</option>
+                  <option value="failed">Download failed</option>
+                </select>
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Link:
+                <select id="pins-link-filter" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+                  <option value="">All</option>
+                  <option value="with">Has link</option>
+                  <option value="without">No link</option>
+                </select>
+              </label>
+              <label style="font-size:12px;color:#94a3b8">Site:
+                <select id="pins-site-filter" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
+                  <option value="">All</option>
+                  <option value="Blog">Blog</option>
+                  <option value="Store">Store</option>
+                  <option value="Link-in-Bio">Link-in-Bio</option>
+                  <option value="Social Media">Social Media</option>
+                  <option value="General Website">General Website</option>
+                  <option value="Portfolio">Portfolio</option>
+                  <option value="News/Media">News/Media</option>
+                  <option value="SaaS/Tool">SaaS/Tool</option>
+                  <option value="blank">Not set</option>
+                </select>
               </label>
               <label style="font-size:12px;color:#94a3b8">Sort:
                 <select id="pins-sort" style="margin-left:4px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;padding:3px 7px;font-size:12px">
@@ -983,8 +1019,19 @@ def build_page():
                 style="background:#22d3ee;color:#0f172a;font-weight:700;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px">
                 🔍 Load
               </button>
+              <button onclick="scanSelectedPins()"
+                style="background:#1e293b;color:#e2e8f0;font-weight:700;border:1px solid #334155;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px">
+                Scan selected
+              </button>
             </div>
             <div id="pins-status" style="font-size:12px;color:#64748b;margin-bottom:6px"></div>
+            <div id="scan-log-panel" style="display:none;background:#020617;border:1px solid #1e293b;border-radius:8px;margin-bottom:10px;padding:10px 12px">
+              <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:6px">
+                <div id="scan-log-title" style="font-size:12px;font-weight:700;color:#e2e8f0">Step 15 scan</div>
+                <div id="scan-log-state" style="font-size:11px;color:#94a3b8"></div>
+              </div>
+              <pre id="scan-log-lines" style="margin:0;max-height:180px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.4;color:#94a3b8"></pre>
+            </div>
             <div id="pins-table" style="max-height:480px;overflow-y:auto;border:1px solid #1e293b;border-radius:8px;display:none"></div>
             <div id="pins-pager" style="display:flex;gap:10px;align-items:center;margin-top:8px;display:none">
               <button id="pins-prev" onclick="loadPins(_pinsPage-1)"
@@ -1002,6 +1049,7 @@ def build_page():
         const TYPE_COLOR = {{Seasonal:"#22d3ee",Trend:"#f97316",Shopping:"#a78bfa",Lifestyle:"#4ade80",Recipe:"#fb923c",DIY:"#60a5fa",Other:"#94a3b8"}};
         let _lastSchedule = null;
         let _pinsPage = 1, _pinsTotal = 0, _pinsPerPage = 50;
+        let _scanPollTimer = null;
 
         function _fmt(n) {{
           if (!n) return "—";
@@ -1016,6 +1064,9 @@ def build_page():
             from:     document.getElementById("pins-from").value,
             to:       document.getElementById("pins-to").value,
             type:     document.getElementById("pins-type").value,
+            status:   document.getElementById("pins-status-filter").value,
+            link:     document.getElementById("pins-link-filter").value,
+            site:     document.getElementById("pins-site-filter").value,
             sort:     document.getElementById("pins-sort").value,
             minscore: document.getElementById("pins-minscore").value,
             page:     page || _pinsPage
@@ -1031,6 +1082,9 @@ def build_page():
             if (f.from)     document.getElementById("pins-from").value     = f.from;
             if (f.to)       document.getElementById("pins-to").value       = f.to;
             if (f.type)     document.getElementById("pins-type").value     = f.type;
+            if (f.status)   document.getElementById("pins-status-filter").value = f.status;
+            if (f.link)     document.getElementById("pins-link-filter").value = f.link;
+            if (f.site)     document.getElementById("pins-site-filter").value = f.site;
             if (f.sort)     document.getElementById("pins-sort").value     = f.sort;
             if (f.minscore) document.getElementById("pins-minscore").value = f.minscore;
             return f.page || 1;
@@ -1048,15 +1102,20 @@ def build_page():
           const from  = document.getElementById("pins-from").value;
           const to    = document.getElementById("pins-to").value;
           const type  = document.getElementById("pins-type").value;
+          const filterStatus = document.getElementById("pins-status-filter").value;
+          const linkFilter = document.getElementById("pins-link-filter").value;
+          const siteFilter = document.getElementById("pins-site-filter").value;
           const sort  = document.getElementById("pins-sort").value;
-          const minscore = document.getElementById("pins-minscore").value || 1;
+          const minscore = document.getElementById("pins-minscore").value || 0;
           const status = document.getElementById("pins-status");
           status.textContent = "⏳ Loading…";
           _saveFilters(page);
-          let url = `/api/pins?page=${{page}}&sort=${{sort}}&minscore=${{minscore}}`;
+          let url = `/api/pins?page=${{page}}&sort=${{sort}}&minscore=${{minscore}}&status=${{filterStatus}}`;
           if (from) url += `&from=${{from}}`;
           if (to)   url += `&to=${{to}}`;
           if (type) url += `&type=${{encodeURIComponent(type)}}`;
+          if (linkFilter) url += `&link=${{encodeURIComponent(linkFilter)}}`;
+          if (siteFilter) url += `&site=${{encodeURIComponent(siteFilter)}}`;
           try {{
             const r = await fetch(url);
             const data = await r.json();
@@ -1082,38 +1141,229 @@ def build_page():
           }}
         }}
 
+        async function scanSelectedPins() {{
+          const from = document.getElementById("pins-from").value;
+          const to = document.getElementById("pins-to").value;
+          const linkFilter = document.getElementById("pins-link-filter").value;
+          const siteFilter = document.getElementById("pins-site-filter").value;
+          const status = document.getElementById("pins-status");
+          if (!from || !to) {{
+            status.textContent = "Choose Pin created from/to before scanning selected pins.";
+            return;
+          }}
+          status.textContent = "Starting Step 15 scan for this date range...";
+          try {{
+            let url = `/api/scan-selected?from=${{from}}&to=${{to}}&limit=500&workers=10`;
+            if (linkFilter) url += `&link=${{encodeURIComponent(linkFilter)}}`;
+            if (siteFilter) url += `&site=${{encodeURIComponent(siteFilter)}}`;
+            const r = await fetch(url);
+            const data = await r.json();
+            if (!data.ok) {{
+              status.textContent = "Scan failed: " + (data.error || "unknown error");
+              return;
+            }}
+            status.textContent = `Step 15 scan started (pid ${{data.pid}}). It will classify ready pins only.`;
+            startScanPolling(data.job_id);
+            setTimeout(() => loadPins(_pinsPage), 5000);
+          }} catch(ex) {{
+            status.textContent = "Scan failed: " + ex;
+          }}
+        }}
+
+        function startScanPolling(jobId, onDone=null) {{
+          const panel = document.getElementById("scan-log-panel");
+          const title = document.getElementById("scan-log-title");
+          const state = document.getElementById("scan-log-state");
+          const lines = document.getElementById("scan-log-lines");
+          panel.style.display = "";
+          title.textContent = `Step 15 scan job ${{jobId}}`;
+          lines.textContent = "Waiting for logs...";
+          if (_scanPollTimer) clearInterval(_scanPollTimer);
+          async function poll() {{
+            try {{
+              const r = await fetch(`/api/scan-status?job_id=${{encodeURIComponent(jobId)}}`);
+              const data = await r.json();
+              if (!data.ok) {{
+                state.textContent = data.error || "status error";
+                return;
+              }}
+              state.textContent = data.running ? `running · pid ${{data.pid}}` : `finished · exit ${{data.returncode}}`;
+              lines.textContent = data.log || "(no log output yet)";
+              lines.scrollTop = lines.scrollHeight;
+              if (!data.running) {{
+                clearInterval(_scanPollTimer);
+                _scanPollTimer = null;
+                loadPins(_pinsPage);
+                if (onDone) onDone(data);
+              }}
+            }} catch(ex) {{
+              state.textContent = "status error: " + ex;
+            }}
+          }}
+          poll();
+          _scanPollTimer = setInterval(poll, 3000);
+        }}
+
+        async function scanOnePin(pinId, force=false) {{
+          const status = document.getElementById("pins-status");
+          status.textContent = `Starting Step 15 scan for pin ${{pinId}}...`;
+          try {{
+            const r = await fetch(`/api/scan-pin?pin_id=${{encodeURIComponent(pinId)}}${{force ? "&force=1" : ""}}`);
+            const data = await r.json();
+            if (!data.ok) {{
+              status.textContent = "Pin scan failed: " + (data.error || "unknown error");
+              return;
+            }}
+            status.textContent = `Step 15 pin scan started (pid ${{data.pid}}).`;
+            startScanPolling(data.job_id, () => {{
+              const filterStatus = document.getElementById("pins-status-filter").value;
+              if (filterStatus === "unclassified") {{
+                status.textContent = `Pin ${{pinId}} was classified. Current filter shows remaining unclassified-ready pins only.`;
+              }} else {{
+                status.textContent = `Pin ${{pinId}} scan finished.`;
+              }}
+            }});
+          }} catch(ex) {{
+            status.textContent = "Pin scan failed: " + ex;
+          }}
+        }}
+
+        async function downloadOnePin(pinId, thenAi=false) {{
+          const status = document.getElementById("pins-status");
+          status.textContent = `Starting Step 14 download for pin ${{pinId}}...`;
+          try {{
+            const r = await fetch(`/api/download-pin?pin_id=${{encodeURIComponent(pinId)}}`);
+            const data = await r.json();
+            if (!data.ok) {{
+              status.textContent = "Step 14 failed to start: " + (data.error || "unknown error");
+              return;
+            }}
+            status.textContent = `Step 14 download started (pid ${{data.pid}}).`;
+            startScanPolling(data.job_id, thenAi ? (() => {{
+              status.textContent = `Step 14 finished. Starting Step 15 AI for pin ${{pinId}}...`;
+              setTimeout(() => scanOnePin(pinId, true), 800);
+            }}) : null);
+          }} catch(ex) {{
+            status.textContent = "Step 14 failed to start: " + ex;
+          }}
+        }}
+
         function renderPinsTable(pins) {{
           const wrap = document.getElementById("pins-table");
           wrap.style.display = "";
           if (!pins.length) {{ wrap.innerHTML = '<p class="muted" style="padding:12px">No pins match.</p>'; return; }}
+          const cellTitle = (v) => String(v || "").replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+          const shortText = (v, n=90) => {{
+            v = String(v || "");
+            return v.length > n ? v.slice(0, n - 1) + "…" : v;
+          }};
+          const detailValue = (label, value) => `
+            <div style="min-width:220px">
+              <div style="font-size:10px;text-transform:uppercase;color:#64748b;margin-bottom:2px">${{label}}</div>
+              <div style="font-size:12px;color:#e2e8f0;white-space:pre-wrap;word-break:break-word">${{cellTitle(value || "—")}}</div>
+            </div>`;
+          const prettyJson = (value) => {{
+            if (!value) return "—";
+            try {{ return JSON.stringify(JSON.parse(value), null, 2); }}
+            catch(e) {{ return value; }}
+          }};
+          const detailHtml = (p) => `
+            <div style="padding:12px;background:#020617;border-top:1px solid #1e293b">
+              <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px">
+                <div style="font-size:12px;font-weight:800;color:#e2e8f0">AI generated data for pin ${{p.pin_id}}</div>
+                <div style="font-size:11px;color:#64748b">generated_by_ia_scan fields</div>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 14px;margin-bottom:12px">
+                ${{detailValue("content_type_generated_by_ia_scan", p.type)}}
+                ${{detailValue("category_generated_by_ia_scan", p.category)}}
+                ${{detailValue("post_score_generated_by_ia_scan", p.score ? p.score + "/10" : "")}}
+                ${{detailValue("seasonal_context_generated_by_ia_scan", p.seasonal)}}
+                ${{detailValue("best_posting_days_generated_by_ia_scan", p.days)}}
+                ${{detailValue("posting_window_generated_by_ia_scan", p.ia_window)}}
+                ${{detailValue("keywords_generated_by_ia_scan", p.ia_keywords)}}
+                ${{detailValue("hook_generated_by_ia_scan", p.ia_hook)}}
+                ${{detailValue("caption_generated_by_ia_scan", p.ia_caption)}}
+                ${{detailValue("target_audience_generated_by_ia_scan", p.ia_audience)}}
+                ${{detailValue("monetization_angle_generated_by_ia_scan", p.ia_monetization)}}
+                ${{detailValue("description_generated_by_ia_scan", p.desc)}}
+              </div>
+              <div style="font-size:10px;text-transform:uppercase;color:#64748b;margin-bottom:4px">content_json_generated_by_ia_scan</div>
+              <pre style="margin:0;max-height:320px;overflow:auto;background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:10px;color:#cbd5e1;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word">${{cellTitle(prettyJson(p.ia_json))}}</pre>
+            </div>`;
           let html = `<table class="mini-table" style="width:100%">
             <tr>
-              <th>Type</th><th>Category</th><th>Score</th><th>Seasonal</th>
-              <th>Pinner</th><th>Followers</th><th>Reach</th><th>Repins</th>
-              <th>Pin created</th><th>Best days</th><th>Caption</th><th>Pin</th><th>Blog</th>
+              <th>Pin ID</th><th>State</th><th>Type</th><th>Category</th><th>Score</th><th>Seasonal</th>
+              <th>Pinner</th><th>Site</th><th>Followers</th><th>Reach</th><th>Repins</th>
+              <th>Pin created</th><th>AI scanned</th><th>Best days</th><th>Caption</th>
+              <th>Action</th><th>Pin</th><th>Blog</th>
             </tr>`;
           for (const p of pins) {{
             const em  = TYPE_EMOJI[p.type] || "📌";
             const col = TYPE_COLOR[p.type]  || "#94a3b8";
             const sc  = p.score >= 8 ? "#4ade80" : p.score >= 5 ? "#f97316" : "#94a3b8";
+            let scanState = "Need Step 14";
+            let stateColor = "#64748b";
+            const readyForAi = !!p.ready_for_ai;
+            if (p.classified) {{ scanState = "AI scanned"; stateColor = "#4ade80"; }}
+            else if (readyForAi) {{ scanState = "Ready for AI"; stateColor = "#22d3ee"; }}
+            else if (p.download_status === "Done") {{ scanState = "Step 14 empty"; stateColor = "#f97316"; }}
+            else if ((p.download_status || "").startsWith("Failed")) {{ scanState = p.download_status; stateColor = "#f97316"; }}
+            else if (!p.blog_url) {{ scanState = "No blog link"; }}
+            const canScan = !p.classified && readyForAi;
+            let actionHtml = "";
+            actionHtml = `<div style="display:flex;gap:4px;align-items:center;white-space:nowrap">`;
+            if (p.blog_url) {{
+              const step14Label = (p.download_status || "").startsWith("Failed") ? "Retry 14" : (p.download_status === "Done" ? "Re-14" : "Step 14");
+              const step14AiLabel = p.download_status === "Done" ? "Re-14+AI" : "14+AI";
+              actionHtml += `<button onclick="downloadOnePin('${{p.pin_id}}')" title="Download/retry this pin destination with Step 14" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">${{step14Label}}</button>`;
+              actionHtml += `<button onclick="downloadOnePin('${{p.pin_id}}', true)" title="Run Step 14, then automatically run Step 15 AI" style="background:#172554;color:#93c5fd;border:1px solid #1d4ed8;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">${{step14AiLabel}}</button>`;
+            }} else {{
+              actionHtml += `<button disabled title="No outbound blog link to download" style="background:#111827;color:#64748b;border:1px solid #1f2937;border-radius:4px;padding:3px 7px;font-size:11px">No link</button>`;
+            }}
+            if (readyForAi && !p.classified) {{
+              actionHtml += `<button onclick="scanOnePin('${{p.pin_id}}')" title="Classify this downloaded pin with Step 15 AI" style="background:#0f172a;color:#22d3ee;border:1px solid #164e63;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">AI</button>`;
+              actionHtml += `<button onclick="scanOnePin('${{p.pin_id}}', true)" title="Force Step 15 using prior similar JSON examples when available" style="background:#312e81;color:#c4b5fd;border:1px solid #6d28d9;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">Smart AI</button>`;
+            }} else if (readyForAi && p.classified) {{
+              actionHtml += `<button onclick="scanOnePin('${{p.pin_id}}', true)" title="Force re-run Step 15 AI for this pin" style="background:#052e16;color:#4ade80;border:1px solid #166534;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">Re-AI</button>`;
+              actionHtml += `<button onclick="scanOnePin('${{p.pin_id}}', true)" title="Force Step 15 using prior similar JSON examples when available" style="background:#312e81;color:#c4b5fd;border:1px solid #6d28d9;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">Smart AI</button>`;
+            }} else {{
+              actionHtml += `<button disabled title="Step 15 needs Step 14 downloaded content first" style="background:#111827;color:#64748b;border:1px solid #1f2937;border-radius:4px;padding:3px 7px;font-size:11px">AI</button>`;
+              actionHtml += `<button disabled title="Smart AI needs Step 14 downloaded content first" style="background:#111827;color:#64748b;border:1px solid #1f2937;border-radius:4px;padding:3px 7px;font-size:11px">Smart AI</button>`;
+            }}
+            actionHtml += `<button onclick="togglePinDetails('${{p.pin_id}}')" title="Expand AI generated data" style="background:#312e81;color:#ddd6fe;border:1px solid #6d28d9;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer">Expand</button>`;
+            actionHtml += `</div>`;
             html += `<tr>
+              <td style="font-size:11px;color:#93c5fd;white-space:nowrap" title="${{p.pin_id}}">${{p.pin_id}}</td>
+              <td style="font-size:11px;color:${{stateColor}};white-space:nowrap">${{scanState}}</td>
               <td style="color:${{col}};white-space:nowrap">${{em}} ${{p.type}}</td>
               <td style="font-size:11px">${{p.category||"—"}}</td>
-              <td style="color:${{sc}};font-weight:700">${{p.score}}/10</td>
+              <td style="color:${{sc}};font-weight:700">${{p.classified ? p.score + "/10" : (p.download_status || "not downloaded")}}</td>
               <td style="font-size:11px;color:#94a3b8">${{p.seasonal||"—"}}</td>
               <td style="font-size:11px"><a href="https://pinterest.com/${{p.pinner}}/" target="_blank" style="color:#60a5fa">${{p.pinner}}</a></td>
+              <td style="font-size:11px;color:#94a3b8;white-space:nowrap">${{p.site_type||"—"}}</td>
               <td style="font-size:11px;color:#4ade80">${{_fmt(p.followers)}}</td>
               <td style="font-size:11px;color:#22d3ee">${{_fmt(p.reach)}}</td>
               <td style="font-size:11px">${{_fmt(p.repins)}}</td>
               <td style="font-size:11px;color:#64748b;white-space:nowrap">${{p.created_at||"—"}}</td>
+              <td style="font-size:11px;color:#64748b;white-space:nowrap">${{p.scanned||"—"}}</td>
               <td style="font-size:11px;color:#64748b">${{p.days||"—"}}</td>
               <td style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.desc||""}}">${{p.desc||"—"}}</td>
+              <td>${{actionHtml}}</td>
               <td>${{p.pin_url ? `<a href="${{p.pin_url}}" target="_blank" style="color:#a78bfa;font-size:11px">🔗 pin</a>` : "—"}}</td>
               <td>${{p.blog_url ? `<a href="${{p.blog_url}}" target="_blank" style="color:#f97316;font-size:11px">🌐 blog</a>` : "—"}}</td>
+            </tr>
+            <tr id="pin-detail-${{p.pin_id}}" style="display:none">
+              <td colspan="18" style="padding:0">${{detailHtml(p)}}</td>
             </tr>`;
           }}
           html += `</table>`;
           wrap.innerHTML = html;
+        }}
+
+        function togglePinDetails(pinId) {{
+          const row = document.getElementById(`pin-detail-${{pinId}}`);
+          if (!row) return;
+          row.style.display = row.style.display === "none" ? "table-row" : "none";
         }}
 
         // ── Schedule ──────────────────────────────────────────────────────────
@@ -1517,18 +1767,73 @@ class Handler(BaseHTTPRequestHandler):
             from_dt   = qs.get("from",     [""])[0]
             to_dt     = qs.get("to",       [""])[0]
             ftype     = qs.get("type",     [""])[0]
-            minscore  = max(1, min(10, int(qs.get("minscore", ["1"])[0])))
+            link_filter = qs.get("link", [""])[0]
+            site_filter = qs.get("site", [""])[0]
+            status_filter = qs.get("status", ["classified"])[0]
+            if status_filter not in ("all", "with_link", "classified", "unclassified", "ready", "not_downloaded", "failed"):
+                status_filter = "classified"
+            minscore  = max(0, min(10, int(qs.get("minscore", ["0"])[0])))
+            created_expr = (
+                "COALESCE("
+                "STR_TO_DATE(p.created_at, '%%a, %%d %%b %%Y %%H:%%i:%%s +0000'),"
+                "STR_TO_DATE(p.created_at, '%%Y-%%m-%%dT%%H:%%i:%%s.%%fZ'),"
+                "STR_TO_DATE(p.created_at, '%%Y-%%m-%%d %%H:%%i:%%s'),"
+                "STR_TO_DATE(p.created_at, '%%Y-%%m-%%d')"
+                ")"
+            )
             order_sql = {
-                "score":     "pca.post_score DESC, pca.scanned_at DESC",
-                "followers": "pi.follower_count DESC, pca.post_score DESC",
-                "repins":    "p.repin_count DESC, pca.post_score DESC",
-                "date":      "pca.scanned_at DESC",
-                "type":      "pca.content_type ASC, pca.post_score DESC",
-            }.get(sort_key, "pca.post_score DESC")
-            where, params = ["pca.post_score >= %s"], [minscore]
-            if from_dt:  where.append("p.created_at >= %s");         params.append(from_dt)
-            if to_dt:    where.append("p.created_at <= %s");          params.append(to_dt + " 23:59:59")
-            if ftype:    where.append("pca.content_type = %s");       params.append(ftype)
+                "score":     "COALESCE(pca.post_score,0) DESC, pca.scanned_at DESC",
+                "followers": "pi.follower_count DESC, COALESCE(pca.post_score,0) DESC",
+                "repins":    "p.repin_count DESC, COALESCE(pca.post_score,0) DESC",
+                "date":      f"{created_expr} DESC, COALESCE(pca.post_score,0) DESC",
+                "type":      "pca.content_type ASC, COALESCE(pca.post_score,0) DESC",
+            }.get(sort_key, "COALESCE(pca.post_score,0) DESC")
+            where, params = ["p.pin_type = 'created'"], []
+            if status_filter == "classified":
+                where.extend([
+                    "p.link_download_status = 'Done'",
+                    "p.link_html IS NOT NULL",
+                    "p.link_html != ''",
+                ])
+                where.append("pca.pin_id IS NOT NULL")
+                where.append("pca.post_score >= %s")
+                params.append(minscore)
+            elif status_filter == "unclassified":
+                where.extend([
+                    "p.link_download_status = 'Done'",
+                    "p.link_html IS NOT NULL",
+                    "p.link_html != ''",
+                ])
+                where.append("pca.pin_id IS NULL")
+            elif status_filter == "ready":
+                where.extend([
+                    "p.link_download_status = 'Done'",
+                    "p.link_html IS NOT NULL",
+                    "p.link_html != ''",
+                ])
+                where.append("(pca.pin_id IS NULL OR pca.post_score >= %s)")
+                params.append(minscore)
+            elif status_filter == "with_link":
+                where.append("COALESCE(p.link,'') != ''")
+            elif status_filter == "not_downloaded":
+                where.append("(p.link_download_status IS NULL OR p.link_download_status = '')")
+            elif status_filter == "failed":
+                where.append("p.link_download_status LIKE 'Failed%%'")
+            if from_dt:  where.append(f"{created_expr} >= %s");       params.append(from_dt)
+            if to_dt:    where.append(f"{created_expr} <= %s");       params.append(to_dt + " 23:59:59")
+            if link_filter == "with":
+                where.append("COALESCE(p.link,'') != ''")
+            elif link_filter == "without":
+                where.append("COALESCE(p.link,'') = ''")
+            if site_filter == "blank":
+                where.append("(pi.site_type IS NULL OR pi.site_type = '')")
+            elif site_filter:
+                where.append("pi.site_type = %s")
+                params.append(site_filter)
+            if ftype:
+                where.append("pca.pin_id IS NOT NULL")
+                where.append("pca.content_type = %s")
+                params.append(ftype)
             where_str = " AND ".join(where)
             try:
                 env3 = load_env()
@@ -1544,22 +1849,39 @@ class Handler(BaseHTTPRequestHandler):
                 cur3 = conn3.cursor()
                 cur3.execute(f"""
                     SELECT COUNT(*)
-                    FROM pin_content_analysis pca
-                    LEFT JOIN pins p ON p.id = pca.pin_id
+                    FROM pins p
+                    LEFT JOIN pin_content_analysis pca ON pca.pin_id = p.id
+                    LEFT JOIN pinners pi ON pi.username = COALESCE(pca.pinner_username, p.pinner_username)
                     WHERE {where_str}
                 """, params)
                 total3 = cur3.fetchone()[0]
                 cur3.execute(f"""
-                    SELECT pca.pin_id, pca.pin_url, pca.pinner_username,
-                           pca.content_type, pca.category, pca.description,
+                    SELECT COALESCE(pca.pin_id, p.id),
+                           COALESCE(pca.pin_url, p.pin_url),
+                           COALESCE(pca.pinner_username, p.pinner_username),
+                           pca.content_type,
+                           COALESCE(pca.category, 'Unclassified'),
+                           COALESCE(pca.description, p.description, p.title),
                            pca.post_score, pca.seasonal_context, pca.best_posting_days,
                            pca.scanned_at,
                            COALESCE(pi.follower_count,0), COALESCE(pi.profile_reach,0),
                            COALESCE(p.repin_count,0),     COALESCE(p.link,''),
-                           COALESCE(p.created_at,'')
-                    FROM pin_content_analysis pca
-                    LEFT JOIN pinners pi ON pi.username = pca.pinner_username
-                    LEFT JOIN pins    p  ON p.id        = pca.pin_id
+                           COALESCE(DATE_FORMAT({created_expr}, '%%Y-%%m-%%d'), ''),
+                           COALESCE(p.created_at,''),
+                           pca.pin_id IS NOT NULL,
+                           COALESCE(p.link_download_status, ''),
+                           COALESCE(pi.site_type, ''),
+                           (COALESCE(p.link_download_status, '') = 'Done' AND COALESCE(p.link_html, '') != ''),
+                           COALESCE(pca.hook_generated_by_ia_scan, ''),
+                           COALESCE(pca.keywords_generated_by_ia_scan, ''),
+                           COALESCE(pca.posting_window_generated_by_ia_scan, ''),
+                           COALESCE(pca.target_audience_generated_by_ia_scan, ''),
+                           COALESCE(pca.monetization_angle_generated_by_ia_scan, ''),
+                           COALESCE(pca.caption_generated_by_ia_scan, ''),
+                           COALESCE(CAST(pca.content_json_generated_by_ia_scan AS CHAR), '')
+                    FROM pins p
+                    LEFT JOIN pin_content_analysis pca ON pca.pin_id = p.id
+                    LEFT JOIN pinners pi ON pi.username = COALESCE(pca.pinner_username, p.pinner_username)
                     WHERE {where_str}
                     ORDER BY {order_sql}
                     LIMIT %s OFFSET %s
@@ -1574,7 +1896,18 @@ class Handler(BaseHTTPRequestHandler):
                      "scanned": str(r[9] or "")[:16],
                      "followers": r[10] or 0, "reach": r[11] or 0,
                      "repins": r[12] or 0, "blog_url": r[13] or "",
-                     "created_at": str(r[14] or "")[:10]}
+                     "created_at": str(r[14] or r[15] or "")[:10],
+                     "classified": bool(r[16]),
+                      "download_status": r[17] or "",
+                      "site_type": r[18] or "",
+                      "ready_for_ai": bool(r[19]),
+                      "ia_hook": (r[20] or "")[:180],
+                      "ia_keywords": (r[21] or "")[:220],
+                      "ia_window": (r[22] or "")[:220],
+                      "ia_audience": (r[23] or "")[:180],
+                      "ia_monetization": (r[24] or "")[:120],
+                      "ia_caption": (r[25] or "")[:220],
+                      "ia_json": r[26] or ""}
                     for r in rows3
                 ]
                 body3 = _json.dumps({"ok": True, "total": total3,
@@ -1592,6 +1925,275 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers(); self.wfile.write(body3); return
 
         # ── /api/live — lightweight status poll (no new DB call, reads cache) ──
+        if parsed.path == "/api/scan-selected":
+            import json as _json
+            import subprocess as _subprocess
+            qs = parse_qs(parsed.query)
+            from_dt = qs.get("from", [""])[0]
+            to_dt = qs.get("to", [""])[0]
+            link_filter = qs.get("link", [""])[0]
+            site_filter = qs.get("site", [""])[0]
+            try:
+                limit = max(1, min(2000, int(qs.get("limit", ["500"])[0])))
+                workers = max(1, min(30, int(qs.get("workers", ["10"])[0])))
+            except Exception:
+                limit, workers = 500, 10
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", from_dt or "") or not re.match(r"^\d{4}-\d{2}-\d{2}$", to_dt or ""):
+                body_scan = _json.dumps({"ok": False, "error": "from/to must be YYYY-MM-DD"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_scan)))
+                self.end_headers(); self.wfile.write(body_scan); return
+            if link_filter == "without":
+                body_scan = _json.dumps({"ok": False, "error": "Step 15 can only scan pins with downloaded blog content. Choose Link=Has link or All."}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_scan)))
+                self.end_headers(); self.wfile.write(body_scan); return
+            env_scan = load_env()
+            if not env_scan.get("MYSQL_PASSWORD"):
+                body_scan = _json.dumps({"ok": False, "error": "MYSQL_PASSWORD is not configured"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_scan)))
+                self.end_headers(); self.wfile.write(body_scan); return
+            script = BASE / "15_post_planner.py"
+            if not script.exists():
+                body_scan = _json.dumps({"ok": False, "error": "15_post_planner.py not found"}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_scan)))
+                self.end_headers(); self.wfile.write(body_scan); return
+            try:
+                proc_env = os.environ.copy()
+                proc_env["PYTHONIOENCODING"] = "utf-8"
+                job_id = f"{int(time.time())}-{from_dt}-{to_dt}"
+                log_dir = BASE / "dashboard_scan_logs"
+                log_dir.mkdir(exist_ok=True)
+                log_path = log_dir / f"step15-{job_id}.log"
+                log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
+                cmd_scan = [
+                        sys.executable, "-u", str(script),
+                        "--source", "mysql",
+                        "--once",
+                        "--limit", str(limit),
+                        "--workers", str(workers),
+                        "--from", from_dt,
+                        "--to", to_dt,
+                        "--created-only",
+                    ]
+                if site_filter:
+                    cmd_scan += ["--site-type", site_filter]
+                proc = _subprocess.Popen(
+                    cmd_scan,
+                    cwd=str(BASE),
+                    env=proc_env,
+                    stdout=log_fh,
+                    stderr=_subprocess.STDOUT,
+                    creationflags=getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+                log_fh.close()
+                _scan_jobs[job_id] = {
+                    "proc": proc,
+                    "pid": proc.pid,
+                    "log_path": str(log_path),
+                    "from": from_dt,
+                    "to": to_dt,
+                    "site": site_filter,
+                    "link": link_filter,
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                body_scan = _json.dumps({"ok": True, "pid": proc.pid, "job_id": job_id, "limit": limit}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_scan)))
+                self.end_headers(); self.wfile.write(body_scan); return
+            except Exception as ex_scan:
+                body_scan = _json.dumps({"ok": False, "error": str(ex_scan)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_scan)))
+                self.end_headers(); self.wfile.write(body_scan); return
+
+        if parsed.path == "/api/download-pin":
+            import json as _json
+            import subprocess as _subprocess
+            qs = parse_qs(parsed.query)
+            pin_id = qs.get("pin_id", [""])[0].strip()
+            if not re.match(r"^\d{5,}$", pin_id):
+                body_pin = _json.dumps({"ok": False, "error": "pin_id is required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            env_scan = load_env()
+            if not env_scan.get("MYSQL_PASSWORD"):
+                body_pin = _json.dumps({"ok": False, "error": "MYSQL_PASSWORD is not configured"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            script = BASE / "14_download_blog_pin_links.py"
+            if not script.exists():
+                body_pin = _json.dumps({"ok": False, "error": "14_download_blog_pin_links.py not found"}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            try:
+                proc_env = os.environ.copy()
+                proc_env["PYTHONIOENCODING"] = "utf-8"
+                job_id = f"{int(time.time())}-step14-pin-{pin_id}"
+                log_dir = BASE / "dashboard_scan_logs"
+                log_dir.mkdir(exist_ok=True)
+                log_path = log_dir / f"{job_id}.log"
+                log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
+                proc = _subprocess.Popen(
+                    [
+                        sys.executable, "-u", str(script),
+                        "--source", "mysql",
+                        "--once",
+                        "--workers", "1",
+                        "--limit", "1",
+                        "--retry-failed",
+                        "--pin-id", pin_id,
+                    ],
+                    cwd=str(BASE),
+                    env=proc_env,
+                    stdout=log_fh,
+                    stderr=_subprocess.STDOUT,
+                    creationflags=getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+                log_fh.close()
+                _scan_jobs[job_id] = {
+                    "proc": proc,
+                    "pid": proc.pid,
+                    "log_path": str(log_path),
+                    "pin_id": pin_id,
+                    "step": "14",
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                body_pin = _json.dumps({"ok": True, "pid": proc.pid, "job_id": job_id}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            except Exception as ex_pin:
+                body_pin = _json.dumps({"ok": False, "error": str(ex_pin)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+
+        if parsed.path == "/api/scan-pin":
+            import json as _json
+            import subprocess as _subprocess
+            qs = parse_qs(parsed.query)
+            pin_id = qs.get("pin_id", [""])[0].strip()
+            force_scan = qs.get("force", ["0"])[0] == "1"
+            if not re.match(r"^\d{5,}$", pin_id):
+                body_pin = _json.dumps({"ok": False, "error": "pin_id is required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            env_scan = load_env()
+            if not env_scan.get("MYSQL_PASSWORD"):
+                body_pin = _json.dumps({"ok": False, "error": "MYSQL_PASSWORD is not configured"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            script = BASE / "15_post_planner.py"
+            if not script.exists():
+                body_pin = _json.dumps({"ok": False, "error": "15_post_planner.py not found"}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            try:
+                proc_env = os.environ.copy()
+                proc_env["PYTHONIOENCODING"] = "utf-8"
+                job_id = f"{int(time.time())}-pin-{pin_id}"
+                log_dir = BASE / "dashboard_scan_logs"
+                log_dir.mkdir(exist_ok=True)
+                log_path = log_dir / f"step15-{job_id}.log"
+                log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
+                cmd_pin = [
+                    sys.executable, "-u", str(script),
+                    "--source", "mysql",
+                    "--once",
+                    "--limit", "1",
+                    "--workers", "1",
+                    "--pin-id", pin_id,
+                    "--no-calendar",
+                ]
+                if force_scan:
+                    cmd_pin.append("--force")
+                proc = _subprocess.Popen(
+                    cmd_pin,
+                    cwd=str(BASE),
+                    env=proc_env,
+                    stdout=log_fh,
+                    stderr=_subprocess.STDOUT,
+                    creationflags=getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+                log_fh.close()
+                _scan_jobs[job_id] = {
+                    "proc": proc,
+                    "pid": proc.pid,
+                    "log_path": str(log_path),
+                    "pin_id": pin_id,
+                    "force": force_scan,
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                body_pin = _json.dumps({"ok": True, "pid": proc.pid, "job_id": job_id}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+            except Exception as ex_pin:
+                body_pin = _json.dumps({"ok": False, "error": str(ex_pin)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_pin)))
+                self.end_headers(); self.wfile.write(body_pin); return
+
+        if parsed.path == "/api/scan-status":
+            import json as _json
+            qs = parse_qs(parsed.query)
+            job_id = qs.get("job_id", [""])[0]
+            job = _scan_jobs.get(job_id)
+            if not job:
+                body_status = _json.dumps({"ok": False, "error": "scan job not found"}).encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_status)))
+                self.end_headers(); self.wfile.write(body_status); return
+            proc = job.get("proc")
+            returncode = proc.poll() if proc else None
+            log_text = ""
+            try:
+                log_path = Path(job["log_path"])
+                if log_path.exists():
+                    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    log_text = "\n".join(lines[-80:])
+            except Exception as log_ex:
+                log_text = f"(could not read log: {log_ex})"
+            body_status = _json.dumps({
+                "ok": True,
+                "job_id": job_id,
+                "pid": job.get("pid"),
+                "running": returncode is None,
+                "returncode": returncode,
+                "started_at": job.get("started_at"),
+                "log": log_text,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type","application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body_status)))
+            self.end_headers(); self.wfile.write(body_status); return
+
         if parsed.path == "/api/live":
             import json as _json
             with _lock:
@@ -1644,6 +2246,10 @@ def _start_planner():
     if not _os.path.exists(script):
         print("   ⚠ 15_post_planner.py not found — skipping auto-start")
         return
+    running, pid = get_running_bots_local().get("bot15", (False, None))
+    if running:
+        print(f"   Step 15 planner already running (pid {pid})")
+        return
     try:
         proc = subprocess.Popen(
             [_sys.executable, script, "--source", "mysql"],
@@ -1656,11 +2262,31 @@ def _start_planner():
         print(f"   ⚠ Could not start planner: {ex}")
 
 
+def _watch_self_reload():
+    """Restart dashboard.py when this file changes."""
+    this_file = Path(__file__).resolve()
+    try:
+        last_mtime = this_file.stat().st_mtime
+    except OSError:
+        return
+
+    while True:
+        time.sleep(1.0)
+        try:
+            current_mtime = this_file.stat().st_mtime
+        except OSError:
+            continue
+        if current_mtime != last_mtime:
+            print("\n   dashboard.py changed - restarting server...\n", flush=True)
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 if __name__ == "__main__":
     PORT = 8765
     print("⏳ Loading data…")
     refresh_cache()
     threading.Thread(target=bg_refresh, daemon=True).start()
+    threading.Thread(target=_watch_self_reload, daemon=True).start()
     _start_planner()
     print(f"\n✅  http://localhost:{PORT}\n")
     print("   Logs are read from MySQL bot_logs table (via db_logger.py).")

@@ -27,6 +27,8 @@ _DOMAIN_QUICK_SCRAPE_API/
 progress.json
 profiles_progress.json
 magic_log.jsonl
+auto_fixer.log
+dashboard_scan_logs/
 
 # Ignore local CSV snapshots and output folders
 *.csv
